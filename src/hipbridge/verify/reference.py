@@ -15,6 +15,7 @@ unavailable reference with a reason, not an exception at import time.
 
 from __future__ import annotations
 
+import os
 import shutil
 import struct
 import subprocess
@@ -325,7 +326,10 @@ class NativeReference(Reference):
         ext = ".cu" if self.toolchain == "nvcc" else ".hip.cpp"
         src = tmp / f"driver{ext}"
         src.write_text(self._render_driver(), encoding="utf-8", newline="\n")
-        exe = tmp / ("driver" if self._remote else "driver.exe")
+        # Name by the platform that will RUN it, not the one rendering it:
+        # through a prefix the binary executes on the guest side.
+        windows_target = os.name == "nt" and not self._remote
+        exe = tmp / ("driver.exe" if windows_target else "driver")
 
         cmd = [self.toolchain, self._path(src), "-o", self._path(exe), "-O2", *self.extra_flags]
         r = self._run(cmd, capture_output=True, text=True)

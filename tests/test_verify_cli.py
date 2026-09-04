@@ -124,3 +124,42 @@ def test_push_ci_never_requests_a_gpu_runner():
     for name, job in wf["jobs"].items():
         runs_on = str(job.get("runs-on", ""))
         assert "self-hosted" not in runs_on, f"job {name} would use a paid runner"
+
+
+# --- the generated device drivers -------------------------------------------
+
+
+@needs_verify
+@pytest.mark.parametrize("toolchain", ["nvcc", "hipcc"])
+def test_generated_driver_is_well_formed(toolchain):
+    """Render both drivers without needing either toolchain.
+
+    The hipcc branch cannot be exercised on this machine, and discovering a
+    template typo on a metered MI300X is an expensive way to find it. The
+    rendered HIP driver has been separately confirmed to compile as C++ under
+    g++ with stub HIP headers.
+    """
+    from hipbridge.verify import suites
+
+    s = suites.ROW_SOFTMAX
+    ref = verify.NativeReference(
+        source=s.source(REPO / "examples"), launch=s.launch, toolchain=toolchain
+    )
+    ref._n_inputs, ref._n_scalars = 1, 2
+    src = ref._render_driver()
+
+    assert "%(" not in src, "unsubstituted template token"
+    assert src.count("{") == src.count("}"), "unbalanced braces"
+    assert src.count("(") == src.count(")"), "unbalanced parens"
+    assert s.kernel in src, "kernel source not embedded"
+    assert "-12345.0f" in src, "sentinel fill missing; unwritten output would pass"
+
+    if toolchain == "hipcc":
+        assert "#include <hip/hip_runtime.h>" in src
+        assert "hipLaunchKernelGGL(row_softmax, dim3(gx,gy,gz)" in src
+        assert "hipMemcpyDeviceToHost" in src
+        assert "cuda" not in src.lower().replace(".cu", ""), "CUDA leaked into HIP output"
+    else:
+        assert "#include <cuda_runtime.h>" in src
+        assert "row_softmax<<<dim3(gx,gy,gz)" in src
+        assert "cudaMemcpyDeviceToHost" in src
