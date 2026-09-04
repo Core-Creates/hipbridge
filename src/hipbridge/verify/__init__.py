@@ -26,6 +26,11 @@ _LAZY = {
     "is_identity": "compare",
     "is_unwritten": "compare",
     "ulp_diff": "compare",
+    # bench
+    "BenchResult": "bench",
+    "Comparison": "bench",
+    "time_candidate": "bench",
+    "time_reference": "bench",
     # harness
     "CaseResult": "harness",
     "Harness": "harness",

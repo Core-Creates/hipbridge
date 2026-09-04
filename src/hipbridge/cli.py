@@ -104,6 +104,77 @@ def _cmd_verify(args) -> int:
     return 1 if failed else 0
 
 
+def _cmd_bench(args) -> int:
+    """Time the candidate against the original on device.
+
+    Refuses to report a speedup for a shape that failed verification. A fast
+    wrong kernel is not a result, and a benchmark that does not say whether the
+    numbers were correct is the kind this project exists to distrust.
+    """
+    from hipbridge import verify
+
+    if not verify.available():
+        print("SKIP: [verify] extra not installed")
+        return 1 if args.require else 0
+
+    import torch
+
+    from hipbridge.verify import bench, suites
+
+    examples = Path(args.examples)
+    prefix = verify.wsl(args.wsl) if args.wsl else []
+    shapes = [tuple(int(d) for d in s.split("x")) for s in args.shapes.split(",")]
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    failed = False
+    if device != "cuda":
+        print("WARNING: no GPU visible to torch, so the candidate runs on the host")
+        print("         while the original runs on device. Ratios are suppressed as")
+        print("         NOT COMPARABLE. On Windows this is normally a CPU-only torch")
+        print("         wheel; Triton has no Windows build either.")
+        print()
+
+    for suite in suites.BUILTIN:
+        ref = verify.NativeReference(
+            source=suite.source(examples),
+            launch=suite.launch,
+            toolchain=args.toolchain,
+            command_prefix=prefix,
+            extra_flags=(["--offload-arch=" + args.arch] if args.arch else []),
+        )
+        avail = ref.availability()
+        if not avail:
+            print(f"SKIP  {suite.name}: {avail.reason}")
+            continue
+
+        candidate, described = suites.candidate_for(suite)
+        print(f"{suite.name} on {args.toolchain}, device={device}, reps={args.reps}")
+        print(f"  candidate: {described}")
+        print(f"  original : {suite.source_file} compiled with {args.toolchain}")
+        print()
+
+        for shape in shapes:
+            x = verify.generate(verify.InputSpec(shape=shape), device=device)
+
+            # Verify at this exact shape before timing it.
+            summary = verify.Harness(
+                candidate=candidate,
+                reference=ref,
+                oracle=suite.oracle,
+                name=f"{suite.name}@{shape}",
+                distributions=(verify.Distribution.NORMAL,),
+            ).run([shape])
+            ok = summary.ok
+            failed |= not ok
+
+            try:
+                print(bench.compare(candidate, ref, x, reps=args.reps, verified=ok))
+            except RuntimeError as exc:
+                print(f"  timing unavailable at {shape}: {exc}")
+                failed = True
+
+    return 1 if (failed and args.require) else 0
+
+
 def _cmd_info(args) -> int:
     print(f"hipbridge {__version__}")
     print(f"recognizers: {', '.join(registered())}")
@@ -146,6 +217,16 @@ def main(argv: list[str] | None = None) -> int:
         help="fail instead of skipping when no device is available",
     )
     ver.set_defaults(fn=_cmd_verify)
+
+    ben = sub.add_parser("bench", help="time the candidate against the original on device")
+    ben.add_argument("--toolchain", default="hipcc", choices=["hipcc", "nvcc"])
+    ben.add_argument("--arch", default="", help="offload arch, e.g. gfx942")
+    ben.add_argument("--shapes", default="1x1024,64x1024,1024x1024,4096x4096")
+    ben.add_argument("--reps", type=int, default=100)
+    ben.add_argument("--examples", default="examples")
+    ben.add_argument("--wsl", default="", metavar="DISTRO")
+    ben.add_argument("--require", action="store_true")
+    ben.set_defaults(fn=_cmd_bench)
 
     info = sub.add_parser("info", help="show capabilities and which extras are installed")
     info.set_defaults(fn=_cmd_info)

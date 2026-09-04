@@ -143,6 +143,29 @@ int main(int argc, char** argv) {
     std::vector<float> h_out(out_n);
     %(memcpy)s(h_out.data(), d_out, out_n * sizeof(float), %(d2h)s);
     write_bin(out_path, h_out);
+
+    // Optional device-side timing, enabled by HIPBRIDGE_REPS so it cannot
+    // collide with the scalar arguments, which consume the rest of argv.
+    // Events time the kernel on device and exclude the file I/O and host
+    // copies above, which would otherwise dominate and make every kernel look
+    // the same speed.
+    const char* reps_env = getenv("HIPBRIDGE_REPS");
+    int reps = reps_env ? atoi(reps_env) : 0;
+    if (reps > 0) {
+        int warmup = reps / 10 > 3 ? reps / 10 : 3;
+        for (int i = 0; i < warmup; ++i) { %(launch)s }
+        %(sync)s();
+
+        %(event_t)s beg, end;
+        %(event_create)s(&beg); %(event_create)s(&end);
+        %(event_record)s(beg, 0);
+        for (int i = 0; i < reps; ++i) { %(launch)s }
+        %(event_record)s(end, 0);
+        %(event_sync)s(end);
+        float total_ms = 0.0f;
+        %(event_elapsed)s(&total_ms, beg, end);
+        printf("KERNEL_MS %%.9f\n", total_ms / (float)reps);
+    }
     return 0;
 }
 """
@@ -157,6 +180,11 @@ _CUDA_TOKENS = {
     "last_error": "cudaGetLastError",
     "success": "cudaSuccess",
     "error_string": "cudaGetErrorString",
+    "event_t": "cudaEvent_t",
+    "event_create": "cudaEventCreate",
+    "event_record": "cudaEventRecord",
+    "event_sync": "cudaEventSynchronize",
+    "event_elapsed": "cudaEventElapsedTime",
 }
 
 _HIP_TOKENS = {
@@ -169,6 +197,11 @@ _HIP_TOKENS = {
     "last_error": "hipGetLastError",
     "success": "hipSuccess",
     "error_string": "hipGetErrorString",
+    "event_t": "hipEvent_t",
+    "event_create": "hipEventCreate",
+    "event_record": "hipEventRecord",
+    "event_sync": "hipEventSynchronize",
+    "event_elapsed": "hipEventElapsedTime",
 }
 
 SENTINEL = -12345.0
@@ -303,6 +336,8 @@ class NativeReference(Reference):
     # check is skipped, since the host compiler is whatever lives on that side.
     command_prefix: list[str] = field(default_factory=list)
     _built: Path | None = field(default=None, init=False, repr=False)
+    _reps: int = field(default=0, init=False, repr=False)
+    last_kernel_ms: float | None = field(default=None, init=False, repr=False)
 
     @property
     def _remote(self) -> bool:
@@ -439,10 +474,25 @@ class NativeReference(Reference):
         argv += [str(x) for x in self.launch.block]
         argv += [str(x) for x in scalars]
 
-        r = self._run(argv, capture_output=True, text=True)
+        env = dict(os.environ)
+        if self._reps:
+            if self._remote:
+                # A command prefix crosses a process boundary that does not
+                # carry the parent environment: `wsl -- cmd` starts a fresh
+                # session, so an exported variable here is invisible there.
+                # Passing it through env(1) travels with the command instead.
+                argv = ["env", f"HIPBRIDGE_REPS={self._reps}", *argv]
+            else:
+                env["HIPBRIDGE_REPS"] = str(self._reps)
+        r = self._run(argv, capture_output=True, text=True, env=env)
         if r.returncode != 0:
             detail = "\n".join(x for x in (r.stdout.strip(), r.stderr.strip()) if x)
             raise RuntimeError(f"reference run failed (exit {r.returncode}): {detail[-1000:]}")
+
+        self.last_kernel_ms = None
+        for line in r.stdout.splitlines():
+            if line.startswith("KERNEL_MS "):
+                self.last_kernel_ms = float(line.split()[1])
 
         raw = out_path.read_bytes()
         vals = struct.unpack(f"<{out_n}f", raw)

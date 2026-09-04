@@ -163,3 +163,72 @@ def test_generated_driver_is_well_formed(toolchain):
         assert "#include <cuda_runtime.h>" in src
         assert "row_softmax<<<dim3(gx,gy,gz)" in src
         assert "cudaMemcpyDeviceToHost" in src
+
+
+# --- benchmarking -----------------------------------------------------------
+
+
+@needs_verify
+def test_cross_device_comparison_is_refused():
+    """A CPU candidate against a GPU reference is not a speedup.
+
+    Observed while validating on Windows, where torch is CPU-only: the harness
+    happily printed "3.6x" for a host implementation against a device one.
+    Ratios like that are how misleading benchmark tables get built, so the
+    comparison is refused rather than footnoted.
+    """
+    from hipbridge.verify.bench import BenchResult, Comparison
+
+    cpu = Comparison(
+        candidate=BenchResult("candidate", 0.5, 10, (64, 64), "cpu"),
+        reference=BenchResult("original", 2.0, 10, (64, 64), "cuda"),
+        verified=True,
+    )
+    assert not cpu.comparable
+    assert "NOT COMPARABLE" in str(cpu)
+    assert "4.0x" not in str(cpu), "a speedup must not be printed for mixed devices"
+
+    gpu = Comparison(
+        candidate=BenchResult("candidate", 0.5, 10, (64, 64), "cuda"),
+        reference=BenchResult("original", 2.0, 10, (64, 64), "cuda"),
+        verified=True,
+    )
+    assert gpu.comparable
+    assert abs(gpu.speedup - 4.0) < 1e-9
+    assert "4.0x" in str(gpu)
+
+
+@needs_verify
+def test_unverified_shape_is_flagged_in_the_timing_line():
+    """A fast wrong kernel is not a result."""
+    from hipbridge.verify.bench import BenchResult, Comparison
+
+    c = Comparison(
+        candidate=BenchResult("candidate", 0.5, 10, (64, 64), "cuda"),
+        reference=BenchResult("original", 2.0, 10, (64, 64), "cuda"),
+        verified=False,
+    )
+    assert "UNVERIFIED" in str(c)
+
+
+@needs_verify
+@pytest.mark.parametrize("toolchain", ["nvcc", "hipcc"])
+def test_driver_emits_timing_instrumentation(toolchain):
+    from hipbridge.verify import suites
+
+    s = suites.ROW_SOFTMAX
+    ref = verify.NativeReference(
+        source=s.source(REPO / "examples"), launch=s.launch, toolchain=toolchain
+    )
+    ref._n_inputs, ref._n_scalars = 1, 2
+    src = ref._render_driver()
+    assert "HIPBRIDGE_REPS" in src, "timing must be opt-in via the environment"
+    # The escape must reach the C source as two characters. A real newline
+    # here breaks the string literal and the build, which it once did.
+    assert chr(92) + "n" in src.split("KERNEL_MS")[1][:20], (
+        "timing format must keep an escaped newline, not a literal one"
+    )
+    assert "%(" not in src
+    assert src.count("{") == src.count("}")
+    ev = "hipEvent_t" if toolchain == "hipcc" else "cudaEvent_t"
+    assert ev in src, "must time with device events, not wall clock"
