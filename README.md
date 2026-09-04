@@ -199,6 +199,80 @@ is undefined and the build is retried with `-D__AMDGCN_WAVEFRONT_SIZE=64`. That
 value is correct for gfx942, but it papers over a real version skew. Match the
 header and compiler versions before trusting performance numbers.
 
+## Benchmarking against the original
+
+Correctness does not justify a substitution on its own. If the tuned kernel is
+not faster there is no reason to swap it in, so `bench` times both sides on the
+same device, at the same shape, with one stated method.
+
+```bash
+hipbridge bench --toolchain hipcc --arch gfx942 --reps 100
+hipbridge bench --toolchain nvcc --wsl Ubuntu --shapes 1x1024,4096x4096
+```
+
+Defaults are `--shapes 1x1024,64x1024,1024x1024,4096x4096` and `--reps 100`.
+`--examples`, `--wsl`, and `--require` behave as they do for `verify`.
+
+Method, stated in `verify/bench.py` because a benchmark without one is an
+anecdote:
+
+- The original is timed **inside the generated driver** with device events, so
+  file I/O and host copies are excluded. Those otherwise dominate and make every
+  kernel look identical.
+- The candidate is timed with device events too, never wall clock.
+- Both sides get warmup iterations before any timing, to pay JIT and cache costs
+  once rather than charge them to the first measurement.
+- The figure reported is the per-iteration mean over `reps` back-to-back
+  launches.
+- **A shape is timed only after it verified correct at that shape.** Shapes that
+  did not verify are still printed, tagged `(UNVERIFIED at this shape)`. A fast
+  wrong kernel is not a result.
+
+### It refuses to report a ratio it cannot stand behind
+
+The reference always runs on device. If torch put the candidate on the host, a
+ratio between them compares a CPU implementation against a GPU one and means
+nothing, so no ratio is printed:
+
+```
+     64x1024  original     575.7 us (device)   candidate    2375.0 us (cpu)   NOT COMPARABLE: candidate did not run on the device
+```
+
+That guard exists because the first run of this command, on a Windows box with
+a CPU-only torch wheel, cheerfully reported a **3.6x speedup** for exactly that
+mismatch. Footnoting it would not have been enough; the number would still have
+been quoted. When both sides are genuinely on device the line ends in a speedup
+ratio instead.
+
+A CPU-only torch install is announced up front rather than left in the output
+for a reader to catch:
+
+```
+WARNING: no GPU visible to torch, so the candidate runs on the host
+         while the original runs on device. Ratios are suppressed as
+         NOT COMPARABLE. On Windows this is normally a CPU-only torch
+         wheel; Triton has no Windows build either.
+```
+
+### No performance numbers yet
+
+There are deliberately none in this README. The command runs end to end, but it
+has not yet produced a single comparable pair of timings: on the Windows box
+torch is CPU-only, so every line came back `NOT COMPARABLE`, and it has not been
+run on the MI300X yet.
+
+When it is, the version skew described above has to be resolved first. Timing a
+reference built with `-D__AMDGCN_WAVEFRONT_SIZE=64` papering over a
+header/compiler mismatch is not a number worth publishing. Match the header and
+compiler versions, then run it, and this section gets a table.
+
+The prior expectation, recorded here so it can be checked rather than quietly
+revised afterwards: the original `row_softmax.cu` launches with `block=(1,1,1)`,
+one thread per block, which uses 1/64th of each wavefront on a 304-CU MI300X,
+while the Triton kernel uses the full 64-wide wavefront with a tree reduction.
+The gap should be large and should widen with row count. That is a prediction,
+not a result, and the whole point of the command is that it can disprove it.
+
 ## Layout and the future split
 
 `src/hipbridge/verify/` and `src/hipbridge/kernels/` are kept import-clean so
