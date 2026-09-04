@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 from hipbridge import __version__
 from hipbridge.analysis import ARCHS, occupancy, roofline
@@ -33,6 +34,74 @@ def _cmd_analyze(args) -> int:
     if args.flops and args.bytes:
         print("roofline: ", roofline(args.flops, args.bytes, args.arch))
     return 0
+
+
+def _cmd_verify(args) -> int:
+    """Run the example suites against a real device.
+
+    Exits 0 and reports a skip when no device is present, so this is safe to
+    wire into CI that usually has no GPU. Pass --require to make absence fatal.
+    """
+    # Lazy, guarded: core must run without the [verify] extra installed.
+    from hipbridge import verify
+
+    if not verify.available():
+        print("SKIP: [verify] extra not installed (pip install 'hipbridge[verify]')")
+        return 1 if args.require else 0
+
+    from hipbridge.verify import suites
+
+    examples = Path(args.examples)
+    prefix = verify.wsl(args.wsl) if args.wsl else []
+    lines: list[str] = []
+    failed = False
+    ran = 0
+
+    for suite in suites.BUILTIN:
+        ref = verify.NativeReference(
+            source=suite.source(examples),
+            launch=suite.launch,
+            toolchain=args.toolchain,
+            command_prefix=prefix,
+            extra_flags=(["--offload-arch=" + args.arch] if args.arch else []),
+        )
+        avail = ref.availability()
+        if not avail:
+            msg = f"SKIP  {suite.name}: {avail.reason}"
+            print(msg)
+            lines.append(msg)
+            continue
+
+        candidate, described = suites.candidate_for(suite)
+        print(f"running {suite.name} against {args.toolchain} device")
+        print(f"  candidate: {described}")
+        shape_list = list(suite.shapes())[: args.limit]
+
+        summary = verify.Harness(
+            candidate=candidate,
+            reference=ref,
+            oracle=suite.oracle,
+            name=f"{suite.name} vs original on {args.toolchain}",
+        ).run(shape_list)
+        ran += 1
+        print(summary)
+        lines.append(str(summary))
+        failed |= not summary.ok
+
+    if args.report:
+        Path(args.report).write_text(
+            "# hipbridge verification report\n\n"
+            f"toolchain: `{args.toolchain}`  arch: `{args.arch or 'default'}`\n\n"
+            + "\n\n".join(f"```\n{x}\n```" for x in lines)
+            + "\n",
+            encoding="utf-8",
+        )
+        print(f"\nreport written to {args.report}")
+
+    if ran == 0:
+        print("no suite ran (no device available)")
+        return 1 if args.require else 0
+    return 1 if failed else 0
 
 
 def _cmd_info(args) -> int:
@@ -63,6 +132,20 @@ def main(argv: list[str] | None = None) -> int:
     ana.add_argument("--flops", type=float)
     ana.add_argument("--bytes", type=float)
     ana.set_defaults(fn=_cmd_analyze)
+
+    ver = sub.add_parser("verify", help="run example suites against a real device")
+    ver.add_argument("--toolchain", default="hipcc", choices=["hipcc", "nvcc"])
+    ver.add_argument("--arch", default="", help="offload arch, e.g. gfx942 for MI300X")
+    ver.add_argument("--limit", type=int, default=12, help="max shapes per suite (cost control)")
+    ver.add_argument("--examples", default="examples", help="directory holding the .cu files")
+    ver.add_argument("--wsl", default="", metavar="DISTRO", help="run the toolchain inside WSL2")
+    ver.add_argument("--report", default="", help="write a markdown report to this path")
+    ver.add_argument(
+        "--require",
+        action="store_true",
+        help="fail instead of skipping when no device is available",
+    )
+    ver.set_defaults(fn=_cmd_verify)
 
     info = sub.add_parser("info", help="show capabilities and which extras are installed")
     info.set_defaults(fn=_cmd_info)

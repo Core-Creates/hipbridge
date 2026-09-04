@@ -1,0 +1,86 @@
+name: AMD verify
+
+# MANUAL ONLY, deliberately.
+#
+# MI300X time is metered (roughly 1.71 to 3.47 USD per GPU-hour depending on
+# provider). Firing this on every push is how a 20 USD/month habit becomes a
+# 400 USD one. The free eight-job matrix in ci.yml still runs on every push and
+# covers everything that does not need a GPU; this runs when you have something
+# worth spending money to verify.
+#
+# Setup, once you have a device:
+#   1. Rent an MI300X (AMD Developer Cloud credits, TensorWave, DigitalOcean).
+#   2. On that box: install the repo's [verify] extra and register a GitHub
+#      self-hosted runner with the labels  self-hosted, amd
+#   3. Actions -> AMD verify -> Run workflow -> runner: self-hosted
+#
+# With runner: ubuntu-latest it is a free dry run. No AMD device exists there,
+# so every suite reports SKIP with a reason and the job passes. That verifies
+# the plumbing without spending anything.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Where to run. ubuntu-latest is a free dry run.
+        type: choice
+        options: [ubuntu-latest, self-hosted]
+        default: ubuntu-latest
+      arch:
+        description: Offload arch (gfx942 = MI300X, gfx90a = MI250X)
+        type: string
+        default: gfx942
+      limit:
+        description: Max shapes per suite. Lower is cheaper.
+        type: string
+        default: "12"
+      require_device:
+        description: Fail if no AMD device is found, instead of skipping.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ${{ inputs.runner }}
+    # Hard ceiling. A hung compile on a metered GPU must not bill for six hours.
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Show what the runner actually has
+        run: |
+          echo "runner: ${{ inputs.runner }}"
+          command -v hipcc && hipcc --version || echo "hipcc: not present"
+          command -v rocm-smi && rocm-smi || echo "rocm-smi: not present"
+          command -v rocminfo && rocminfo | grep -m1 gfx || echo "rocminfo: not present"
+
+      - name: Install
+        run: pip install -e ".[verify,dev]"
+
+      - name: Capabilities
+        run: hipbridge info
+
+      - name: Verify against device
+        run: |
+          hipbridge verify \
+            --toolchain hipcc \
+            --arch "${{ inputs.arch }}" \
+            --limit "${{ inputs.limit }}" \
+            --report amd-verify-report.md \
+            ${{ inputs.require_device == true && '--require' || '' }}
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: amd-verify-report-${{ inputs.arch }}
+          path: amd-verify-report.md
+          if-no-files-found: ignore
