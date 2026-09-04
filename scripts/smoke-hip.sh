@@ -92,6 +92,42 @@ HIP
 
 FLAGS="-O2"
 [ -n "$ARCH" ] && FLAGS="$FLAGS --offload-arch=$ARCH"
+
+# Some ROCm images use a component-split layout (/opt/rocm/core-<ver>/...) where
+# hipcc does not find its own headers, giving:
+#   fatal error: 'hip/hip_runtime.h' file not found
+# Locate them and put them on the include path rather than guessing.
+echo "locating hip/hip_runtime.h"
+HIP_INC=""
+for d in "${ROCM_PATH:-}/include" /opt/rocm/include /opt/rocm-*/include /opt/rocm/*/include; do
+    if [ -f "$d/hip/hip_runtime.h" ]; then HIP_INC="$d"; break; fi
+done
+if [ -z "$HIP_INC" ]; then
+    FOUND="$(find /opt -name hip_runtime.h -path '*/hip/hip_runtime.h' 2>/dev/null | head -1 || true)"
+    [ -n "$FOUND" ] && HIP_INC="${FOUND%/hip/hip_runtime.h}"
+fi
+
+if [ -n "$HIP_INC" ]; then
+    echo "  found: $HIP_INC/hip/hip_runtime.h"
+    FLAGS="$FLAGS -I$HIP_INC"
+    ROCM_ROOT="$(dirname "$HIP_INC")"
+    [ -d "$ROCM_ROOT/lib" ] && FLAGS="$FLAGS --rocm-path=$ROCM_ROOT"
+else
+    echo "  NOT FOUND anywhere under /opt"
+    echo
+    echo "The HIP development headers are not installed. hipcc and the runtime"
+    echo "are present, but the headers ship separately on some images. Try:"
+    echo
+    echo "    apt-get update && apt-get install -y hip-dev rocm-hip-runtime-dev"
+    echo "  or"
+    echo "    apt-get install -y rocm-dev"
+    echo
+    echo "Then re-run this script. Diagnostics:"
+    echo "  ls /opt/rocm*/ ; ls /opt/rocm*/include 2>/dev/null"
+    ls -d /opt/rocm* 2>/dev/null || true
+    exit 6
+fi
+
 echo "compiling: hipcc $FLAGS"
 hipcc $FLAGS "$WORK/smoke.hip.cpp" -o "$WORK/smoke"
 echo "running..."

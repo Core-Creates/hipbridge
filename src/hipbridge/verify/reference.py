@@ -223,6 +223,38 @@ def _host_compiler_missing(toolchain: str) -> str:
     )
 
 
+def hip_include_flags(root: str | None = None) -> list[str]:
+    """Locate the HIP headers and return compiler flags pointing at them.
+
+    Some ROCm images use a component-split layout (/opt/rocm/core-<ver>/...)
+    where hipcc cannot find its own headers and fails with
+    `fatal error: 'hip/hip_runtime.h' file not found`, despite the compiler and
+    runtime being present and gfx detection working. Observed on an AMD
+    Developer Cloud MI300X image with HIP 7.14.
+
+    Returns [] when the headers are already reachable or cannot be found; the
+    compiler's own error is clearer than a guess.
+    """
+    candidates: list[Path] = []
+    if root:
+        candidates.append(Path(root) / "include")
+    env = os.environ.get("ROCM_PATH")
+    if env:
+        candidates.append(Path(env) / "include")
+    candidates.append(Path("/opt/rocm/include"))
+    candidates += sorted(Path("/opt").glob("rocm-*/include"))
+    candidates += sorted(Path("/opt/rocm").glob("*/include")) if Path("/opt/rocm").is_dir() else []
+
+    for inc in candidates:
+        if (inc / "hip" / "hip_runtime.h").is_file():
+            flags = [f"-I{inc}"]
+            rocm_root = inc.parent
+            if (rocm_root / "lib").is_dir():
+                flags.append(f"--rocm-path={rocm_root}")
+            return flags
+    return []
+
+
 def wsl(distro: str = "Ubuntu") -> list[str]:
     """Command prefix that runs the toolchain inside a WSL2 distribution.
 
@@ -331,7 +363,11 @@ class NativeReference(Reference):
         windows_target = os.name == "nt" and not self._remote
         exe = tmp / ("driver.exe" if windows_target else "driver")
 
-        cmd = [self.toolchain, self._path(src), "-o", self._path(exe), "-O2", *self.extra_flags]
+        flags = list(self.extra_flags)
+        if self.toolchain == "hipcc" and not self._remote:
+            if not any(f.startswith(("-I", "--rocm-path")) for f in flags):
+                flags += hip_include_flags()
+        cmd = [self.toolchain, self._path(src), "-o", self._path(exe), "-O2", *flags]
         r = self._run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             # nvcc reports fatal driver errors (a missing host compiler, for one)
@@ -388,6 +424,7 @@ __all__ = [
     "NativeReference",
     "Reference",
     "TorchReference",
+    "hip_include_flags",
     "to_wsl_path",
     "wsl",
 ]

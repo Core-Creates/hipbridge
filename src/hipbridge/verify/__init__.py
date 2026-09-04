@@ -42,6 +42,7 @@ _LAZY = {
     "Reference": "reference",
     "SENTINEL": "reference",
     "TorchReference": "reference",
+    "hip_include_flags": "reference",
     "to_wsl_path": "reference",
     "wsl": "reference",
     # submodules
