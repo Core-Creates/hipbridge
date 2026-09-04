@@ -126,8 +126,17 @@ registered on a rented box.
 
 ```bash
 gh auth login && gh repo clone Core-Creates/hipbridge
-cd hipbridge && bash scripts/bootstrap-amd.sh
+cd hipbridge
+
+bash scripts/smoke-hip.sh      # toolchain only: no Python, no pip, no PyTorch
+bash scripts/bootstrap-amd.sh  # full harness
 ```
+
+Run the smoke test first. It compiles and runs `row_softmax` on the device and
+self-checks against a float64 CPU computation, so it separates "does hipcc
+work" from "is the Python environment set up". Some AMD Developer Cloud images
+ship hipcc and the driver but **no pip and no PyTorch**; the bootstrap script
+handles that, the smoke test does not need it.
 
 ROCm images ship a ROCm-built PyTorch plus `pytorch-triton-rocm`. **Do not
 reinstall either from PyPI**, which would replace them with NVIDIA builds and
