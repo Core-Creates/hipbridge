@@ -29,60 +29,82 @@ ARCH="${ARCH:-${DETECTED:-gfx942}}"
 echo "arch: $ARCH${DETECTED:+ (detected)}"
 command -v rocm-smi >/dev/null 2>&1 && rocm-smi --showproductname 2>/dev/null | head -6 || true
 
-say "Python toolchain"
-PY="${PY:-python3}"
-command -v "$PY" >/dev/null || die "no python3"
-echo "python: $($PY --version 2>&1)"
+say "Python environment"
+PY_SYS="${PY:-python3}"
+command -v "$PY_SYS" >/dev/null || die "no python3"
+echo "system python: $($PY_SYS --version 2>&1)"
 
-if ! "$PY" -m pip --version >/dev/null 2>&1; then
-    echo "pip missing, installing"
-    "$PY" -m ensurepip --upgrade >/dev/null 2>&1 \
-        || (command -v apt-get >/dev/null && apt-get update -qq && apt-get install -y -qq python3-pip) \
-        || (command -v curl >/dev/null && curl -sS https://bootstrap.pypa.io/get-pip.py | "$PY") \
-        || die "could not install pip; try: apt-get install -y python3-pip"
+# Ubuntu 24.04 marks the system Python externally managed (PEP 668), so
+# `pip install` into it is refused. A venv is the documented answer and is
+# cleaner anyway: it keeps a multi-GB ROCm torch out of the system tree.
+VENV="${VENV:-$PWD/.venv}"
+if [ ! -x "$VENV/bin/python" ]; then
+    echo "creating venv at $VENV"
+    if ! "$PY_SYS" -m venv "$VENV" 2>/dev/null; then
+        echo "venv module missing, installing python3-venv"
+        # unattended-upgrades can hold the dpkg lock for a minute after boot.
+        for _ in $(seq 1 60); do
+            fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break
+            printf '.'; sleep 5
+        done
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv python3-full             || die "could not install python3-venv"
+        "$PY_SYS" -m venv "$VENV" || die "venv creation failed"
+    fi
 fi
-echo "pip: $("$PY" -m pip --version)"
+PY="$VENV/bin/python"
+echo "venv python: $($PY --version 2>&1)"
+"$PY" -m pip install --quiet --upgrade pip
 
 say "PyTorch for ROCm"
 if "$PY" -c 'import torch' >/dev/null 2>&1; then
-    echo "torch already present, leaving it alone"
+    echo "torch already present in the venv, leaving it alone"
 else
     ROCM_VER="$(cat /opt/rocm/.info/version 2>/dev/null | cut -d. -f1,2 || true)"
-    echo "ROCm version: ${ROCM_VER:-unknown}"
-    # Try the matching wheel index first, then walk back. A CUDA or CPU wheel
-    # would install cleanly and then silently test the wrong hardware, so the
-    # result is checked rather than trusted.
-    for IDX in ${ROCM_VER:+rocm$ROCM_VER} rocm6.4 rocm6.3 rocm6.2; do
+    if [ -z "$ROCM_VER" ]; then
+        # Fall back to the HIP version hipcc reports, e.g. "HIP version: 7.14.x".
+        ROCM_VER="$(hipcc --version 2>/dev/null | sed -n 's/.*HIP version: \([0-9]*\.[0-9]*\).*//p' | head -1)"
+    fi
+    echo "ROCm/HIP version: ${ROCM_VER:-unknown}"
+
+    MAJOR="${ROCM_VER%%.*}"
+    if [ "$MAJOR" = "7" ]; then
+        INDEXES="rocm$ROCM_VER rocm7.0 rocm6.4 rocm6.3 rocm6.2"
+    else
+        INDEXES="${ROCM_VER:+rocm$ROCM_VER} rocm6.4 rocm6.3 rocm6.2"
+    fi
+
+    # A CUDA or CPU wheel installs perfectly cleanly and then silently tests the
+    # wrong hardware, so the result is checked rather than trusted.
+    for IDX in $INDEXES; do
         echo "trying https://download.pytorch.org/whl/$IDX"
-        if "$PY" -m pip install --quiet --index-url "https://download.pytorch.org/whl/$IDX" torch; then
+        if "$PY" -m pip install --quiet --index-url "https://download.pytorch.org/whl/$IDX" torch 2>/dev/null; then
             if "$PY" -c 'import torch,sys; sys.exit(0 if torch.version.hip else 1)' 2>/dev/null; then
                 echo "installed ROCm torch from $IDX"
                 break
             fi
-            echo "  that index gave a non-ROCm build, uninstalling"
+            echo "  that index gave a non-ROCm build, removing"
             "$PY" -m pip uninstall -y -q torch || true
         fi
     done
-    "$PY" -c 'import torch,sys; sys.exit(0 if torch.version.hip else 1)' 2>/dev/null \
-        || die "no ROCm PyTorch. Install manually, then re-run:
+    "$PY" -c 'import torch,sys; sys.exit(0 if torch.version.hip else 1)' 2>/dev/null         || die "no ROCm PyTorch. Install into the venv, then re-run:
   $PY -m pip install --index-url https://download.pytorch.org/whl/rocmX.Y torch
-Check https://pytorch.org/get-started/locally/ for the index matching ROCm ${ROCM_VER:-?}"
+See https://pytorch.org/get-started/locally/ for the index matching ROCm ${ROCM_VER:-?}"
 fi
 
-"$PY" - <<'PY'
+"$PY" - <<'PYEOF'
 import torch
 print("torch       :", torch.__version__)
 print("hip         :", torch.version.hip)
 print("devices     :", torch.cuda.device_count())
 if torch.cuda.device_count():
     print("device 0    :", torch.cuda.get_device_name(0))
-PY
+PYEOF
 
-say "Installing hipbridge (torch already satisfied, so untouched)"
+say "Installing hipbridge into the venv"
 "$PY" -m pip install --quiet -e ".[verify,dev]"
 
 say "Capabilities"
-hipbridge info
+"$VENV/bin/hipbridge" info
 
 say "Candidate selection (must be the Triton kernel, not the torch fallback)"
 "$PY" - <<'PY'
@@ -94,7 +116,7 @@ print("candidate     :", described)
 PY
 
 say "Verifying against the device (arch=$ARCH)"
-hipbridge verify \
+"$VENV/bin/hipbridge" verify \
     --toolchain hipcc \
     --arch "$ARCH" \
     --limit "${LIMIT:-12}" \

@@ -129,7 +129,7 @@ gh auth login && gh repo clone Core-Creates/hipbridge
 cd hipbridge
 
 bash scripts/smoke-hip.sh      # toolchain only: no Python, no pip, no PyTorch
-bash scripts/bootstrap-amd.sh  # full harness
+bash scripts/bootstrap-amd.sh  # full harness (creates .venv; PEP 668 blocks system pip)
 ```
 
 Run the smoke test first. It compiles and runs `row_softmax` on the device and
