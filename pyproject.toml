@@ -42,6 +42,9 @@ kernels = [
 # PyTorch, which is what hipbridge.kernels then picks up.
 verify = [
     "torch>=2.4",
+    # Not imported by verify/, but torch warns "Failed to initialize NumPy" on
+    # every call without it and some torch interop paths need it outright.
+    "numpy>=1.24",
 ]
 dev = [
     "pytest>=8.0",

@@ -126,3 +126,32 @@ def test_summary_reports_case_counts(torch_, reference):
     expected = len(SMALL) * len(verify.DEFAULT_SWEEP)
     assert len(s.results) == expected
     assert "cases" in str(s)
+
+
+def test_device_auto_resolves_to_something_concrete(torch_, reference):
+    h = _harness(lambda x: torch_.softmax(x, dim=-1), reference)
+    assert h.device in ("cuda", "cpu")
+    assert h.device != "auto", "auto must be resolved in __post_init__"
+
+
+def test_candidate_output_is_normalised_before_comparison(torch_, reference):
+    """Regression: the harness ran a Triton candidate on an MI300X and every
+    case failed with "Pointer argument cannot be accessed from Triton (cpu
+    tensor?)". Inputs defaulted to CPU, which is fine for a torch candidate and
+    impossible for a GPU kernel. Outputs must also be brought back to the host,
+    since the reference returns a host tensor and mixing devices raises.
+    """
+
+    def needs_detach(x):
+        # A candidate whose output carries grad and is non-contiguous, standing
+        # in for one that returns a device tensor.
+        y = torch_.softmax(x, dim=-1).clone().requires_grad_(True)
+        return y.transpose(0, 1).transpose(0, 1)
+
+    s = _harness(needs_detach, reference, name="detach").run([(4, 64)])
+    assert s.ok, str(s)
+
+
+def test_explicit_device_is_respected(torch_, reference):
+    h = _harness(lambda x: torch_.softmax(x, dim=-1), reference, device="cpu")
+    assert h.device == "cpu"

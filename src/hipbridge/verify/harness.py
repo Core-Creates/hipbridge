@@ -99,7 +99,11 @@ class Harness:
     max_ulp: int = 4
     distributions: Sequence[Distribution] = DEFAULT_SWEEP
     determinism_runs: int = 3
-    device: str = "cpu"
+    # "auto" puts inputs on the GPU when one is present. A Triton candidate
+    # cannot accept CPU tensors ("Pointer argument cannot be accessed from
+    # Triton"), while NativeReference copies to host regardless, so the device
+    # is chosen for the candidate and everything is normalised for comparison.
+    device: str = "auto"
     # A float64 implementation of the same maths. When supplied, correctness is
     # judged by accuracy against this oracle rather than by agreement with the
     # reference, because the reference is frequently the less accurate side.
@@ -110,10 +114,13 @@ class Harness:
     def __post_init__(self) -> None:
         if not isinstance(self.reference, Reference):
             self.reference = TorchReference(self.reference)
+        if self.device == "auto":
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
     def _one(self, spec: InputSpec) -> CaseResult:
         label = spec.describe()
         x = generate(spec, device=self.device)
+        x_dev = x
 
         try:
             got = self.candidate(x)
@@ -127,13 +134,21 @@ class Harness:
             why = f"reference raised {type(exc).__name__}: {exc}"
             return CaseResult(label, False, failures=[why])
 
+        # Comparison happens on the host. The candidate may return a device
+        # tensor while the reference returns a host one, and mixing them raises
+        # rather than comparing.
+        got = got.detach().cpu()
+        if torch.is_tensor(want):
+            want = want.detach().cpu()
+        x = x.detach().cpu()
+
         extra: list[str] = []
 
         # Determinism: identical input must give a bitwise identical answer.
         # NaN-aware, because torch.equal treats NaN as unequal to itself and a
         # kernel that reliably produces NaN is still deterministic.
         for _ in range(max(0, self.determinism_runs - 1)):
-            again = self.candidate(x)
+            again = self.candidate(x_dev).detach().cpu()
             if not _same_bits(again, got):
                 extra.append("NONDETERMINISTIC: repeated run differed bitwise")
                 break
