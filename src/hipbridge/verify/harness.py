@@ -74,6 +74,15 @@ class Summary:
         return [r for r in self.results if not r.passed]
 
     @property
+    def verdicts(self) -> dict[str, int]:
+        """How many cases were better / equivalent / worse than the reference."""
+        out: dict[str, int] = {}
+        for r in self.results:
+            if r.arbitration:
+                out[r.arbitration.verdict] = out.get(r.arbitration.verdict, 0) + 1
+        return out
+
+    @property
     def worst_ulp(self) -> int:
         return max((r.max_ulp or 0) for r in self.results) if self.results else 0
 
@@ -85,6 +94,11 @@ class Summary:
             f"{len(self.results) - len(self.failures)}/{len(self.results)} cases, "
             f"worst ulp={self.worst_ulp}"
         )
+        # In oracle mode the ULP figure is expected to be large and says little
+        # on its own. The accuracy verdict is the number that matters.
+        if self.verdicts:
+            parts = ", ".join(f"{v}={n}" for v, n in sorted(self.verdicts.items()))
+            head += f"  [accuracy vs original: {parts}]"
         # Only the first few failures; a broken kernel fails everything.
         return "\n".join([head, *(str(f) for f in self.failures[:8])])
 

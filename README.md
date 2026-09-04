@@ -151,8 +151,33 @@ regrows a `triton` dependency.
 |---|---|
 | CPU, torch oracle | verified |
 | NVIDIA, nvcc on RTX 4060 via WSL2 | verified, 56/56 cases |
-| AMD, hipcc on MI300X (gfx942) | **toolchain verified** (see below) |
-| AMD, full differential harness | not yet, needs ROCm PyTorch on the box |
+| AMD, hipcc on MI300X (gfx942) | **verified**, 84/84 cases |
+
+## The result this project was built to get
+
+On an AMD Instinct MI300X (gfx942, HIP 7.14, torch 2.9.1+rocm6.4), the tuned
+Triton kernel checked against the original `row_softmax.cu` compiled with
+`hipcc` and executed on device:
+
+```
+candidate: hipbridge.kernels.softmax (Triton, AMD-tuned)
+PASS  row_softmax vs original on hipcc: 84/84 cases, worst ulp=593
+```
+
+**593 ULP of divergence, and it passes.** That is the entire argument.
+
+The Triton kernel reduces pairwise across a 64-wide wavefront; the original
+accumulates serially, which grows rounding error as O(n) rather than O(log n).
+So the two disagree enormously, and the Triton one is *closer to float64 truth*.
+
+Judged the obvious way, "does the translation match the original within a ULP
+budget", this run scores **0/84** and the better kernel is rejected. Judged
+against a float64 oracle, it scores 84/84. Matching the original would have
+meant reproducing its rounding error.
+
+The same effect was first measured on an RTX 4060, where the original kernel
+was 1.4x to 59.7x less accurate than torch across every shape and distribution
+tried. See `compare.arbitrate` and `tests/test_arbitration.py`.
 
 First MI300X run, `scripts/smoke-hip.sh`, HIP 7.14, gfx942:
 

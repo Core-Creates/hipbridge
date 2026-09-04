@@ -155,3 +155,20 @@ def test_candidate_output_is_normalised_before_comparison(torch_, reference):
 def test_explicit_device_is_respected(torch_, reference):
     h = _harness(lambda x: torch_.softmax(x, dim=-1), reference, device="cpu")
     assert h.device == "cpu"
+
+
+def test_summary_reports_accuracy_verdicts_in_oracle_mode(torch_, reference):
+    """A large ULP figure means little in oracle mode; the verdict is the point.
+
+    Measured on an MI300X: the Triton kernel passed 84/84 at worst ulp=593
+    against the original serial-accumulation kernel. Without the verdict
+    breakdown that headline reads like a near-miss rather than a clean win.
+    """
+    oracle = lambda t: torch_.softmax(t.double(), dim=-1)  # noqa: E731
+    s = _harness(lambda x: torch_.softmax(x, dim=-1), reference, oracle=oracle, name="v").run(
+        [(4, 64)]
+    )
+    assert s.ok
+    assert s.verdicts, "oracle mode must record a verdict per case"
+    assert sum(s.verdicts.values()) == len(s.results)
+    assert "accuracy vs original" in str(s)
