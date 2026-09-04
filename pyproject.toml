@@ -48,6 +48,8 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.6",
     "pyyaml>=6.0",  # tests assert the CI workflows stay off paid runners
+    # tomllib is stdlib from 3.11; requires-python is >=3.10, so back it up.
+    "tomli>=2.0; python_version < '3.11'",
 ]
 all = ["hipbridge[kernels,verify]"]
 

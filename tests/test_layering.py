@@ -84,7 +84,10 @@ def _third_party_imports(pkg_dir: Path) -> set[str]:
 
 
 def _extra(name: str) -> set[str]:
-    import tomllib
+    try:
+        import tomllib  # stdlib from 3.11
+    except ModuleNotFoundError:  # pragma: no cover - 3.10 only
+        import tomli as tomllib
 
     data = tomllib.loads((SRC.parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
     deps = data["project"]["optional-dependencies"][name]
