@@ -251,11 +251,12 @@ def hip_include_flags(root: str | None = None) -> list[str]:
 
     for inc in candidates:
         if (inc / "hip" / "hip_runtime.h").is_file():
-            flags = [f"-I{inc}"]
-            rocm_root = inc.parent
-            if (rocm_root / "lib").is_dir():
-                flags.append(f"--rocm-path={rocm_root}")
-            return flags
+            # Only the include path. Do NOT derive --rocm-path from where the
+            # header lives: with libamdhip64-dev the headers are under /usr
+            # while the toolchain is under /opt/rocm, and --rocm-path=/usr makes
+            # hipcc look for /usr/lib/llvm/bin/clang++ instead of the compiler
+            # it already resolves correctly by itself.
+            return [f"-I{inc}"]
     return []
 
 

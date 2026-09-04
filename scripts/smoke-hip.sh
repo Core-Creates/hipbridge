@@ -127,8 +127,12 @@ fi
 if [ -n "$HIP_INC" ]; then
     echo "  found: $HIP_INC/hip/hip_runtime.h"
     FLAGS="$FLAGS -I$HIP_INC"
-    ROCM_ROOT="$(dirname "$HIP_INC")"
-    [ -d "$ROCM_ROOT/lib" ] && FLAGS="$FLAGS --rocm-path=$ROCM_ROOT"
+    # Deliberately NOT deriving --rocm-path from the header location. With
+    # libamdhip64-dev the headers are under /usr while the toolchain is under
+    # /opt/rocm, so passing --rocm-path=/usr sends hipcc looking for
+    # /usr/lib/llvm/bin/clang++ and it stops finding its own working compiler.
+    # hipcc resolves its toolchain correctly on its own; only the headers were
+    # ever missing.
 else
     echo "  NOT FOUND"
     echo
