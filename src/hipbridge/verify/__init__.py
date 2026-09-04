@@ -5,11 +5,44 @@ you a substitution is correct, and it is independently useful to anyone writing
 GPU kernels by hand.
 
 Promotion candidate: no import edge back into hipbridge core.
+
+    from hipbridge.verify import Harness, TorchReference, shapes
+
+    h = Harness(candidate=my_softmax,
+                reference=TorchReference(lambda x: torch.softmax(x, -1)))
+    print(h.run(shapes.row_wise()))
 """
 
 from __future__ import annotations
 
 _MISSING = "hipbridge.verify requires PyTorch.\n  pip install 'hipbridge[verify]'\n"
+
+_LAZY = {
+    # compare
+    "Report": "compare",
+    "check": "compare",
+    "is_identity": "compare",
+    "is_unwritten": "compare",
+    "ulp_diff": "compare",
+    # harness
+    "CaseResult": "harness",
+    "Harness": "harness",
+    "Summary": "harness",
+    # inputs
+    "DEFAULT_SWEEP": "inputs",
+    "Distribution": "inputs",
+    "InputSpec": "inputs",
+    "generate": "inputs",
+    # reference
+    "Availability": "reference",
+    "LaunchSpec": "reference",
+    "NativeReference": "reference",
+    "Reference": "reference",
+    "SENTINEL": "reference",
+    "TorchReference": "reference",
+    # submodules
+    "shapes": None,
+}
 
 
 class VerifyUnavailable(ImportError):
@@ -31,14 +64,18 @@ def require() -> None:
 
 
 def __getattr__(name: str):
-    # Lazy so `import hipbridge.verify` succeeds without torch and callers can
-    # check available() first.
-    if name in {"compare", "ulp_diff", "Report", "check"}:
-        require()
-        from hipbridge.verify import compare as _c
+    # Lazy so `import hipbridge.verify` and available() work without torch.
+    if name not in _LAZY:
+        raise AttributeError(name)
+    require()
+    import importlib
 
-        return getattr(_c, name)
-    raise AttributeError(name)
+    mod = importlib.import_module(f"hipbridge.verify.{_LAZY[name] or name}")
+    return mod if _LAZY[name] is None else getattr(mod, name)
 
 
-__all__ = ["VerifyUnavailable", "available", "check", "require"]
+def __dir__() -> list[str]:
+    return sorted({*_LAZY, "available", "require", "VerifyUnavailable"})
+
+
+__all__ = ["VerifyUnavailable", "available", "require", *sorted(_LAZY)]
