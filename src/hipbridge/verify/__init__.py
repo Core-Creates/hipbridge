@@ -19,7 +19,9 @@ _MISSING = "hipbridge.verify requires PyTorch.\n  pip install 'hipbridge[verify]
 
 _LAZY = {
     # compare
+    "Arbitration": "compare",
     "Report": "compare",
+    "arbitrate": "compare",
     "check": "compare",
     "is_identity": "compare",
     "is_unwritten": "compare",
@@ -40,6 +42,8 @@ _LAZY = {
     "Reference": "reference",
     "SENTINEL": "reference",
     "TorchReference": "reference",
+    "to_wsl_path": "reference",
+    "wsl": "reference",
     # submodules
     "shapes": None,
 }

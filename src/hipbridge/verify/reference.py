@@ -222,6 +222,26 @@ def _host_compiler_missing(toolchain: str) -> str:
     )
 
 
+def wsl(distro: str = "Ubuntu") -> list[str]:
+    """Command prefix that runs the toolchain inside a WSL2 distribution.
+
+    A very common developer setup is Windows for editing and WSL2 for the GPU
+    toolchain: nvcc there drives gcc instead of MSVC, and ROCm is Linux-only, so
+    the AMD half of any such project lives in WSL regardless. This lets the
+    harness run in Windows Python while compiling and executing on the Linux
+    side, against the same physical device.
+    """
+    return ["wsl", "-d", distro, "--"]
+
+
+def to_wsl_path(p: Path | str) -> str:
+    r"""Translate C:\Users\x to /mnt/c/Users/x. Already-POSIX paths pass through."""
+    s = str(p)
+    if len(s) > 1 and s[1] == ":":
+        return "/mnt/" + s[0].lower() + s[2:].replace("\\", "/")
+    return s.replace("\\", "/")
+
+
 @dataclass
 class NativeReference(Reference):
     """Compile and run the original kernel source on a real device."""
@@ -231,9 +251,39 @@ class NativeReference(Reference):
     toolchain: str = "nvcc"  # "nvcc" or "hipcc"
     extra_flags: list[str] = field(default_factory=list)
     name: str = "native"
+    # Optional prefix placed before every toolchain and driver invocation, e.g.
+    # wsl("Ubuntu"). When set, paths are translated and the MSVC host-compiler
+    # check is skipped, since the host compiler is whatever lives on that side.
+    command_prefix: list[str] = field(default_factory=list)
     _built: Path | None = field(default=None, init=False, repr=False)
 
+    @property
+    def _remote(self) -> bool:
+        return bool(self.command_prefix)
+
+    def _path(self, p: Path) -> str:
+        return to_wsl_path(p) if self._remote else str(p)
+
+    def _run(self, argv: list[str], **kw) -> subprocess.CompletedProcess:
+        return subprocess.run([*self.command_prefix, *argv], **kw)
+
     def availability(self) -> Availability:
+        if self._remote:
+            where = " ".join(self.command_prefix)
+            try:
+                r = self._run(
+                    [self.toolchain, "--version"], capture_output=True, text=True, timeout=120
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                return Availability(False, f"cannot reach {where}: {exc}")
+            if r.returncode != 0:
+                return Availability(False, f"{self.toolchain} not usable via {where}")
+            probe = "nvidia-smi" if self.toolchain == "nvcc" else "rocm-smi"
+            d = self._run([probe, "-L"], capture_output=True, text=True, timeout=120)
+            if d.returncode != 0 or not d.stdout.strip():
+                return Availability(False, f"no device visible via {where}")
+            return Availability(True)
+
         exe = shutil.which(self.toolchain)
         if exe is None:
             return Availability(False, f"{self.toolchain} not on PATH")
@@ -268,14 +318,17 @@ class NativeReference(Reference):
         if not avail:
             raise RuntimeError(f"cannot build: {avail.reason}")
 
+        # When running through a prefix the temp dir must be visible on both
+        # sides, so it is created on the Windows filesystem and referenced via
+        # its translated path rather than living in the guest's own /tmp.
         tmp = Path(tempfile.mkdtemp(prefix="hipbridge_ref_"))
         ext = ".cu" if self.toolchain == "nvcc" else ".hip.cpp"
         src = tmp / f"driver{ext}"
-        src.write_text(self._render_driver(), encoding="utf-8")
-        exe = tmp / ("driver.exe" if Path(tempfile.gettempdir()).drive else "driver")
+        src.write_text(self._render_driver(), encoding="utf-8", newline="\n")
+        exe = tmp / ("driver" if self._remote else "driver.exe")
 
-        cmd = [self.toolchain, str(src), "-o", str(exe), "-O2", *self.extra_flags]
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        cmd = [self.toolchain, self._path(src), "-o", self._path(exe), "-O2", *self.extra_flags]
+        r = self._run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             # nvcc reports fatal driver errors (a missing host compiler, for one)
             # on stdout, not stderr. Reporting only stderr yields an empty
@@ -297,26 +350,27 @@ class NativeReference(Reference):
         assert self._built is not None
 
         tmp = self._built.parent
-        argv: list[str] = [str(self._built), str(len(inputs))]
+        argv: list[str] = [self._path(self._built), str(len(inputs))]
         for i, t in enumerate(inputs):
             p = tmp / f"in{i}.bin"
             flat = t.detach().cpu().contiguous().float().reshape(-1)
             p.write_bytes(struct.pack(f"<{flat.numel()}f", *flat.tolist()))
-            argv += [str(p), str(flat.numel())]
+            argv += [self._path(p), str(flat.numel())]
 
         out_shape = self.launch.out_shape(shapes) if self.launch.out_shape else shapes[0]
         out_n = 1
         for d in out_shape:
             out_n *= d
         out_path = tmp / "out.bin"
-        argv += [str(out_path), str(out_n)]
+        argv += [self._path(out_path), str(out_n)]
         argv += [str(x) for x in self.launch.grid(shapes)]
         argv += [str(x) for x in self.launch.block]
         argv += [str(x) for x in scalars]
 
-        r = subprocess.run(argv, capture_output=True, text=True)
+        r = self._run(argv, capture_output=True, text=True)
         if r.returncode != 0:
-            raise RuntimeError(f"reference run failed ({r.returncode}): {r.stderr[-1000:]}")
+            detail = "\n".join(x for x in (r.stdout.strip(), r.stderr.strip()) if x)
+            raise RuntimeError(f"reference run failed (exit {r.returncode}): {detail[-1000:]}")
 
         raw = out_path.read_bytes()
         vals = struct.unpack(f"<{out_n}f", raw)
@@ -330,4 +384,6 @@ __all__ = [
     "NativeReference",
     "Reference",
     "TorchReference",
+    "to_wsl_path",
+    "wsl",
 ]

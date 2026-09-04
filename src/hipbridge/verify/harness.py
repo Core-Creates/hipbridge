@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from hipbridge.verify.compare import check, is_identity
+from hipbridge.verify.compare import Arbitration, arbitrate, check, is_identity
 from hipbridge.verify.inputs import DEFAULT_SWEEP, Distribution, InputSpec, generate
 from hipbridge.verify.reference import Reference, TorchReference
 
@@ -45,11 +45,13 @@ class CaseResult:
     passed: bool
     max_ulp: int | None = None
     failures: list[str] = field(default_factory=list)
+    arbitration: Arbitration | None = None
 
     def __str__(self) -> str:
         mark = "pass" if self.passed else "FAIL"
         ulp = f" ulp={self.max_ulp}" if self.max_ulp is not None else ""
-        head = f"  {mark}  {self.label}{ulp}"
+        acc = f" [{self.arbitration.verdict}]" if self.arbitration else ""
+        head = f"  {mark}  {self.label}{ulp}{acc}"
         return "\n".join([head, *(f"        {f}" for f in self.failures)])
 
 
@@ -98,6 +100,12 @@ class Harness:
     distributions: Sequence[Distribution] = DEFAULT_SWEEP
     determinism_runs: int = 3
     device: str = "cpu"
+    # A float64 implementation of the same maths. When supplied, correctness is
+    # judged by accuracy against this oracle rather than by agreement with the
+    # reference, because the reference is frequently the less accurate side.
+    # See compare.arbitrate for the measurements behind this.
+    oracle: Callable[..., torch.Tensor] | None = None
+    oracle_slack: float = 2.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.reference, Reference):
@@ -135,8 +143,19 @@ class Harness:
             extra.append("IDENTITY: output is a byte-exact copy of the input")
 
         report = check(label, lambda _t: got, lambda _t: want, (x,), max_ulp=self.max_ulp)
-        failures = [f for f in report.failures if "IDENTITY" not in f] + extra
-        return CaseResult(label, not failures, report.max_ulp, failures)
+
+        if self.oracle is None:
+            failures = [f for f in report.failures if "IDENTITY" not in f] + extra
+            return CaseResult(label, not failures, report.max_ulp, failures)
+
+        # Oracle mode: ULP drift from the reference is expected and fine as long
+        # as the candidate is not further from the truth than the reference is.
+        arb = arbitrate(got, want, self.oracle(x.double()), slack=self.oracle_slack)
+        failures = [f for f in report.failures if "exceeds tolerance" not in f]
+        failures = [f for f in failures if "IDENTITY" not in f] + extra
+        if arb.verdict == "worse":
+            failures.append(f"LESS ACCURATE than the reference: {arb}")
+        return CaseResult(label, not failures, report.max_ulp, failures, arb)
 
     def run(self, shapes: Iterable[tuple[int, ...]], limit: int | None = None) -> Summary:
         if isinstance(self.reference, Reference):

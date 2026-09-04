@@ -94,4 +94,75 @@ def check(
     return Report(name, not failures, worst, abs_err, rel_err, failures)
 
 
-__all__ = ["Report", "check", "is_identity", "is_unwritten", "ulp_diff"]
+@dataclass
+class Arbitration:
+    """Accuracy of two implementations judged against a high-precision oracle."""
+
+    candidate_err: float
+    reference_err: float
+    verdict: str  # "better" | "equivalent" | "worse"
+    ratio: float
+
+    def __str__(self) -> str:
+        return (
+            f"candidate {self.candidate_err:.3e} vs reference {self.reference_err:.3e} "
+            f"({self.ratio:.1f}x, {self.verdict})"
+        )
+
+
+def arbitrate(
+    candidate: torch.Tensor,
+    reference: torch.Tensor,
+    truth: torch.Tensor,
+    slack: float = 2.0,
+) -> Arbitration:
+    """Judge candidate and reference against a float64 oracle.
+
+    Measured on an RTX 4060: the serial-accumulation row_softmax.cu in examples/
+    is 1.4x to 59.7x LESS accurate than torch across every shape and
+    distribution tried, because serial summation accumulates O(n) rounding error
+    where a pairwise reduction accumulates O(log n).
+
+    So requiring a translated kernel to match the original within a ULP budget
+    is backwards. A tuned AMD kernel using a wavefront tree reduction will
+    diverge from a naive serial original precisely BECAUSE it is more accurate,
+    and a match-the-original test would reject it. The question worth asking is
+    whether the candidate is closer to the truth, not whether it reproduces the
+    original's rounding error.
+    """
+    t = truth.double()
+    e_cand = float((candidate.double() - t).abs().max())
+    e_ref = float((reference.double() - t).abs().max())
+
+    if e_ref == 0.0:
+        ratio = 1.0 if e_cand == 0.0 else float("inf")
+    else:
+        ratio = e_cand / e_ref
+
+    # Ratios between sub-epsilon errors are noise. Two implementations both
+    # accurate to a few float32 ULP of the output scale can differ by 3x purely
+    # through rounding, and failing that would reject correct kernels. Anything
+    # at or below the representable resolution of the output is not a defect.
+    scale = float(t.abs().max()) or 1.0
+    floor = 8.0 * torch.finfo(torch.float32).eps * scale
+    if e_cand <= floor:
+        return Arbitration(e_cand, e_ref, "equivalent", ratio)
+
+    if ratio <= 1.0:
+        verdict = "better"
+    elif ratio <= slack:
+        verdict = "equivalent"
+    else:
+        verdict = "worse"
+    return Arbitration(e_cand, e_ref, verdict, ratio)
+
+
+__all__ = [
+    "Arbitration",
+    "Report",
+    "arbitrate",
+    "check",
+    "is_identity",
+    "is_unwritten",
+    "ulp_diff",
+]
