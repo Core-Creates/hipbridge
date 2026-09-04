@@ -2,9 +2,11 @@
 
 Recognize CUDA kernels, substitute verified AMD implementations, prove it numerically.
 
-**Status: pre-alpha.** Nothing here has been run on AMD hardware. Claims in this
-README are limited to what the test suite actually exercises, and the test suite
-runs on CPU.
+**Status: pre-alpha.** Correctness has been verified on real hardware, on both
+vendors: nvcc on an RTX 4060 via WSL2, and hipcc on an MI300X (gfx942). See
+[the status table](#status-of-what-has-actually-been-run) for exactly which
+paths those are. Performance has not been measured yet. Claims in this README
+are limited to what has actually been run, never to what should follow from it.
 
 ## Design rules
 
