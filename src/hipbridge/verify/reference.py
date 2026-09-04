@@ -244,6 +244,10 @@ def hip_include_flags(root: str | None = None) -> list[str]:
     candidates.append(Path("/opt/rocm/include"))
     candidates += sorted(Path("/opt").glob("rocm-*/include"))
     candidates += sorted(Path("/opt/rocm").glob("*/include")) if Path("/opt/rocm").is_dir() else []
+    # libamdhip64-dev is Debian-packaged and lands in /usr/include, not under
+    # /opt/rocm where a ROCm tarball install would put it. Searching only /opt
+    # misses a perfectly good apt-installed header.
+    candidates += [Path("/usr/include"), Path("/usr/local/include")]
 
     for inc in candidates:
         if (inc / "hip" / "hip_runtime.h").is_file():

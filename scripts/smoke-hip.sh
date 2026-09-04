@@ -99,11 +99,28 @@ FLAGS="-O2"
 # Locate them and put them on the include path rather than guessing.
 echo "locating hip/hip_runtime.h"
 HIP_INC=""
-for d in "${ROCM_PATH:-}/include" /opt/rocm/include /opt/rocm-*/include /opt/rocm/*/include; do
-    if [ -f "$d/hip/hip_runtime.h" ]; then HIP_INC="$d"; break; fi
-done
+
+# Ask dpkg first. If the package is installed it knows exactly where the header
+# went, which beats guessing prefixes. libamdhip64-dev is Debian-packaged, so it
+# installs under /usr/include, NOT under /opt/rocm as ROCm tarball installs do.
+if command -v dpkg >/dev/null 2>&1; then
+    for pkg in libamdhip64-dev hip-dev rocm-hip-runtime-dev; do
+        F="$(dpkg -L "$pkg" 2>/dev/null | grep -m1 '/hip/hip_runtime\.h$' || true)"
+        if [ -n "$F" ]; then
+            HIP_INC="${F%/hip/hip_runtime.h}"
+            echo "  dpkg says $pkg provides it"
+            break
+        fi
+    done
+fi
+
 if [ -z "$HIP_INC" ]; then
-    FOUND="$(find /opt -name hip_runtime.h -path '*/hip/hip_runtime.h' 2>/dev/null | head -1 || true)"
+    for d in "${ROCM_PATH:-}/include" /opt/rocm/include /opt/rocm-*/include              /opt/rocm/*/include /usr/include /usr/local/include; do
+        if [ -f "$d/hip/hip_runtime.h" ]; then HIP_INC="$d"; break; fi
+    done
+fi
+if [ -z "$HIP_INC" ]; then
+    FOUND="$(find /opt /usr/include /usr/local/include -path '*/hip/hip_runtime.h' 2>/dev/null | head -1 || true)"
     [ -n "$FOUND" ] && HIP_INC="${FOUND%/hip/hip_runtime.h}"
 fi
 
