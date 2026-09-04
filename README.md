@@ -150,8 +150,27 @@ regrows a `triton` dependency.
 | Path | State |
 |---|---|
 | CPU, torch oracle | verified |
-| NVIDIA, nvcc on RTX 4060 via WSL2 | verified, 56/56 |
-| AMD, hipcc on MI300X | **never executed**, no device yet |
+| NVIDIA, nvcc on RTX 4060 via WSL2 | verified, 56/56 cases |
+| AMD, hipcc on MI300X (gfx942) | **toolchain verified** (see below) |
+| AMD, full differential harness | not yet, needs ROCm PyTorch on the box |
+
+First MI300X run, `scripts/smoke-hip.sh`, HIP 7.14, gfx942:
+
+```
+max |row sum - 1| : 3.325e-07
+max abs error     : 1.307e-08  (vs float64 CPU)
+PASS: hipcc built it, MI300X ran it, the numbers are right.
+```
+
+1.3e-08 is well inside float32 epsilon (1.19e-07). The sentinel fill confirmed
+every output element was written, so this is not a kernel that silently skipped
+its store.
+
+**Caveat on that box:** the apt HIP headers (`/usr/include/hip`) are a different
+ROCm version from the compiler (`/opt/rocm/core-7.14`), so `__AMDGCN_WAVEFRONT_SIZE`
+is undefined and the build is retried with `-D__AMDGCN_WAVEFRONT_SIZE=64`. That
+value is correct for gfx942, but it papers over a real version skew. Match the
+header and compiler versions before trusting performance numbers.
 
 ## Layout and the future split
 
