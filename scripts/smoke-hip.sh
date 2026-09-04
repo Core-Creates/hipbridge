@@ -113,18 +113,34 @@ if [ -n "$HIP_INC" ]; then
     ROCM_ROOT="$(dirname "$HIP_INC")"
     [ -d "$ROCM_ROOT/lib" ] && FLAGS="$FLAGS --rocm-path=$ROCM_ROOT"
 else
-    echo "  NOT FOUND anywhere under /opt"
+    echo "  NOT FOUND"
     echo
     echo "The HIP development headers are not installed. hipcc and the runtime"
-    echo "are present, but the headers ship separately on some images. Try:"
+    echo "are present, but the headers ship as a separate package on some images."
     echo
-    echo "    apt-get update && apt-get install -y hip-dev rocm-hip-runtime-dev"
-    echo "  or"
-    echo "    apt-get install -y rocm-dev"
+    echo "Note: a file called hip_runtime.h under .../openmp_wrappers/ is NOT the"
+    echo "one. That is clang's OpenMP offload shim and it shares the filename."
+    echo "The real header is at <prefix>/include/hip/hip_runtime.h."
     echo
-    echo "Then re-run this script. Diagnostics:"
-    echo "  ls /opt/rocm*/ ; ls /opt/rocm*/include 2>/dev/null"
-    ls -d /opt/rocm* 2>/dev/null || true
+    echo "ROCm components present:"
+    ls -d /opt/rocm*/ /opt/rocm/*/ 2>/dev/null | sed 's/^/  /' || echo "  none"
+    echo
+    if command -v apt-get >/dev/null 2>&1; then
+        echo "Candidate packages (apt):"
+        for pkg in hip-dev rocm-hip-runtime-dev rocm-dev hip-runtime-amd; do
+            if apt-cache show "$pkg" >/dev/null 2>&1; then
+                echo "    AVAILABLE  apt-get install -y $pkg"
+            else
+                echo "    not in configured repos: $pkg"
+            fi
+        done
+        echo
+        echo "If none are available, the ROCm apt repository is not configured."
+    fi
+    echo
+    echo "Often faster: relaunch the instance on a ROCm image that includes"
+    echo "PyTorch. Those ship the HIP headers and torch together, which also"
+    echo "removes the separate pip/PyTorch setup this box needs."
     exit 6
 fi
 
