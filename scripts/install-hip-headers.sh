@@ -46,17 +46,40 @@ echo "rocm meta/dev packages:"
 apt-cache search --names-only 'rocm' 2>/dev/null | grep -iE 'dev|hip' | head -20 | sed 's/^/  /' || true
 
 say "Installing"
+# ROCm 7 names the HIP headers libamdhip64-dev ("Header files for the AMD
+# implementation of HIP"), not hip-dev or rocm-dev as older docs suggest. The
+# fixed list below leads with the real name, then falls back to asking apt which
+# package actually ships hip/hip_runtime.h rather than guessing further.
 INSTALLED=""
-for pkg in hip-dev rocm-hip-runtime-dev hip-runtime-amd rocm-dev rocm-hip-sdk hip-base; do
+CANDIDATES="libamdhip64-dev hip-dev rocm-hip-runtime-dev rocm-dev"
+
+# Ask the package database directly, if apt-file happens to be present.
+if command -v apt-file >/dev/null 2>&1; then
+    EXTRA="$(apt-file search --package-only 'include/hip/hip_runtime.h' 2>/dev/null | head -3 | tr '
+' ' ')"
+    [ -n "$EXTRA" ] && CANDIDATES="$EXTRA $CANDIDATES"
+fi
+
+for pkg in $CANDIDATES; do
     if apt-cache policy "$pkg" 2>/dev/null | grep -q 'Candidate: [^(]'; then
         echo "trying $pkg"
         if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg"; then
             INSTALLED="$pkg"
             break
         fi
+    else
+        echo "not available: $pkg"
     fi
 done
 [ -n "$INSTALLED" ] && echo "installed: $INSTALLED" || echo "no candidate package installed"
+
+# Device bitcode for the specific target. Usually already present under
+# /opt/rocm/amdgcn, but the arch metapackage supplies it when it is not.
+ARCH_DETECT="${ARCH:-$(rocminfo 2>/dev/null | grep -o 'gfx[0-9a-f]*' | head -1 || echo gfx942)}"
+for pkg in $(apt-cache search --names-only "amdrocm-core-dev.*-${ARCH_DETECT}$" 2>/dev/null | awk '{print $1}' | sort -r | head -1); do
+    echo "installing device libs for $ARCH_DETECT: $pkg"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" || true
+done
 
 say "Result"
 HDR="$(find /opt -path '*/hip/hip_runtime.h' 2>/dev/null | head -1 || true)"
