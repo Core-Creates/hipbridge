@@ -100,6 +100,36 @@ runs it on a real device, which is the only reference that proves anything about
 the kernel you were actually handed. Availability is detected, never assumed: a
 missing toolchain yields an unavailable reference with a reason, not a crash.
 
+## Verifying against real hardware
+
+```bash
+hipbridge verify --toolchain nvcc --wsl Ubuntu          # NVIDIA, via WSL2
+hipbridge verify --toolchain hipcc --arch gfx942        # AMD MI300X
+```
+
+No device present is a **skip at exit 0**, not a failure, because this runs
+mostly on machines without a GPU. Pass `--require` to make absence fatal.
+
+`.github/workflows/amd-verify.yml` is **manual only** (`workflow_dispatch`).
+MI300X time is metered at roughly $1.71 to $3.47 per GPU-hour, so it never
+fires on push; the free eight-job matrix in `ci.yml` covers everything that
+does not need a device. The AMD job carries a 30 minute hard timeout and a
+shape-limit input, and three tests assert the cost model directly: the AMD
+workflow must stay `workflow_dispatch` only, it must have a timeout, and no
+job in `ci.yml` may request a self-hosted runner.
+
+Run it with `runner: ubuntu-latest` for a free dry run that proves the
+plumbing without spending anything. Switch to `self-hosted` once a runner is
+registered on a rented box.
+
+### Status of what has actually been run
+
+| Path | State |
+|---|---|
+| CPU, torch oracle | verified |
+| NVIDIA, nvcc on RTX 4060 via WSL2 | verified, 56/56 |
+| AMD, hipcc on MI300X | **never executed**, no device yet |
+
 ## Layout and the future split
 
 `src/hipbridge/verify/` and `src/hipbridge/kernels/` are kept import-clean so
