@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from drover.frontend.ir import KernelFacts, Pattern, Recognition
+from hipbridge.frontend.ir import KernelFacts, Pattern, Recognition
 
 # A rule returns (pattern, confidence, rationale) or None to decline.
 Rule = Callable[[KernelFacts], tuple[Pattern, str, list[str]] | None]

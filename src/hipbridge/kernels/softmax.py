@@ -3,7 +3,7 @@
 Block sizes are multiples of 64 because a CDNA wavefront is 64 wide; a 32-wide
 choice wastes half of every wavefront.
 
-UNVERIFIED on AMD hardware. Run drover.verify against this before trusting it.
+UNVERIFIED on AMD hardware. Run hipbridge.verify against this before trusting it.
 """
 
 from __future__ import annotations

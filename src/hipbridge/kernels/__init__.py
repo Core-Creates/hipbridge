@@ -1,14 +1,14 @@
 """Tuned AMD Triton implementations. Requires the [kernels] extra.
 
-Promotion candidate: this package has no import edge back into drover core and
+Promotion candidate: this package has no import edge back into hipbridge core and
 can become its own distribution unchanged.
 """
 
 from __future__ import annotations
 
 _MISSING = (
-    "drover.kernels requires Triton.\n"
-    "  pip install 'drover[kernels]'\n"
+    "hipbridge.kernels requires Triton.\n"
+    "  pip install 'hipbridge[kernels]'\n"
     "Triton publishes Linux wheels only; on Windows or macOS use a Linux host "
     "or a container for this extra."
 )
@@ -35,8 +35,8 @@ def require() -> None:
 def registry() -> dict:
     """Map Pattern -> callable returning a tuned AMD implementation."""
     require()
-    from drover.frontend.ir import Pattern
-    from drover.kernels import softmax
+    from hipbridge.frontend.ir import Pattern
+    from hipbridge.kernels import softmax
 
     return {Pattern.REDUCE_SERIAL: softmax.softmax_rowwise}
 

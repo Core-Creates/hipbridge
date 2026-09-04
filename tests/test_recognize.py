@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from drover import Pattern, parse_file, recognize
+from hipbridge import Pattern, parse_file, recognize
 
 
 def _one(path):

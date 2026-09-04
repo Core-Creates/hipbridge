@@ -22,9 +22,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
       - name: Core imports with no extras
-        run: python -c "import drover; print(drover.__version__)"
+        run: python -c "import hipbridge; print(hipbridge.__version__)"
       - run: pytest
-      - run: drover info
+      - run: hipbridge info
 
   extras:
     runs-on: ubuntu-latest

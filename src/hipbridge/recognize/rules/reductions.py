@@ -9,8 +9,8 @@ Three distinct shapes that all reduce, and that lower to very different AMD code
 
 from __future__ import annotations
 
-from drover.frontend.ir import KernelFacts, Pattern
-from drover.recognize.base import rule
+from hipbridge.frontend.ir import KernelFacts, Pattern
+from hipbridge.recognize.base import rule
 
 
 @rule("reduce.tree", priority=10)

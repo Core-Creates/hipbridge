@@ -1,7 +1,7 @@
 """AMD hardware analysis. Pure arithmetic over published vendor specifications.
 
 Every number here is a datasheet figure, NOT a measurement on your device.
-Anything derived from these is a ceiling, not a result. Use drover.verify to
+Anything derived from these is a ceiling, not a result. Use hipbridge.verify to
 find out what your hardware actually does.
 """
 

@@ -1,13 +1,13 @@
 """CUDA frontend: source text in, structural facts out."""
 
-from drover.frontend.ir import (
+from hipbridge.frontend.ir import (
     KernelFacts,
     Param,
     Pattern,
     Recognition,
     SharedBuffer,
 )
-from drover.frontend.parser import ParseError, parse_file, parse_source
+from hipbridge.frontend.parser import ParseError, parse_file, parse_source
 
 __all__ = [
     "KernelFacts",

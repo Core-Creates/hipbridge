@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "drover"
+name = "hipbridge"
 version = "0.1.0.dev0"
 description = "Recognize CUDA kernels, substitute verified AMD implementations, prove it numerically"
 readme = "README.md"
@@ -26,7 +26,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Each extra maps 1:1 to a src/drover/<name>/ package that is a candidate
+# Each extra maps 1:1 to a src/hipbridge/<name>/ package that is a candidate
 # for promotion to its own distribution later. Keep that mapping honest.
 #
 # Triton publishes Linux wheels only. The marker keeps `pip install .[kernels]`
@@ -44,14 +44,14 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.6",
 ]
-all = ["drover[kernels,verify]"]
+all = ["hipbridge[kernels,verify]"]
 
 [project.scripts]
-drover = "drover.cli:main"
+hipbridge = "hipbridge.cli:main"
 
 [project.urls]
-Repository = "https://github.com/iaintheardofu/drover"
-Issues = "https://github.com/iaintheardofu/drover/issues"
+Repository = "https://github.com/Core-Creates/hipbridge"
+Issues = "https://github.com/Core-Creates/hipbridge/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

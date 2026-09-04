@@ -4,12 +4,12 @@ Build this before the translator, not after. It is the only thing that can tell
 you a substitution is correct, and it is independently useful to anyone writing
 GPU kernels by hand.
 
-Promotion candidate: no import edge back into drover core.
+Promotion candidate: no import edge back into hipbridge core.
 """
 
 from __future__ import annotations
 
-_MISSING = "drover.verify requires PyTorch.\n  pip install 'drover[verify]'\n"
+_MISSING = "hipbridge.verify requires PyTorch.\n  pip install 'hipbridge[verify]'\n"
 
 
 class VerifyUnavailable(ImportError):
@@ -31,11 +31,11 @@ def require() -> None:
 
 
 def __getattr__(name: str):
-    # Lazy so `import drover.verify` succeeds without torch and callers can
+    # Lazy so `import hipbridge.verify` succeeds without torch and callers can
     # check available() first.
     if name in {"compare", "ulp_diff", "Report", "check"}:
         require()
-        from drover.verify import compare as _c
+        from hipbridge.verify import compare as _c
 
         return getattr(_c, name)
     raise AttributeError(name)

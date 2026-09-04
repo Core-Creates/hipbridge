@@ -1,6 +1,6 @@
 """Command line interface.
 
-Note the import discipline: drover.kernels and drover.verify are imported
+Note the import discipline: hipbridge.kernels and hipbridge.verify are imported
 *inside* functions, never at module level, so the CLI works with core alone.
 tests/test_layering.py enforces this.
 """
@@ -10,10 +10,10 @@ from __future__ import annotations
 import argparse
 import sys
 
-from drover import __version__
-from drover.analysis import ARCHS, occupancy, roofline
-from drover.frontend import parse_file
-from drover.recognize import recognize, registered
+from hipbridge import __version__
+from hipbridge.analysis import ARCHS, occupancy, roofline
+from hipbridge.frontend import parse_file
+from hipbridge.recognize import recognize, registered
 
 
 def _cmd_inspect(args) -> int:
@@ -36,12 +36,12 @@ def _cmd_analyze(args) -> int:
 
 
 def _cmd_info(args) -> int:
-    print(f"drover {__version__}")
+    print(f"hipbridge {__version__}")
     print(f"recognizers: {', '.join(registered())}")
     print(f"architectures: {', '.join(ARCHS)}")
 
     # Lazy, guarded: core must run without either extra installed.
-    from drover import kernels, verify
+    from hipbridge import kernels, verify
 
     print(f"[kernels] extra: {'available' if kernels.available() else 'not installed'}")
     print(f"[verify]  extra: {'available' if verify.available() else 'not installed'}")
@@ -49,8 +49,8 @@ def _cmd_info(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="drover", description=__doc__)
-    p.add_argument("--version", action="version", version=f"drover {__version__}")
+    p = argparse.ArgumentParser(prog="hipbridge", description=__doc__)
+    p.add_argument("--version", action="version", version=f"hipbridge {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     insp = sub.add_parser("inspect", help="parse a .cu file and report recognized kernels")

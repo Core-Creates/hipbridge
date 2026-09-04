@@ -11,8 +11,8 @@ from pathlib import Path
 
 import clang.cindex as ci
 
-from drover.frontend.ir import KernelFacts, Param, SharedBuffer
-from drover.frontend.prelude import ATOMIC_NAMES, PRELUDE, SHUFFLE_NAMES
+from hipbridge.frontend.ir import KernelFacts, Param, SharedBuffer
+from hipbridge.frontend.prelude import ATOMIC_NAMES, PRELUDE, SHUFFLE_NAMES
 
 # __global__/__device__ are attribute keywords clang only accepts under -x cuda,
 # which additionally wants the CUDA SDK headers. Parsing as C++ with the

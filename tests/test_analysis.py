@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from drover import ARCHS, lds_padding, occupancy, roofline
+from hipbridge import ARCHS, lds_padding, occupancy, roofline
 
 
 def test_all_archs_are_64_wide_except_rdna():

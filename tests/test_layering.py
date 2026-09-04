@@ -1,7 +1,7 @@
 """The test that makes the future split possible.
 
 Core (frontend, recognize, analysis, cli) must never import an extra at module
-level. Violate this and drover.verify / drover.kernels can no longer be lifted
+level. Violate this and hipbridge.verify / hipbridge.kernels can no longer be lifted
 into their own distributions without a refactor, and core stops installing
 without torch.
 
@@ -16,8 +16,8 @@ from pathlib import Path
 
 import pytest
 
-SRC = Path(__file__).resolve().parents[1] / "src" / "drover"
-EXTRAS = {"drover.verify", "drover.kernels"}
+SRC = Path(__file__).resolve().parents[1] / "src" / "hipbridge"
+EXTRAS = {"hipbridge.verify", "hipbridge.kernels"}
 CORE = ["frontend", "recognize", "analysis", "cli.py", "__init__.py"]
 
 
@@ -53,13 +53,13 @@ def test_core_does_not_import_extras(path: Path):
 
 def test_core_imports_without_extras():
     """Core must be importable with neither extra present."""
-    import drover
+    import hipbridge
 
-    assert drover.__version__
+    assert hipbridge.__version__
 
 
 def test_extras_report_availability_without_raising():
-    from drover import kernels, verify
+    from hipbridge import kernels, verify
 
     assert isinstance(kernels.available(), bool)
     assert isinstance(verify.available(), bool)

@@ -8,8 +8,8 @@ cross-lane communication.
 
 from __future__ import annotations
 
-from drover.frontend.ir import KernelFacts, Pattern
-from drover.recognize.base import rule
+from hipbridge.frontend.ir import KernelFacts, Pattern
+from hipbridge.recognize.base import rule
 
 
 @rule("elementwise.flat", priority=90)
