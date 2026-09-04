@@ -44,6 +44,7 @@ _LAZY = {
     "TorchReference": "reference",
     "hip_include_flags": "reference",
     "to_wsl_path": "reference",
+    "wavefront_for": "reference",
     "wsl": "reference",
     # submodules
     "shapes": None,

@@ -260,6 +260,15 @@ def hip_include_flags(root: str | None = None) -> list[str]:
     return []
 
 
+def wavefront_for(arch: str) -> int:
+    """Wavefront width for a gfx target. CDNA is 64 wide, RDNA is 32."""
+    if arch.startswith("gfx9"):
+        return 64
+    if arch.startswith("gfx1"):
+        return 32
+    return 64
+
+
 def wsl(distro: str = "Ubuntu") -> list[str]:
     """Command prefix that runs the toolchain inside a WSL2 distribution.
 
@@ -374,6 +383,24 @@ class NativeReference(Reference):
                 flags += hip_include_flags()
         cmd = [self.toolchain, self._path(src), "-o", self._path(exe), "-O2", *flags]
         r = self._run(cmd, capture_output=True, text=True)
+
+        # Observed on an MI300X image whose apt HIP headers (/usr/include/hip)
+        # are a different ROCm version from the compiler (/opt/rocm/core-7.14):
+        #   amd_warp_functions.h: use of undeclared identifier
+        #   '__AMDGCN_WAVEFRONT_SIZE'
+        # The macro is normally predefined by the compiler. Supplying the value
+        # for the target arch is correct and lets the build proceed; matching
+        # header and compiler versions is the real fix.
+        if r.returncode != 0 and "__AMDGCN_WAVEFRONT_SIZE" in (r.stdout + r.stderr):
+            arch = next(
+                (f.split("=", 1)[1] for f in flags if f.startswith("--offload-arch=")),
+                "gfx942",
+            )
+            retry = [*cmd, f"-D__AMDGCN_WAVEFRONT_SIZE={wavefront_for(arch)}"]
+            r = self._run(retry, capture_output=True, text=True)
+            if r.returncode == 0:
+                cmd = retry
+
         if r.returncode != 0:
             # nvcc reports fatal driver errors (a missing host compiler, for one)
             # on stdout, not stderr. Reporting only stderr yields an empty
@@ -431,5 +458,6 @@ __all__ = [
     "TorchReference",
     "hip_include_flags",
     "to_wsl_path",
+    "wavefront_for",
     "wsl",
 ]

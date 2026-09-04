@@ -50,19 +50,19 @@ int main() {
     float *d_in = nullptr, *d_out = nullptr;
     if (hipMalloc(&d_in, n * sizeof(float)) != hipSuccess) { printf("FAIL: hipMalloc\n"); return 2; }
     if (hipMalloc(&d_out, n * sizeof(float)) != hipSuccess) { printf("FAIL: hipMalloc\n"); return 2; }
-    hipMemcpy(d_in, h_in.data(), n * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_in, h_in.data(), n * sizeof(float), hipMemcpyHostToDevice);
 
     // Sentinel, exactly as the generated driver does: catches a kernel that
     // never stores, which would otherwise pass on whatever the allocator gave.
     std::vector<float> sentinel(n, -12345.0f);
-    hipMemcpy(d_out, sentinel.data(), n * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_out, sentinel.data(), n * sizeof(float), hipMemcpyHostToDevice);
 
     hipLaunchKernelGGL(row_softmax, dim3(rows,1,1), dim3(1,1,1), 0, 0, d_in, d_out, rows, cols);
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) { printf("FAIL: kernel error: %s\n", hipGetErrorString(err)); return 3; }
 
-    hipMemcpy(h_out.data(), d_out, n * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_out.data(), d_out, n * sizeof(float), hipMemcpyDeviceToHost);
 
     int untouched = 0;
     for (int i = 0; i < n; i++) if (h_out[i] == -12345.0f) untouched++;
@@ -165,7 +165,43 @@ else
     exit 6
 fi
 
+# Wavefront width for the target. CDNA (gfx9xx) is 64 wide; RDNA (gfx10xx and
+# later) is 32. Used only if the header/compiler mismatch below needs papering.
+case "$ARCH" in
+    gfx9*)  WAVE=64 ;;
+    gfx1*)  WAVE=32 ;;
+    *)      WAVE=64 ;;
+esac
+
 echo "compiling: hipcc $FLAGS"
-hipcc $FLAGS "$WORK/smoke.hip.cpp" -o "$WORK/smoke"
+if hipcc $FLAGS "$WORK/smoke.hip.cpp" -o "$WORK/smoke" 2>"$WORK/err.txt"; then
+    :
+elif grep -q '__AMDGCN_WAVEFRONT_SIZE' "$WORK/err.txt"; then
+    # The apt headers (/usr/include/hip) and the compiler (/opt/rocm/core-*) come
+    # from different ROCm versions. The headers reference __AMDGCN_WAVEFRONT_SIZE,
+    # which this clang does not predefine under that spelling. Supplying it for
+    # the detected arch is correct and lets the build proceed; the proper fix is
+    # to install headers matching the compiler version.
+    echo
+    echo "  header/compiler version mismatch: __AMDGCN_WAVEFRONT_SIZE undefined"
+    echo "  retrying with -D__AMDGCN_WAVEFRONT_SIZE=$WAVE (correct for $ARCH)"
+    FLAGS="$FLAGS -D__AMDGCN_WAVEFRONT_SIZE=$WAVE"
+    if ! hipcc $FLAGS "$WORK/smoke.hip.cpp" -o "$WORK/smoke" 2>"$WORK/err2.txt"; then
+        echo
+        echo "still failing:"
+        tail -25 "$WORK/err2.txt"
+        echo
+        echo "The headers in $HIP_INC do not match the compiler in"
+        echo "$(dirname "$(dirname "$(command -v hipcc)")")."
+        echo "Install headers matching the compiler, e.g. a version-pinned package:"
+        echo "    apt-cache search --names-only 'libamdhip64' "
+        echo "    apt-get install -y libamdhip64-dev=<version matching HIP 7.14>"
+        exit 7
+    fi
+else
+    echo "compile failed:"
+    tail -25 "$WORK/err.txt"
+    exit 7
+fi
 echo "running..."
 "$WORK/smoke"
