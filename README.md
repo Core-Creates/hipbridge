@@ -122,6 +122,20 @@ Run it with `runner: ubuntu-latest` for a free dry run that proves the
 plumbing without spending anything. Switch to `self-hosted` once a runner is
 registered on a rented box.
 
+### On an AMD ROCm box
+
+```bash
+gh auth login && gh repo clone Core-Creates/hipbridge
+cd hipbridge && bash scripts/bootstrap-amd.sh
+```
+
+ROCm images ship a ROCm-built PyTorch plus `pytorch-triton-rocm`. **Do not
+reinstall either from PyPI**, which would replace them with NVIDIA builds and
+break the GPU you are paying for. The `verify` extra therefore declares `torch`
+and nothing else; on such a box Triton arrives with the platform PyTorch, and
+`hipbridge.kernels` picks it up from there. A test asserts the extra never
+regrows a `triton` dependency.
+
 ### Status of what has actually been run
 
 | Path | State |

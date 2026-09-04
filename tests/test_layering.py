@@ -63,3 +63,51 @@ def test_extras_report_availability_without_raising():
 
     assert isinstance(kernels.available(), bool)
     assert isinstance(verify.available(), bool)
+
+
+# --- extras must declare exactly what they import --------------------------
+
+TOP_LEVEL = {"torch", "triton", "numpy", "clang", "yaml"}
+
+
+def _third_party_imports(pkg_dir: Path) -> set[str]:
+    """Top-level third-party modules imported anywhere under pkg_dir."""
+    found: set[str] = set()
+    for path in pkg_dir.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                found |= {a.name.split(".")[0] for a in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                found.add(node.module.split(".")[0])
+    return found & TOP_LEVEL
+
+
+def _extra(name: str) -> set[str]:
+    import tomllib
+
+    data = tomllib.loads((SRC.parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
+    deps = data["project"]["optional-dependencies"][name]
+    return {d.split(";")[0].split(">=")[0].split("==")[0].strip() for d in deps}
+
+
+def test_verify_extra_does_not_declare_triton():
+    """Regression, and it would have broken the AMD box specifically.
+
+    verify/ imports torch and nothing else. Declaring triton there makes
+    `pip install .[verify]` pull the NVIDIA-flavoured triton wheel over the
+    pytorch-triton-rocm that ROCm PyTorch depends on, breaking the very GPU the
+    harness was installed to test.
+    """
+    assert "triton" not in _extra("verify")
+    assert "triton" not in _third_party_imports(SRC / "verify")
+
+
+def test_each_extra_declares_what_its_package_imports():
+    for extra, pkg in (("verify", "verify"), ("kernels", "kernels")):
+        imported = _third_party_imports(SRC / pkg)
+        declared = _extra(extra)
+        # torch is supplied by the platform on ROCm images, so kernels may
+        # import it without declaring it; triton may not be over-declared.
+        undeclared = imported - declared - {"torch"}
+        assert not undeclared, f"[{extra}] imports {undeclared} without declaring it"

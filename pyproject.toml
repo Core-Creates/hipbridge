@@ -27,17 +27,21 @@ dependencies = [
 
 [project.optional-dependencies]
 # Each extra maps 1:1 to a src/hipbridge/<name>/ package that is a candidate
-# for promotion to its own distribution later. Keep that mapping honest.
+# for promotion to its own distribution later. Keep that mapping honest: an
+# extra must declare what its package imports, and nothing else.
 #
 # Triton publishes Linux wheels only. The marker keeps `pip install .[kernels]`
 # from hard-failing on Windows/macOS instead of degrading gracefully.
 kernels = [
     "triton>=3.0; platform_system == 'Linux'",
 ]
+# verify/ imports torch and nothing else. It must NOT declare triton: on a ROCm
+# machine that pulls the NVIDIA-flavoured triton wheel over the
+# pytorch-triton-rocm that ROCm PyTorch depends on, breaking the very GPU the
+# harness was installed to test. On such a box triton arrives with the platform
+# PyTorch, which is what hipbridge.kernels then picks up.
 verify = [
-    "triton>=3.0; platform_system == 'Linux'",
     "torch>=2.4",
-    "numpy>=1.24",
 ]
 dev = [
     "pytest>=8.0",
