@@ -18,6 +18,7 @@ from __future__ import annotations
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -172,6 +173,55 @@ _HIP_TOKENS = {
 SENTINEL = -12345.0
 
 
+def _device_present(toolchain: str) -> bool:
+    """Is a real device visible to the vendor runtime?
+
+    Deliberately NOT torch.cuda.is_available(). The CPU-only torch wheel is the
+    default on Windows and on any `pip install torch` without a vendor index, so
+    torch reports no CUDA on machines that plainly have a working GPU and
+    toolkit. NativeReference compiles and runs its own binary and never touches
+    torch's runtime, so gating on torch's build flavour is simply the wrong
+    question.
+    """
+    probe = "nvidia-smi" if toolchain == "nvcc" else "rocm-smi"
+    if shutil.which(probe):
+        try:
+            r = subprocess.run(
+                [probe, "-L"] if probe == "nvidia-smi" else [probe],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                return True
+        except (OSError, subprocess.SubprocessError):
+            pass
+    # Fall back to torch only as a secondary signal, never as the gate.
+    return bool(toolchain == "nvcc" and torch.cuda.is_available())
+
+
+def _host_compiler_missing(toolchain: str) -> str:
+    """nvcc drives a host C++ compiler and cannot build without one.
+
+    On Windows that is MSVC cl.exe, which is a separate install from the CUDA
+    toolkit and from Visual Studio itself. Missing it produces
+    `nvcc fatal: Cannot find compiler 'cl.exe' in PATH` at build time, so it is
+    checked here instead: an availability probe that reports ok and then fails
+    on the next call is worse than useless.
+
+    Returns a reason string when unusable, empty when fine.
+    """
+    if toolchain != "nvcc" or sys.platform != "win32":
+        return ""
+    if shutil.which("cl"):
+        return ""
+    return (
+        "nvcc present but MSVC host compiler (cl.exe) not on PATH. "
+        "Install the Visual Studio Build Tools C++ workload, then run from a "
+        "Developer Command Prompt, or build under WSL2 where nvcc uses gcc."
+    )
+
+
 @dataclass
 class NativeReference(Reference):
     """Compile and run the original kernel source on a real device."""
@@ -187,8 +237,11 @@ class NativeReference(Reference):
         exe = shutil.which(self.toolchain)
         if exe is None:
             return Availability(False, f"{self.toolchain} not on PATH")
-        if self.toolchain == "nvcc" and not torch.cuda.is_available():
-            return Availability(False, "nvcc present but no CUDA device visible")
+        if not _device_present(self.toolchain):
+            return Availability(False, f"{self.toolchain} present but no device visible")
+        host = _host_compiler_missing(self.toolchain)
+        if host:
+            return Availability(False, host)
         return Availability(True)
 
     def _render_driver(self) -> str:
@@ -224,7 +277,15 @@ class NativeReference(Reference):
         cmd = [self.toolchain, str(src), "-o", str(exe), "-O2", *self.extra_flags]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
-            raise RuntimeError(f"{self.toolchain} failed:\n{r.stderr[-2000:]}")
+            # nvcc reports fatal driver errors (a missing host compiler, for one)
+            # on stdout, not stderr. Reporting only stderr yields an empty
+            # message for the most common Windows failure there is.
+            detail = "\n".join(x for x in (r.stdout.strip(), r.stderr.strip()) if x)
+            raise RuntimeError(
+                f"{self.toolchain} failed (exit {r.returncode}):\n"
+                f"{detail[-2000:] or '(no output)'}\n"
+                f"command: {' '.join(cmd)}"
+            )
         self._built = exe
         return exe
 
