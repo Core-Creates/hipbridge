@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drover"
+version = "0.1.0.dev0"
+description = "Recognize CUDA kernels, substitute verified AMD implementations, prove it numerically"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [{ name = "Corrina Alcoser" }]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Compilers",
+]
+
+# Core stays deliberately light: a C++ frontend and pure-arithmetic analysis.
+# Everything heavy lives behind an extra.
+dependencies = [
+    "libclang>=16.0",
+]
+
+[project.optional-dependencies]
+# Each extra maps 1:1 to a src/drover/<name>/ package that is a candidate
+# for promotion to its own distribution later. Keep that mapping honest.
+#
+# Triton publishes Linux wheels only. The marker keeps `pip install .[kernels]`
+# from hard-failing on Windows/macOS instead of degrading gracefully.
+kernels = [
+    "triton>=3.0; platform_system == 'Linux'",
+]
+verify = [
+    "triton>=3.0; platform_system == 'Linux'",
+    "torch>=2.4",
+    "numpy>=1.24",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+]
+all = ["drover[kernels,verify]"]
+
+[project.scripts]
+drover = "drover.cli:main"
+
+[project.urls]
+Repository = "https://github.com/iaintheardofu/drover"
+Issues = "https://github.com/iaintheardofu/drover/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+src = ["src"]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "gpu: requires a physical GPU",
+    "amd: requires an AMD GPU (ROCm)",
+    "nvidia: requires an NVIDIA GPU (CUDA)",
+]
