@@ -49,7 +49,16 @@ def test_builtin_suites_are_well_formed():
 
 
 @needs_verify
-def test_candidate_resolves_and_is_callable():
+def test_candidate_resolves_and_actually_runs():
+    """If a candidate is offered, it must be runnable here.
+
+    Regression: kernels.available() used to check only that Triton imports.
+    Triton installs fine on a CPU-only Linux runner and then raises
+    `0 active drivers` at launch, so the Triton candidate was offered on a
+    machine that could not run it. Offering an unusable implementation is worse
+    than offering the fallback, because the failure surfaces at launch rather
+    than at selection.
+    """
     import torch
 
     from hipbridge.verify import suites
@@ -58,6 +67,20 @@ def test_candidate_resolves_and_is_callable():
     assert callable(fn) and described
     out = fn(torch.randn(4, 32))
     assert out.shape == (4, 32)
+
+
+def test_kernels_availability_means_runnable():
+    """available() must answer 'can I launch', not 'did the import succeed'."""
+    from hipbridge import kernels
+
+    if not kernels.available():
+        pytest.skip("[kernels] not usable here, which is the point")
+    import torch
+
+    from hipbridge.kernels.softmax import softmax_rowwise
+
+    x = torch.randn(2, 64, device="cuda")
+    assert softmax_rowwise(x).shape == (2, 64)
 
 
 @needs_verify
