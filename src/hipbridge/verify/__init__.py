@@ -44,6 +44,11 @@ _LAZY = {
     "shapes": None,
 }
 
+# Submodules that genuinely have no torch dependency and must stay importable
+# with core alone. Gating these behind require() would be a lie about what they
+# need, and it breaks `from hipbridge.verify import shapes` on a core install.
+_TORCH_FREE = frozenset({"shapes"})
+
 
 class VerifyUnavailable(ImportError):
     """Raised when the [verify] extra is not installed."""
@@ -67,9 +72,13 @@ def __getattr__(name: str):
     # Lazy so `import hipbridge.verify` and available() work without torch.
     if name not in _LAZY:
         raise AttributeError(name)
-    require()
+
     import importlib
 
+    if name in _TORCH_FREE:
+        return importlib.import_module(f"hipbridge.verify.{name}")
+
+    require()
     mod = importlib.import_module(f"hipbridge.verify.{_LAZY[name] or name}")
     return mod if _LAZY[name] is None else getattr(mod, name)
 

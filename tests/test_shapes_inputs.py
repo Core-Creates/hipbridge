@@ -1,3 +1,10 @@
+"""Shape enumeration runs on core alone; input generation needs the extra.
+
+Kept in one file deliberately, with the split expressed per-test rather than
+per-module, so the torch-free half is exercised by the no-extras CI job. A
+module-level skipif would hide it there.
+"""
+
 from __future__ import annotations
 
 import pytest
@@ -5,7 +12,22 @@ import pytest
 from hipbridge import verify
 from hipbridge.verify import shapes as sh
 
-pytestmark = pytest.mark.skipif(not verify.available(), reason="[verify] extra not installed")
+needs_verify = pytest.mark.skipif(not verify.available(), reason="[verify] extra not installed")
+
+
+# --- torch-free: must run on a core install -------------------------------
+
+
+def test_shapes_import_without_the_verify_extra():
+    """Regression: shapes.py has no torch dependency and must not pretend to.
+
+    The lazy __getattr__ in hipbridge.verify used to call require() for every
+    name, so this import raised on a core install. VerifyUnavailable subclasses
+    ImportError rather than AttributeError, so Python's normal submodule-import
+    fallback never fired and the error escaped.
+    """
+    assert sh.WAVEFRONT == 64
+    assert callable(sh.row_wise)
 
 
 def test_row_shapes_straddle_the_wavefront():
@@ -24,6 +46,15 @@ def test_elementwise_includes_zero_and_non_multiples():
     assert sh.is_wavefront_aligned(1024)
 
 
+def test_sample_can_truncate():
+    assert len(sh.sample(sh.row_wise(), limit=5)) == 5
+    assert len(sh.sample(sh.row_wise())) > 5
+
+
+# --- needs torch ----------------------------------------------------------
+
+
+@needs_verify
 def test_generation_is_deterministic_for_a_seed():
     import torch
 
@@ -32,6 +63,7 @@ def test_generation_is_deterministic_for_a_seed():
     assert torch.equal(a, b)
 
 
+@needs_verify
 def test_distributions_actually_differ():
     import torch
 
@@ -46,6 +78,7 @@ def test_distributions_actually_differ():
     assert (sparse == 0).float().mean() > 0.5
 
 
+@needs_verify
 def test_large_distribution_overflows_naive_exp():
     """The whole reason LARGE exists: naive exp() must actually blow up on it."""
     import torch
@@ -54,6 +87,7 @@ def test_large_distribution_overflows_naive_exp():
     assert torch.isinf(torch.exp(x)).any(), "LARGE is not large enough to catch overflow"
 
 
+@needs_verify
 def test_native_reference_reports_unavailable_without_a_toolchain():
     """Must degrade with a reason, never raise at construction."""
     ref = verify.NativeReference(
