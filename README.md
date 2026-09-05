@@ -3,10 +3,12 @@
 Recognize CUDA kernels, substitute verified AMD implementations, prove it numerically.
 
 **Status: pre-alpha.** Correctness has been verified on real hardware, on both
-vendors: nvcc on an RTX 4060 via WSL2, and hipcc on an MI300X (gfx942). See
+vendors: nvcc on an RTX 4060 via WSL2, and hipcc on an MI300X (gfx942).
+Performance has been measured on the MI300X, 17.8x to 76.8x, with the
+measurement conditions stated alongside it. See
 [the status table](#status-of-what-has-actually-been-run) for exactly which
-paths those are. Performance has not been measured yet. Claims in this README
-are limited to what has actually been run, never to what should follow from it.
+paths those are. Claims in this README are limited to what has actually been
+run, never to what should follow from it.
 
 ## Design rules
 
@@ -154,6 +156,7 @@ regrows a `triton` dependency.
 | CPU, torch oracle | verified |
 | NVIDIA, nvcc on RTX 4060 via WSL2 | verified, 56/56 cases |
 | AMD, hipcc on MI300X (gfx942) | **verified**, 84/84 cases |
+| AMD, timed on MI300X (gfx942) | **measured**, 17.8x to 76.8x |
 
 ## The result this project was built to get
 
@@ -164,18 +167,35 @@ Triton kernel checked against the original `row_softmax.cu` compiled with
 ```
 candidate: hipbridge.kernels.softmax (Triton, AMD-tuned)
 PASS  row_softmax vs original on hipcc: 84/84 cases, worst ulp=593
+      [accuracy vs original: better=6, equivalent=78, up to 297x closer to float64]
 ```
 
 **593 ULP of divergence, and it passes.** That is the entire argument.
 
 The Triton kernel reduces pairwise across a 64-wide wavefront; the original
 accumulates serially, which grows rounding error as O(n) rather than O(log n).
-So the two disagree enormously, and the Triton one is *closer to float64 truth*.
+So the two disagree enormously, and where the disagreement is large enough to
+resolve, the Triton one is *closer to float64 truth*.
 
 Judged the obvious way, "does the translation match the original within a ULP
 budget", this run scores **0/84** and the better kernel is rejected. Judged
 against a float64 oracle, it scores 84/84. Matching the original would have
 meant reproducing its rounding error.
+
+Read the verdict breakdown precisely, because it is a narrower claim than "more
+accurate everywhere":
+
+- On **78 of 84** cases both implementations land at the float32 noise floor.
+  Neither is meaningfully closer to truth and the tool calls that equivalent.
+- On **6** cases the original climbs off the floor and the Triton kernel does
+  not, and there it is up to **297x** closer to float64. Those are the inputs
+  the sweep exists to generate: sparse, mixed-sign, and large-magnitude.
+- **Never worse.** Not once in 84.
+
+So the honest statement is not that the substitution is always more accurate.
+It is that the two are indistinguishable on ordinary inputs, and on the inputs
+built to expose serial accumulation the substitution is far closer to truth and
+never further from it.
 
 The same effect was first measured on an RTX 4060, where the original kernel
 was 1.4x to 59.7x less accurate than torch across every shape and distribution
@@ -193,11 +213,21 @@ PASS: hipcc built it, MI300X ran it, the numbers are right.
 every output element was written, so this is not a kernel that silently skipped
 its store.
 
-**Caveat on that box:** the apt HIP headers (`/usr/include/hip`) are a different
-ROCm version from the compiler (`/opt/rocm/core-7.14`), so `__AMDGCN_WAVEFRONT_SIZE`
-is undefined and the build is retried with `-D__AMDGCN_WAVEFRONT_SIZE=64`. That
-value is correct for gfx942, but it papers over a real version skew. Match the
-header and compiler versions before trusting performance numbers.
+**On the header skew, since the workaround is still in the code.** That box
+first ran with Ubuntu's `libamdhip64-dev` 5.7.1 headers in `/usr/include/hip`
+against a 7.14 compiler in `/opt/rocm/core-7.14`, which leaves
+`__AMDGCN_WAVEFRONT_SIZE` undefined and forces the retry with
+`-D__AMDGCN_WAVEFRONT_SIZE=64`. Installing `amdrocm-runtime-dev7.14` puts
+matching 7.14.60850 headers under `/opt/rocm/include` and removing the 5.7
+package clears the ambiguity, after which the compile line carries no `-D` at
+all. Everything published here was re-run on matched headers.
+
+Worth recording: the numbers did not move. The smoke test returned bit-identical
+figures before and after, and the timings shifted less than run-to-run variance.
+The workaround was harmless, which was a reasonable guess and is now a measured
+fact rather than a hope. `scripts/install-hip-headers.sh` still leads with
+`libamdhip64-dev`, which is the trap; on ROCm 7 the package you want is
+`amdrocm-runtime-dev7.14`.
 
 ## Benchmarking against the original
 
@@ -254,17 +284,43 @@ WARNING: no GPU visible to torch, so the candidate runs on the host
          wheel; Triton has no Windows build either.
 ```
 
-### No performance numbers yet
+### Measured on an MI300X
 
-There are deliberately none in this README. The command runs end to end, but it
-has not yet produced a single comparable pair of timings: on the Windows box
-torch is CPU-only, so every line came back `NOT COMPARABLE`, and it has not been
-run on the MI300X yet.
+```
+row_softmax on hipcc, device=cuda, reps=100
+  candidate: hipbridge.kernels.softmax (Triton, AMD-tuned)
+  original : row_softmax.cu compiled with hipcc
 
-When it is, the version skew described above has to be resolved first. Timing a
-reference built with `-D__AMDGCN_WAVEFRONT_SIZE=64` papering over a
-header/compiler mismatch is not a number worth publishing. Match the header and
-compiler versions, then run it, and this section gets a table.
+      1x1024  original     323.7 us   candidate      18.1 us     17.8x
+     64x1024  original     334.9 us   candidate      17.7 us     18.9x
+   1024x1024  original     388.3 us   candidate      18.2 us     21.3x
+   4096x4096  original    2434.3 us   candidate      31.7 us     76.8x
+```
+
+Conditions, because a ratio without them is not a measurement:
+
+- AMD Instinct MI300X **VF** (a virtualized partition, not a whole card),
+  gfx942, HIP 7.14.60850 with matched headers, torch 2.9.1+rocm6.4
+- 100 reps per shape after warmup, device events both sides
+- every shape verified correct at that shape before it was timed
+- four independent runs, two of them by a different operator: the 4096x4096
+  figure landed at 76.8x, 76.8x, 77.0x and 77.3x, and the small shapes within
+  about 5%
+
+**Read the comparison honestly. Much of this gap is the original's launch
+configuration, not the language it is written in.** `row_softmax.cu` launches
+with `block=(1,1,1)`, one thread per block, so it uses 1/64th of a wavefront and
+leaves a 304-CU device essentially idle. A competently launched HIP kernel would
+close a large part of the distance. What the table measures is the substitution
+as a whole, a naive original replaced by a tuned implementation, which is the
+transaction hipbridge actually offers.
+
+The shape of the curve is more informative than any single ratio. The candidate
+is flat at roughly 18 us from 1x1024 through 1024x1024, so at those sizes it is
+launch-latency bound rather than compute bound, and only starts doing real work
+at 4096x4096. The original is nearly flat too, 324 us to 388 us across a
+1000-fold increase in data, which is the signature of serialization rather than
+memory traffic: it is not moving bytes, it is waiting on one thread.
 
 The prior expectation, recorded here so it can be checked rather than quietly
 revised afterwards: the original `row_softmax.cu` launches with `block=(1,1,1)`,
