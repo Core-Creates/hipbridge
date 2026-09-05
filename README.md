@@ -4,8 +4,10 @@ Recognize CUDA kernels, substitute verified AMD implementations, prove it numeri
 
 **Status: pre-alpha.** Correctness has been verified on real hardware, on both
 vendors: nvcc on an RTX 4060 via WSL2, and hipcc on an MI300X (gfx942).
-Performance has been measured on the MI300X, 17.8x to 76.8x, with the
-measurement conditions stated alongside it. See
+Performance has been measured on the MI300X against three baselines: 17x to
+76x against the naive original, **2.9x against a competently written HIP
+kernel** at large shapes, and a 3x to 5x regression below roughly 16M elements.
+See
 [the status table](#status-of-what-has-actually-been-run) for exactly which
 paths those are. Claims in this README are limited to what has actually been
 run, never to what should follow from it.
@@ -166,7 +168,7 @@ regrows a `triton` dependency.
 | CPU, torch oracle | verified |
 | NVIDIA, nvcc on RTX 4060 via WSL2 | verified, 56/56 cases |
 | AMD, hipcc on MI300X (gfx942) | **verified**, 84/84 cases |
-| AMD, timed on MI300X (gfx942) | **measured**, 17.8x to 76.8x |
+| AMD, timed on MI300X (gfx942) | **measured**, 2.9x vs tuned HIP at scale, slower below it |
 
 ## The result this project was built to get
 
@@ -242,34 +244,57 @@ the fault on the same box to check: with only the 5.7 headers present, one run
 of the script installs `amdrocm-runtime-dev7.14`, removes the stale tree under
 `PURGE_STALE=1`, and the smoke test, verify and bench all pass afterwards.
 
-## Benchmarking against the original
+## Benchmarking against baselines that can win
 
 Correctness does not justify a substitution on its own. If the tuned kernel is
-not faster there is no reason to swap it in, so `bench` times both sides on the
+not faster there is no reason to swap it in, so `bench` times every side on the
 same device, at the same shape, with one stated method.
 
 ```bash
-hipbridge bench --toolchain hipcc --arch gfx942 --reps 100
+hipbridge bench --toolchain hipcc --arch gfx942 --reps 100 --runs 5
 hipbridge bench --toolchain nvcc --wsl Ubuntu --shapes 1x1024,4096x4096
 ```
 
-Defaults are `--shapes 1x1024,64x1024,1024x1024,4096x4096` and `--reps 100`.
-`--examples`, `--wsl`, and `--require` behave as they do for `verify`.
+Defaults are `--shapes 1x1024,64x1024,1024x1024,4096x4096`, `--reps 100` and
+`--runs 5`. `--examples`, `--wsl`, and `--require` behave as they do for
+`verify`.
+
+**Three baselines, not one**, because a benchmark is only as honest as the
+thing it beats:
+
+| Baseline | What it answers |
+|---|---|
+| `original` | what does replacing this exact kernel buy me |
+| `tuned HIP` | would a competent engineer have done as well by hand |
+| `torch` | why not just call the library |
+
+`row_softmax.cu` launches one thread per block, so beating it is not evidence of
+anything. `row_softmax_tuned.cu` is the same maths written properly, one block
+per row with tree reductions in shared memory, and it is what the claim should
+be measured against. `torch.softmax` is what a user has instead of any of this.
 
 Method, stated in `verify/bench.py` because a benchmark without one is an
 anecdote:
 
-- The original is timed **inside the generated driver** with device events, so
-  file I/O and host copies are excluded. Those otherwise dominate and make every
-  kernel look identical.
-- The candidate is timed with device events too, never wall clock.
-- Both sides get warmup iterations before any timing, to pay JIT and cache costs
-  once rather than charge them to the first measurement.
-- The figure reported is the per-iteration mean over `reps` back-to-back
-  launches.
+- Native kernels are timed **inside the generated driver** with device events,
+  so file I/O and host copies are excluded. Those otherwise dominate and make
+  every kernel look identical.
+- The candidate and the torch baseline are timed with device events too, never
+  wall clock, and through the same Python path so the two carry the same
+  dispatch cost.
+- Every side gets warmup iterations before any timing, to pay JIT and cache
+  costs once rather than charge them to the first measurement.
+- One run is the mean over `reps` back-to-back launches. The table reports the
+  **median across `runs` of those, with min and max beside it**, because a lone
+  mean hid a 15% spread on small shapes.
+- Shapes where the candidate never approaches the throughput it reaches at
+  larger sizes are labelled **`latency-bound`**. A ratio there describes
+  dispatch overhead, not the kernel.
 - **A shape is timed only after it verified correct at that shape.** Shapes that
   did not verify are still printed, tagged `(UNVERIFIED at this shape)`. A fast
-  wrong kernel is not a result.
+  wrong kernel is not a result. Additional baselines are arbitrated against the
+  float64 oracle before being timed, so a fast baseline that computes the wrong
+  thing cannot flatter the candidate.
 
 ### It refuses to report a ratio it cannot stand behind
 
@@ -300,50 +325,77 @@ WARNING: no GPU visible to torch, so the candidate runs on the host
 ### Measured on an MI300X
 
 ```
-row_softmax on hipcc, device=cuda, reps=100
+row_softmax on hipcc, device=cuda, reps=100, runs=5
   candidate: hipbridge.kernels.softmax (Triton, AMD-tuned)
   original : row_softmax.cu compiled with hipcc
+  tuned HIP: row_softmax_tuned.cu compiled with hipcc
+  torch    : library call, timed like the candidate
 
-      1x1024  original     323.7 us   candidate      18.1 us     17.8x
-     64x1024  original     334.9 us   candidate      17.7 us     18.9x
-   1024x1024  original     388.3 us   candidate      18.2 us     21.3x
-   4096x4096  original    2434.3 us   candidate      31.7 us     76.8x
+       shape        original (us)     tuned HIP (us)         torch (us)     candidate (us)  vs original  vs tuned HIP  vs torch
+      1x1024   326.1 [325.9-326.2]      3.9 [3.9-4.0]      5.5 [5.4-5.5]   17.1 [16.9-17.3]       19.1x         0.2x      0.3x  (latency-bound)
+     64x1024   334.4 [334.4-334.4]      4.1 [4.1-4.2]      5.9 [5.6-5.9]   19.7 [19.5-20.4]       17.0x         0.2x      0.3x  (latency-bound)
+   1024x1024   363.6 [363.4-364.0]      5.6 [5.6-5.6]      5.2 [5.2-5.5]   17.0 [15.4-18.2]       21.4x         0.3x      0.3x  (latency-bound)
+   4096x4096  2430.4 [2429.3-2432.3]   93.5 [92.4-94.0]   40.3 [40.2-48.3]  31.8 [31.5-32.0]      76.4x         2.9x      1.3x
+   8192x4096  3431.6 [3428.2-3433.2]  180.0 [178.6-180.4] 73.2 [72.0-80.0]  61.2 [60.4-61.3]      56.1x         2.9x      1.2x
 ```
+
+Median across 5 runs of 100 reps, min and max beside it.
+
+**The 76x is the least interesting number here, and it is close to meaningless.**
+It is measured against `row_softmax.cu`, which launches one thread per block and
+leaves a 304-CU device idle. Any competent kernel beats it. That is why the
+table carries two baselines that can actually win.
+
+Read the last two columns instead:
+
+| Regime | vs a competent HIP kernel | vs `torch.softmax` | Verdict |
+|---|---|---|---|
+| Rows up to ~1M elements | **0.2x to 0.3x** | **0.3x** | the substitution is a **regression** |
+| 16M elements and up | **2.9x** | **1.2x to 1.3x** | the substitution is worth making |
+
+So the honest claim is not "77x faster". It is: **at large shapes the tuned
+Triton kernel beats a competently written HIP kernel by 2.9x and torch by about
+1.25x, and below roughly 16M elements it loses to both by 3x to 5x.**
+
+The crossover is dispatch cost, and it is measurable rather than assumed. On
+this box, an in-place torch op that does no work at all costs **4.9 us** to
+launch from Python, `torch.softmax` on a 1x1024 row costs **5.5 us**, and the
+Triton candidate costs **17 us**. About 12 us of that is Triton's own launch
+path, and it is fixed, so it dominates until the kernel has real work to do.
+Below the crossover the ratio describes dispatch overhead, not the kernel, which
+is what the `latency-bound` label marks.
+
+One asymmetry worth stating: the native baselines are timed inside the generated
+C++ driver with device events, so they never pay Python dispatch, while the
+candidate and torch are timed through Python and do. That flatters the native
+side by roughly 5 us. It does not change any conclusion here, because the gaps
+at small shapes are 12 us and more, and at large shapes the candidate wins
+anyway.
+
+`row_softmax_tuned.cu` is not a straw baseline either, and it is not optimal:
+one block per row, 256 threads, two shared-memory tree reductions, three passes
+over memory. torch beats it 2.3x at 4096x4096 because a fused implementation
+moves less data. A better hand-written kernel would narrow the 2.9x, and if
+someone writes one, that is a result worth having rather than an embarrassment.
 
 Conditions, because a ratio without them is not a measurement:
 
 - AMD Instinct MI300X **VF** (a virtualized partition, not a whole card),
   gfx942, HIP 7.14.60850 with matched headers, torch 2.9.1+rocm6.4
-- 100 reps per shape after warmup, device events both sides
-- every shape verified correct at that shape before it was timed
-- five independent runs, two of them by a different operator: the 4096x4096
-  figure landed between 74.4x and 77.3x, and the small shapes vary by about 15%
-  run to run (17.4x to 20.4x at 1x1024), which is what a launch-latency-bound
-  measurement looks like
+- every shape verified correct at that shape before it was timed, and each
+  additional baseline arbitrated against the float64 oracle before being timed,
+  so a fast baseline computing the wrong thing cannot flatter the candidate
+- the naive original's own curve is the tell: 326 us to 3432 us across a
+  32000-fold increase in data. It is not moving bytes, it is waiting on one
+  thread.
 
-**Read the comparison honestly. Much of this gap is the original's launch
-configuration, not the language it is written in.** `row_softmax.cu` launches
-with `block=(1,1,1)`, one thread per block, so it uses 1/64th of a wavefront and
-leaves a 304-CU device essentially idle. A competently launched HIP kernel would
-close a large part of the distance. What the table measures is the substitution
-as a whole, a naive original replaced by a tuned implementation, which is the
-transaction hipbridge actually offers.
-
-The shape of the curve is more informative than any single ratio. The candidate
-is flat at roughly 18 us from 1x1024 through 1024x1024, so at those sizes it is
-launch-latency bound rather than compute bound, and only starts doing real work
-at 4096x4096. The original is nearly flat too, 324 us to 388 us across a
-1000-fold increase in data, which is the signature of serialization rather than
-memory traffic: it is not moving bytes, it is waiting on one thread.
-
-The prior expectation, recorded here so it can be checked rather than quietly
-revised afterwards: the original `row_softmax.cu` launches with `block=(1,1,1)`,
-one thread per block, which uses 1/64th of each wavefront on a 304-CU MI300X,
-while the Triton kernel uses the full 64-wide wavefront with a tree reduction.
-The gap should be large and should widen with row count. That is a prediction,
-not a result, and the whole point of the command is that it can disprove it.
+The prediction this table was built to test was "the gap should be large and
+should widen with row count". Against the naive original it held. Against a
+competent kernel it was **wrong below 16M elements**, in the direction that
+matters, and finding that out is the entire reason the second baseline exists.
 
 ## Layout and the future split
+
 
 `src/hipbridge/verify/` and `src/hipbridge/kernels/` are kept import-clean so
 each can be promoted to its own distribution without a refactor. Promote on
