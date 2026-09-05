@@ -168,6 +168,21 @@ def test_generated_driver_is_well_formed(toolchain):
 # --- benchmarking -----------------------------------------------------------
 
 
+def _row(shape, cand, original, tuned=None, device="cuda", verified=True):
+    """A ShapeRow built from plain numbers, so the reporting is testable on CPU."""
+    from hipbridge.verify.bench import Measurement, ShapeRow, Stat
+
+    bases = [Measurement("original", Stat((original,)), "cuda")]
+    if tuned is not None:
+        bases.append(Measurement("tuned HIP", Stat((tuned,)), "cuda"))
+    return ShapeRow(
+        shape=shape,
+        candidate=Measurement("candidate", Stat((cand,)), device),
+        baselines=tuple(bases),
+        verified=verified,
+    )
+
+
 @needs_verify
 def test_cross_device_comparison_is_refused():
     """A CPU candidate against a GPU reference is not a speedup.
@@ -177,38 +192,26 @@ def test_cross_device_comparison_is_refused():
     Ratios like that are how misleading benchmark tables get built, so the
     comparison is refused rather than footnoted.
     """
-    from hipbridge.verify.bench import BenchResult, Comparison
+    from hipbridge.verify.bench import render
 
-    cpu = Comparison(
-        candidate=BenchResult("candidate", 0.5, 10, (64, 64), "cpu"),
-        reference=BenchResult("original", 2.0, 10, (64, 64), "cuda"),
-        verified=True,
-    )
+    cpu = _row((64, 64), cand=0.5, original=2.0, device="cpu")
     assert not cpu.comparable
-    assert "NOT COMPARABLE" in str(cpu)
-    assert "4.0x" not in str(cpu), "a speedup must not be printed for mixed devices"
+    out = render([cpu])
+    assert "NOT COMPARABLE" in out
+    assert "4.0x" not in out, "a speedup must not be printed for mixed devices"
 
-    gpu = Comparison(
-        candidate=BenchResult("candidate", 0.5, 10, (64, 64), "cuda"),
-        reference=BenchResult("original", 2.0, 10, (64, 64), "cuda"),
-        verified=True,
-    )
+    gpu = _row((64, 64), cand=0.5, original=2.0)
     assert gpu.comparable
-    assert abs(gpu.speedup - 4.0) < 1e-9
-    assert "4.0x" in str(gpu)
+    assert abs(gpu.speedup("original") - 4.0) < 1e-9
+    assert "4.0x" in render([gpu])
 
 
 @needs_verify
 def test_unverified_shape_is_flagged_in_the_timing_line():
     """A fast wrong kernel is not a result."""
-    from hipbridge.verify.bench import BenchResult, Comparison
+    from hipbridge.verify.bench import render
 
-    c = Comparison(
-        candidate=BenchResult("candidate", 0.5, 10, (64, 64), "cuda"),
-        reference=BenchResult("original", 2.0, 10, (64, 64), "cuda"),
-        verified=False,
-    )
-    assert "UNVERIFIED" in str(c)
+    assert "UNVERIFIED" in render([_row((64, 64), cand=0.5, original=2.0, verified=False)])
 
 
 @needs_verify
@@ -232,3 +235,71 @@ def test_driver_emits_timing_instrumentation(toolchain):
     assert src.count("{") == src.count("}")
     ev = "hipEvent_t" if toolchain == "hipcc" else "cudaEvent_t"
     assert ev in src, "must time with device events, not wall clock"
+
+
+@needs_verify
+def test_table_reports_a_distribution_not_a_point():
+    """A single mean hides how far a small-shape timing moves between runs."""
+    from hipbridge.verify.bench import Measurement, ShapeRow, Stat, render
+
+    noisy = Stat((0.020, 0.016, 0.018, 0.019, 0.017))
+    assert abs(noisy.median - 0.018) < 1e-9
+    assert abs(noisy.spread - 1.25) < 1e-9
+    assert "18.0 [16.0-20.0]" == noisy.us()
+
+    row = ShapeRow(
+        shape=(1, 1024),
+        candidate=Measurement("candidate", noisy, "cuda"),
+        baselines=(Measurement("original", Stat((0.325, 0.334)), "cuda"),),
+        verified=True,
+    )
+    out = render([row])
+    assert "[16.0-20.0]" in out, "the range has to survive into the table"
+
+
+@needs_verify
+def test_latency_bound_shapes_are_labelled():
+    """A shape whose time does not scale with work is measuring dispatch."""
+    from hipbridge.verify.bench import render
+
+    # 1x1024 and 4096x4096 take almost the same time: the small one never gets
+    # near the throughput the large one shows, so it is launch-bound.
+    small = _row((1, 1024), cand=0.018, original=0.325)
+    large = _row((4096, 4096), cand=0.032, original=2.430)
+    out = render([small, large])
+
+    assert small.latency_bound, "a flat time across 16000x the work is dispatch overhead"
+    assert not large.latency_bound
+    lines = [ln for ln in out.splitlines() if ln.strip().startswith(("1x1024", "4096x4096"))]
+    assert "latency-bound" in lines[0]
+    assert "latency-bound" not in lines[1]
+
+
+@needs_verify
+def test_a_second_baseline_gets_its_own_ratio():
+    """The naive original and a competent kernel are different questions."""
+    from hipbridge.verify.bench import render
+
+    row = _row((4096, 4096), cand=0.032, original=2.430, tuned=0.040)
+    assert abs(row.speedup("original") - 75.9) < 0.1
+    assert abs(row.speedup("tuned HIP") - 1.25) < 0.01
+
+    out = render([row])
+    assert "vs original" in out and "vs tuned HIP" in out
+    assert "75.9x" in out and "1.2x" in out
+
+
+@needs_verify
+def test_row_softmax_carries_a_competent_baseline():
+    """The suite must ship the fair comparison, not just the flattering one."""
+    from hipbridge.verify import suites
+
+    names = [b.name for b in suites.ROW_SOFTMAX.all_baselines()]
+    assert names[0] == "original"
+    assert "tuned HIP" in names
+
+    tuned = suites.ROW_SOFTMAX.baselines[0]
+    src = tuned.source(REPO / "examples")
+    assert tuned.launch.block == (256, 1, 1), "a fair baseline uses the whole wavefront"
+    assert "__syncthreads" in src and "__shared__" in src, "expected a tree reduction"
+    assert "blockIdx.x" in src

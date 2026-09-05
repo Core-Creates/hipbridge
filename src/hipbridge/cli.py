@@ -134,31 +134,50 @@ def _cmd_bench(args) -> int:
         print()
 
     for suite in suites.BUILTIN:
-        ref = verify.NativeReference(
-            source=suite.source(examples),
-            launch=suite.launch,
-            toolchain=args.toolchain,
-            command_prefix=prefix,
-            extra_flags=(["--offload-arch=" + args.arch] if args.arch else []),
-        )
-        avail = ref.availability()
-        if not avail:
-            print(f"SKIP  {suite.name}: {avail.reason}")
+        flags = ["--offload-arch=" + args.arch] if args.arch else []
+
+        # Every baseline gets the same toolchain, the same flags and the same
+        # timing path. The first is the original as written; the rest exist so a
+        # large ratio against a naive kernel cannot pass for the whole story.
+        refs = []
+        for base in suite.all_baselines():
+            r = verify.NativeReference(
+                source=base.source(examples),
+                launch=base.launch,
+                toolchain=args.toolchain,
+                command_prefix=prefix,
+                extra_flags=flags,
+            )
+            avail = r.availability()
+            if not avail:
+                print(f"SKIP  {suite.name} [{base.name}]: {avail.reason}")
+                continue
+            refs.append((base, r))
+        if not refs:
             continue
 
         candidate, described = suites.candidate_for(suite)
-        print(f"{suite.name} on {args.toolchain}, device={device}, reps={args.reps}")
+        print(
+            f"{suite.name} on {args.toolchain}, device={device}, reps={args.reps}, runs={args.runs}"
+        )
         print(f"  candidate: {described}")
-        print(f"  original : {suite.source_file} compiled with {args.toolchain}")
+        for base, _ in refs:
+            print(f"  {base.name:<9}: {base.source_file} compiled with {args.toolchain}")
+        if suite.portable is not None:
+            print(f"  {suite.portable_name:<9}: library call, timed like the candidate")
         print()
 
+        rows = []
         for shape in shapes:
             x = verify.generate(verify.InputSpec(shape=shape), device=device)
 
-            # Verify at this exact shape before timing it.
+            # Verify at this exact shape before timing it. The candidate is
+            # checked against the original; each additional baseline is checked
+            # against the float64 oracle, because a fast baseline that computes
+            # the wrong thing would silently flatter the candidate.
             summary = verify.Harness(
                 candidate=candidate,
-                reference=ref,
+                reference=refs[0][1],
                 oracle=suite.oracle,
                 name=f"{suite.name}@{shape}",
                 distributions=(verify.Distribution.NORMAL,),
@@ -166,11 +185,56 @@ def _cmd_bench(args) -> int:
             ok = summary.ok
             failed |= not ok
 
+            notes = []
             try:
-                print(bench.compare(candidate, ref, x, reps=args.reps, verified=ok))
+                measured = []
+                for base, r in refs:
+                    if base.name != "original":
+                        arb = verify.arbitrate(r(x), refs[0][1](x), suite.oracle(x.double()))
+                        if arb.verdict == "worse":
+                            notes.append(f"{base.name} is LESS ACCURATE than the original")
+                            failed = True
+                    measured.append(
+                        bench.Measurement(
+                            base.name,
+                            bench.stat_reference(r, x, reps=args.reps, runs=args.runs),
+                            "cuda",
+                        )
+                    )
+                if suite.portable is not None:
+                    # Same timing path as the candidate, so both carry the same
+                    # host-side dispatch cost and the ratio between them is fair.
+                    measured.append(
+                        bench.Measurement(
+                            suite.portable_name,
+                            bench.stat_candidate(suite.portable, x, reps=args.reps, runs=args.runs),
+                            device,
+                        )
+                    )
+                cand = bench.Measurement(
+                    "candidate",
+                    bench.stat_candidate(candidate, x, reps=args.reps, runs=args.runs),
+                    device,
+                )
             except RuntimeError as exc:
                 print(f"  timing unavailable at {shape}: {exc}")
                 failed = True
+                continue
+
+            rows.append(
+                bench.ShapeRow(
+                    shape=tuple(x.shape),
+                    candidate=cand,
+                    baselines=tuple(measured),
+                    verified=ok,
+                    notes=notes,
+                )
+            )
+
+        print(bench.render(rows))
+        print()
+        print("median of runs, [min-max] beside it. latency-bound marks shapes where")
+        print("the candidate never reaches the throughput it shows at larger sizes.")
 
     return 1 if (failed and args.require) else 0
 
@@ -223,6 +287,12 @@ def main(argv: list[str] | None = None) -> int:
     ben.add_argument("--arch", default="", help="offload arch, e.g. gfx942")
     ben.add_argument("--shapes", default="1x1024,64x1024,1024x1024,4096x4096")
     ben.add_argument("--reps", type=int, default=100)
+    ben.add_argument(
+        "--runs",
+        type=int,
+        default=5,
+        help="repeat each timing this many times; the table reports median [min-max]",
+    )
     ben.add_argument("--examples", default="examples")
     ben.add_argument("--wsl", default="", metavar="DISTRO")
     ben.add_argument("--require", action="store_true")

@@ -25,6 +25,24 @@ from hipbridge.verify.reference import LaunchSpec
 
 
 @dataclass(frozen=True)
+class Baseline:
+    """A native kernel to time the candidate against.
+
+    More than one, because a single baseline can flatter the candidate. The
+    original as written answers "what does replacing this buy me"; a competently
+    written version of the same maths answers "is the substitution worth making
+    at all", which is the question a reviewer will actually ask.
+    """
+
+    name: str
+    source_file: str
+    launch: LaunchSpec
+
+    def source(self, examples_dir: Path) -> str:
+        return (examples_dir / self.source_file).read_text(encoding="utf-8")
+
+
+@dataclass(frozen=True)
 class Suite:
     name: str
     source_file: str
@@ -32,9 +50,19 @@ class Suite:
     launch: LaunchSpec
     oracle: Callable[[torch.Tensor], torch.Tensor]
     shapes: Callable[[], Sequence[tuple[int, ...]]]
+    baselines: tuple[Baseline, ...] = ()
+    # The library call a user would reach for instead of substituting anything.
+    # Timed on the same device as the candidate, because "why not just use
+    # torch" is the first question anyone sensible asks about a substitution.
+    portable: Callable[[torch.Tensor], torch.Tensor] | None = None
+    portable_name: str = "torch"
 
     def source(self, examples_dir: Path) -> str:
         return (examples_dir / self.source_file).read_text(encoding="utf-8")
+
+    def all_baselines(self) -> tuple[Baseline, ...]:
+        """The original first, then any additional baselines."""
+        return (Baseline("original", self.source_file, self.launch), *self.baselines)
 
 
 def _row_shapes() -> Sequence[tuple[int, ...]]:
@@ -55,7 +83,21 @@ ROW_SOFTMAX = Suite(
         out_shape=lambda s: s[0],
     ),
     oracle=lambda t: torch.softmax(t.double(), dim=-1),
+    portable=lambda t: torch.softmax(t, dim=-1),
     shapes=_row_shapes,
+    baselines=(
+        Baseline(
+            name="tuned HIP",
+            source_file="row_softmax_tuned.cu",
+            launch=LaunchSpec(
+                kernel="row_softmax_tuned",
+                grid=lambda s: (s[0][0], 1, 1),  # one block per row
+                block=(256, 1, 1),  # four wavefronts, tree-reduced in LDS
+                scalar_args=lambda s: [s[0][0], s[0][1]],
+                out_shape=lambda s: s[0],
+            ),
+        ),
+    ),
 )
 
 BUILTIN: tuple[Suite, ...] = (ROW_SOFTMAX,)
@@ -80,4 +122,4 @@ def candidate_for(suite: Suite) -> tuple[Callable[[torch.Tensor], torch.Tensor],
     raise KeyError(suite.name)
 
 
-__all__ = ["BUILTIN", "ROW_SOFTMAX", "Suite", "candidate_for"]
+__all__ = ["BUILTIN", "ROW_SOFTMAX", "Baseline", "Suite", "candidate_for"]

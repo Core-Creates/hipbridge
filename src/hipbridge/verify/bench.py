@@ -1,53 +1,101 @@
-"""Device-side benchmarking of a candidate against the original kernel.
+"""Device-side benchmarking of a candidate against one or more originals.
 
 Correctness alone does not justify substituting a kernel. If the tuned
 implementation is not faster there is no reason to use it, so this measures
-both sides on the same device, at the same shape, with the same methodology.
+every side on the same device, at the same shape, with the same methodology.
 
 Method, stated because a benchmark without one is an anecdote:
 
-  - the original is timed inside the generated driver with device events, so
-    file I/O and host copies are excluded
+  - each native kernel is timed inside the generated driver with device events,
+    so file I/O and host copies are excluded
   - the candidate is timed with device events too, never wall clock
-  - both get warmup iterations before any timing, to pay JIT and cache costs
-  - the reported figure is per-iteration mean over `reps` back-to-back launches
+  - every side gets warmup iterations before any timing, to pay JIT and cache
+    costs once rather than charge them to the first measurement
+  - one run is the mean over `reps` back-to-back launches; the reported figure
+    is the MEDIAN across `runs` such runs, with the min and max beside it,
+    because a single mean hides how much small shapes move between runs
   - a shape is timed only after it has been verified correct at that shape;
     a fast wrong kernel is not a result
+
+Two baselines rather than one. The naive `row_softmax.cu` launches one thread
+per block, so beating it proves little: most of that ratio is its launch
+configuration, not the language it is written in. `row_softmax_tuned.cu` is the
+kernel a competent engineer would write for the same hardware, and the honest
+question is what the substitution buys against THAT. A second ratio near 1.0 is
+a real finding and worth more than a large number against a strawman.
 """
 
 from __future__ import annotations
 
+import statistics
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
 from hipbridge.verify.reference import NativeReference
 
+# A shape is called latency-bound when its throughput falls this far below the
+# best throughput the same implementation reached at any shape in the sweep.
+# Below that, the measurement is dominated by fixed launch overhead and the
+# ratio says more about dispatch than about the kernel.
+LATENCY_BOUND_FRACTION = 0.25
 
-@dataclass
-class BenchResult:
+
+@dataclass(frozen=True)
+class Stat:
+    """Per-iteration milliseconds across repeated timing runs."""
+
+    runs: tuple[float, ...]
+
+    @property
+    def median(self) -> float:
+        return statistics.median(self.runs)
+
+    @property
+    def lo(self) -> float:
+        return min(self.runs)
+
+    @property
+    def hi(self) -> float:
+        return max(self.runs)
+
+    @property
+    def spread(self) -> float:
+        """Max over min: how far the same measurement moved between runs."""
+        return self.hi / self.lo if self.lo else float("inf")
+
+    def us(self) -> str:
+        if len(self.runs) == 1:
+            return f"{self.median * 1000:.1f}"
+        return f"{self.median * 1000:.1f} [{self.lo * 1000:.1f}-{self.hi * 1000:.1f}]"
+
+
+@dataclass(frozen=True)
+class Measurement:
+    """One implementation, timed at one shape."""
+
     name: str
-    ms: float
-    reps: int
-    shape: tuple[int, ...]
+    stat: Stat
     device: str = "unknown"
 
-    def __str__(self) -> str:
-        return f"{self.name} on {self.device}: {self.ms * 1000:.1f} us/iter over {self.reps} reps"
-
 
 @dataclass
-class Comparison:
-    candidate: BenchResult
-    reference: BenchResult
-    verified: bool
+class ShapeRow:
+    """Every implementation timed at a single shape."""
+
+    shape: tuple[int, ...]
+    candidate: Measurement
+    baselines: tuple[Measurement, ...] = ()
+    verified: bool = False
+    latency_bound: bool = False
+    notes: list[str] = field(default_factory=list)
 
     @property
     def comparable(self) -> bool:
-        """Were both sides timed on the same kind of hardware?
+        """Were the candidate and the baselines timed on the same kind of part?
 
-        The reference always runs on device. If the candidate ran on the host,
+        Native baselines always run on device. If the candidate ran on the host,
         the ratio compares a CPU implementation against a GPU one and means
         nothing. Reporting a speedup for that is how misleading benchmark tables
         get made, so it is refused rather than footnoted.
@@ -55,23 +103,69 @@ class Comparison:
         return self.candidate.device == "cuda"
 
     @property
-    def speedup(self) -> float:
-        return self.reference.ms / self.candidate.ms if self.candidate.ms else float("inf")
+    def elements(self) -> int:
+        n = 1
+        for d in self.shape:
+            n *= d
+        return n
 
-    def __str__(self) -> str:
-        dims = "x".join(str(d) for d in self.candidate.shape)
+    def speedup(self, name: str) -> float | None:
         if not self.comparable:
-            return (
-                f"{dims:>12}  original {self.reference.ms * 1000:9.1f} us (device)   "
-                f"candidate {self.candidate.ms * 1000:9.1f} us ({self.candidate.device})   "
-                f"NOT COMPARABLE: candidate did not run on the device"
-            )
-        flag = "" if self.verified else "  (UNVERIFIED at this shape)"
-        return (
-            f"{dims:>12}  original {self.reference.ms * 1000:9.1f} us   "
-            f"candidate {self.candidate.ms * 1000:9.1f} us   "
-            f"{self.speedup:6.1f}x{flag}"
-        )
+            return None
+        for b in self.baselines:
+            if b.name == name:
+                c = self.candidate.stat.median
+                return b.stat.median / c if c else float("inf")
+        return None
+
+
+def mark_latency_bound(rows: list[ShapeRow]) -> None:
+    """Flag shapes where the candidate never gets to show its throughput.
+
+    Compares each shape's elements-per-millisecond against the best the same
+    candidate managed anywhere in the sweep. Well under that best means the
+    kernel spent its time being launched rather than working, so the ratio there
+    is a statement about dispatch overhead and should not be read as throughput.
+    """
+    rates = [(r, r.elements / r.candidate.stat.median) for r in rows if r.candidate.stat.median]
+    if not rates:
+        return
+    best = max(rate for _, rate in rates)
+    for row, rate in rates:
+        row.latency_bound = rate < best * LATENCY_BOUND_FRACTION
+
+
+def render(rows: list[ShapeRow]) -> str:
+    """One aligned table for the whole sweep."""
+    if not rows:
+        return "no shapes measured"
+    mark_latency_bound(rows)
+    names = [b.name for b in rows[0].baselines]
+
+    head = f"{'shape':>12}  " + "".join(f"{n + ' (us)':>24}" for n in names)
+    head += f"{'candidate (us)':>24}" + "".join(f"{'vs ' + n:>13}" for n in names)
+    lines = [head, "-" * len(head)]
+
+    for r in rows:
+        dims = "x".join(str(d) for d in r.shape)
+        line = f"{dims:>12}  " + "".join(f"{b.stat.us():>24}" for b in r.baselines)
+        line += f"{r.candidate.stat.us():>24}"
+        if r.comparable:
+            for n in names:
+                s = r.speedup(n)
+                line += f"{s:>12.1f}x" if s is not None else f"{'-':>13}"
+        else:
+            line += f"  NOT COMPARABLE: candidate ran on {r.candidate.device}, not the device"
+        flags = []
+        if not r.verified:
+            flags.append("UNVERIFIED at this shape")
+        if r.latency_bound and r.comparable:
+            flags.append("latency-bound")
+        flags += r.notes
+        if flags:
+            line += "  (" + "; ".join(flags) + ")"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def time_candidate(
@@ -107,7 +201,7 @@ def time_candidate(
 
 
 def time_reference(ref: NativeReference, x: torch.Tensor, reps: int = 100) -> float:
-    """Per-iteration milliseconds for the original kernel, timed on device."""
+    """Per-iteration milliseconds for a native kernel, timed on device."""
     ref._reps = reps
     try:
         ref(x)
@@ -120,20 +214,30 @@ def time_reference(ref: NativeReference, x: torch.Tensor, reps: int = 100) -> fl
     return ref.last_kernel_ms
 
 
-def compare(
-    candidate: Callable[[torch.Tensor], torch.Tensor],
-    reference: NativeReference,
+def stat_candidate(
+    fn: Callable[[torch.Tensor], torch.Tensor],
     x: torch.Tensor,
     reps: int = 100,
-    verified: bool = False,
-) -> Comparison:
-    shape = tuple(x.shape)
-    dev = "cuda" if x.is_cuda else "cpu"
-    return Comparison(
-        candidate=BenchResult("candidate", time_candidate(candidate, x, reps), reps, shape, dev),
-        reference=BenchResult("original", time_reference(reference, x, reps), reps, shape, "cuda"),
-        verified=verified,
-    )
+    runs: int = 5,
+) -> Stat:
+    """Repeat the candidate timing `runs` times and keep every result."""
+    return Stat(tuple(time_candidate(fn, x, reps) for _ in range(max(1, runs))))
 
 
-__all__ = ["BenchResult", "Comparison", "compare", "time_candidate", "time_reference"]
+def stat_reference(ref: NativeReference, x: torch.Tensor, reps: int = 100, runs: int = 5) -> Stat:
+    """Repeat a native timing `runs` times and keep every result."""
+    return Stat(tuple(time_reference(ref, x, reps) for _ in range(max(1, runs))))
+
+
+__all__ = [
+    "LATENCY_BOUND_FRACTION",
+    "Measurement",
+    "ShapeRow",
+    "Stat",
+    "mark_latency_bound",
+    "render",
+    "stat_candidate",
+    "stat_reference",
+    "time_candidate",
+    "time_reference",
+]

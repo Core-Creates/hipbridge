@@ -131,6 +131,16 @@ def arbitrate(
     whether the candidate is closer to the truth, not whether it reproduces the
     original's rounding error.
     """
+    # A native reference returns host tensors while the candidate runs on the
+    # device, so the three arguments routinely arrive on different devices. The
+    # harness happened to align them; a direct caller got a torch traceback about
+    # cuda:0 and cpu, which says nothing about accuracy. Align them here instead.
+    dev = candidate.device
+    if reference.device != dev:
+        reference = reference.to(dev)
+    if truth.device != dev:
+        truth = truth.to(dev)
+
     t = truth.double()
     e_cand = float((candidate.double() - t).abs().max())
     e_ref = float((reference.double() - t).abs().max())
