@@ -9,6 +9,7 @@ allclose-against-a-loose-tolerance check, so they get explicit tests:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import torch
@@ -139,13 +140,30 @@ def arbitrate(
     else:
         ratio = e_cand / e_ref
 
+    # NaN is not a magnitude and cannot be ordered. Every comparison against it
+    # answers False, so falling through would land on "worse" and blame the
+    # candidate for a NaN the reference produced identically. Decide it here.
+    cand_nan, ref_nan = math.isnan(e_cand), math.isnan(e_ref)
+    if cand_nan or ref_nan:
+        if cand_nan and ref_nan:
+            return Arbitration(e_cand, e_ref, "equivalent", ratio)
+        return Arbitration(e_cand, e_ref, "worse" if cand_nan else "better", ratio)
+
     # Ratios between sub-epsilon errors are noise. Two implementations both
     # accurate to a few float32 ULP of the output scale can differ by 3x purely
     # through rounding, and failing that would reject correct kernels. Anything
     # at or below the representable resolution of the output is not a defect.
+    #
+    # Both sides have to be down there for the comparison to be noise. Testing
+    # only the candidate reports "equivalent" for a candidate that is essentially
+    # exact against a reference that is 78x further from the truth, which is not
+    # noise, it is the result. Measured on an MI300X: the tuned Triton softmax
+    # sits at the floor on every finite distribution while the serial original
+    # does not, so the ratio never got consulted and the verdict never said
+    # "better" for a kernel that always was.
     scale = float(t.abs().max()) or 1.0
     floor = 8.0 * torch.finfo(torch.float32).eps * scale
-    if e_cand <= floor:
+    if e_cand <= floor and e_ref <= floor:
         return Arbitration(e_cand, e_ref, "equivalent", ratio)
 
     if ratio <= 1.0:

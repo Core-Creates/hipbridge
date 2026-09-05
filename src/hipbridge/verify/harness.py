@@ -83,6 +83,21 @@ class Summary:
         return out
 
     @property
+    def accuracy_gain(self) -> float | None:
+        """Largest factor by which the candidate beat the reference, if it did.
+
+        The verdict counts say how often the candidate won; they do not say by
+        how much. "better=84" and a 1.02x edge read identically, so the margin
+        is reported alongside them and comes from the same measurements.
+        """
+        wins = [
+            r.arbitration.ratio
+            for r in self.results
+            if r.arbitration and 0.0 < r.arbitration.ratio < 1.0
+        ]
+        return 1.0 / min(wins) if wins else None
+
+    @property
     def worst_ulp(self) -> int:
         return max((r.max_ulp or 0) for r in self.results) if self.results else 0
 
@@ -98,7 +113,9 @@ class Summary:
         # on its own. The accuracy verdict is the number that matters.
         if self.verdicts:
             parts = ", ".join(f"{v}={n}" for v, n in sorted(self.verdicts.items()))
-            head += f"  [accuracy vs original: {parts}]"
+            gain = self.accuracy_gain
+            margin = f", up to {gain:.0f}x closer to float64" if gain and gain >= 1.5 else ""
+            head += f"  [accuracy vs original: {parts}{margin}]"
         # Only the first few failures; a broken kernel fails everything.
         return "\n".join([head, *(str(f) for f in self.failures[:8])])
 

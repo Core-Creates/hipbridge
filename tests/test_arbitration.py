@@ -86,6 +86,70 @@ def test_sub_epsilon_ratios_are_not_failures(torch_):
     assert arb.verdict != "worse", f"one-ULP perturbation rejected: {arb}"
 
 
+def test_candidate_at_the_floor_beats_a_reference_that_is_not(torch_):
+    """The floor is a noise guard, not a cap on how well a candidate can score.
+
+    Observed on an MI300X: the tuned Triton softmax sat at or below the floor on
+    every finite distribution while the serial original was up to 78x further
+    from float64 truth, and every case was reported "equivalent" because the
+    floor test looked at the candidate alone. A win that large is not noise.
+    """
+    x, truth = _softmax_case(torch_)
+    good = torch_.softmax(x, dim=-1)
+    sloppy = (good.double() + 1e-6).float()
+
+    arb = verify.arbitrate(good, sloppy, truth)
+    assert arb.candidate_err < arb.reference_err, str(arb)
+    assert arb.verdict == "better", f"a clear win reported as {arb.verdict}: {arb}"
+
+
+def test_both_sides_at_the_floor_stay_equivalent(torch_):
+    """The noise guard itself must survive: near-exact pairs are not ranked."""
+    x, truth = _softmax_case(torch_)
+    a = torch_.softmax(x, dim=-1)
+    b = a.clone()
+    b.view(torch_.int32)[0, 0] += 1  # one ULP apart, both essentially exact
+
+    arb = verify.arbitrate(b, a, truth)
+    assert arb.verdict == "equivalent", f"noise ranked as {arb.verdict}: {arb}"
+
+
+def test_nan_from_both_implementations_does_not_blame_the_candidate(torch_):
+    """NaN cannot be ordered, so it has to be decided before the comparisons.
+
+    Every `<=` against NaN answers False, which used to fall through to "worse"
+    and fail a candidate for a NaN the reference produced identically.
+    """
+    x, truth = _softmax_case(torch_)
+    nan = torch_.full_like(truth, float("nan")).float()
+
+    both = verify.arbitrate(nan, nan, truth)
+    assert both.verdict == "equivalent", f"shared NaN blamed on the candidate: {both}"
+
+    good = torch_.softmax(x, dim=-1)
+    only_candidate = verify.arbitrate(nan, good, truth)
+    assert only_candidate.verdict == "worse", str(only_candidate)
+
+    only_reference = verify.arbitrate(good, nan, truth)
+    assert only_reference.verdict == "better", str(only_reference)
+
+
+def test_summary_reports_the_margin_not_just_the_verdict(torch_):
+    """A verdict count alone cannot separate a 1.02x edge from a 78x one."""
+    oracle = lambda t: torch_.softmax(t.double(), dim=-1)  # noqa: E731
+    sloppy = verify.TorchReference(lambda t: (torch_.softmax(t.double(), dim=-1) + 1e-6).float())
+
+    summary = verify.Harness(
+        candidate=lambda t: torch_.softmax(t, dim=-1),
+        reference=sloppy,
+        oracle=oracle,
+        name="margin",
+    ).run([(4, 64)])
+
+    assert summary.accuracy_gain and summary.accuracy_gain > 1.5, str(summary)
+    assert "closer to float64" in str(summary), str(summary)
+
+
 def test_identity_kernel_is_still_rejected_in_oracle_mode(torch_):
     """Oracle mode must not become a loophole for a dropped computation."""
     x, truth = _softmax_case(torch_)
