@@ -132,9 +132,19 @@ registered on a rented box.
 gh auth login && gh repo clone Core-Creates/hipbridge
 cd hipbridge
 
-bash scripts/smoke-hip.sh      # toolchain only: no Python, no pip, no PyTorch
-bash scripts/bootstrap-amd.sh  # full harness (creates .venv; PEP 668 blocks system pip)
+bash scripts/smoke-hip.sh          # toolchain only: no Python, no pip, no PyTorch
+bash scripts/install-hip-headers.sh  # if the smoke test cannot find hip/hip_runtime.h
+bash scripts/bootstrap-amd.sh      # full harness (creates .venv; PEP 668 blocks system pip)
 ```
+
+`install-hip-headers.sh` reads `hipcc --version` and installs the matching
+`amdrocm-runtime-dev<version>`, then refuses to report success until a header
+tree's `HIP_VERSION_MAJOR.MINOR` actually equals the compiler's. Run it with
+`PURGE_STALE=1` to also remove a mismatched tree once a matching one exists.
+**Do not install `libamdhip64-dev` by hand on Ubuntu 24.04**: it resolves to HIP
+5.7.1 from `noble/universe`, installs happily beside a ROCm 7 compiler, and the
+only symptom is one undefined-macro error that is trivially worked around. Both
+scripts now check header and compiler versions against each other and say so.
 
 Run the smoke test first. It compiles and runs `row_softmax` on the device and
 self-checks against a float64 CPU computation, so it separates "does hipcc
@@ -225,9 +235,12 @@ all. Everything published here was re-run on matched headers.
 Worth recording: the numbers did not move. The smoke test returned bit-identical
 figures before and after, and the timings shifted less than run-to-run variance.
 The workaround was harmless, which was a reasonable guess and is now a measured
-fact rather than a hope. `scripts/install-hip-headers.sh` still leads with
-`libamdhip64-dev`, which is the trap; on ROCm 7 the package you want is
-`amdrocm-runtime-dev7.14`.
+fact rather than a hope. `scripts/install-hip-headers.sh` used to lead with
+`libamdhip64-dev`, which is what installed the skew in the first place; it now
+derives the package from the compiler version and verifies the result. Rebuilt
+the fault on the same box to check: with only the 5.7 headers present, one run
+of the script installs `amdrocm-runtime-dev7.14`, removes the stale tree under
+`PURGE_STALE=1`, and the smoke test, verify and bench all pass afterwards.
 
 ## Benchmarking against the original
 
@@ -303,9 +316,10 @@ Conditions, because a ratio without them is not a measurement:
   gfx942, HIP 7.14.60850 with matched headers, torch 2.9.1+rocm6.4
 - 100 reps per shape after warmup, device events both sides
 - every shape verified correct at that shape before it was timed
-- four independent runs, two of them by a different operator: the 4096x4096
-  figure landed at 76.8x, 76.8x, 77.0x and 77.3x, and the small shapes within
-  about 5%
+- five independent runs, two of them by a different operator: the 4096x4096
+  figure landed between 74.4x and 77.3x, and the small shapes vary by about 15%
+  run to run (17.4x to 20.4x at 1x1024), which is what a launch-latency-bound
+  measurement looks like
 
 **Read the comparison honestly. Much of this gap is the original's launch
 configuration, not the language it is written in.** `row_softmax.cu` launches

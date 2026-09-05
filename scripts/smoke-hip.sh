@@ -103,8 +103,14 @@ HIP_INC=""
 # Ask dpkg first. If the package is installed it knows exactly where the header
 # went, which beats guessing prefixes. libamdhip64-dev is Debian-packaged, so it
 # installs under /usr/include, NOT under /opt/rocm as ROCm tarball installs do.
+#
+# Order matters. On Ubuntu 24.04 libamdhip64-dev is HIP 5.7.1, which installs
+# happily beside a ROCm 7 compiler, so the AMD-packaged amdrocm-runtime-dev is
+# asked first and the Ubuntu one is the fallback. Whatever wins gets its version
+# checked against the compiler below.
 if command -v dpkg >/dev/null 2>&1; then
-    for pkg in libamdhip64-dev hip-dev rocm-hip-runtime-dev; do
+    for pkg in $(dpkg-query -W -f='${Package}\n' 'amdrocm-runtime-dev*' 2>/dev/null | sort -Vr) \
+               libamdhip64-dev hip-dev rocm-hip-runtime-dev; do
         F="$(dpkg -L "$pkg" 2>/dev/null | grep -m1 '/hip/hip_runtime\.h$' || true)"
         if [ -n "$F" ]; then
             HIP_INC="${F%/hip/hip_runtime.h}"
@@ -126,6 +132,21 @@ fi
 
 if [ -n "$HIP_INC" ]; then
     echo "  found: $HIP_INC/hip/hip_runtime.h"
+    # Say out loud whether these headers belong to this compiler. A skew still
+    # builds once the wavefront macro is defined by hand, so without this check
+    # it stays invisible and every number downstream inherits it.
+    CC_VER="$(hipcc --version 2>/dev/null | sed -n 's/.*HIP version: \([0-9]*\.[0-9]*\).*/\1/p' | head -1)"
+    HDR_VER="$(awk '/#define HIP_VERSION_MAJOR/ { maj=$3 }
+                    /#define HIP_VERSION_MINOR/ { min=$3 }
+                    END { if (maj != "") print maj "." min }' \
+               "$HIP_INC/hip/hip_version.h" 2>/dev/null)"
+    if [ -n "$CC_VER" ] && [ -n "$HDR_VER" ] && [ "$CC_VER" != "$HDR_VER" ]; then
+        echo "  WARNING: headers are HIP $HDR_VER but the compiler is HIP $CC_VER."
+        echo "           Numbers from a mismatched build are not worth publishing."
+        echo "           Fix with: bash scripts/install-hip-headers.sh"
+    else
+        echo "  version: HIP ${HDR_VER:-unknown}, matching the compiler"
+    fi
     FLAGS="$FLAGS -I$HIP_INC"
     # Deliberately NOT deriving --rocm-path from the header location. With
     # libamdhip64-dev the headers are under /usr while the toolchain is under
@@ -147,8 +168,9 @@ else
     ls -d /opt/rocm*/ /opt/rocm/*/ 2>/dev/null | sed 's/^/  /' || echo "  none"
     echo
     if command -v apt-get >/dev/null 2>&1; then
-        echo "Candidate packages (apt):"
-        for pkg in hip-dev rocm-hip-runtime-dev rocm-dev hip-runtime-amd; do
+        echo "Candidate packages (apt), version-matched first:"
+        CC_VER="$(hipcc --version 2>/dev/null | sed -n 's/.*HIP version: \([0-9]*\.[0-9]*\).*/\1/p' | head -1)"
+        for pkg in ${CC_VER:+amdrocm-runtime-dev$CC_VER} hip-dev rocm-hip-runtime-dev rocm-dev hip-runtime-amd; do
             if apt-cache show "$pkg" >/dev/null 2>&1; then
                 echo "    AVAILABLE  apt-get install -y $pkg"
             else
@@ -185,6 +207,7 @@ elif grep -q '__AMDGCN_WAVEFRONT_SIZE' "$WORK/err.txt"; then
     echo
     echo "  header/compiler version mismatch: __AMDGCN_WAVEFRONT_SIZE undefined"
     echo "  retrying with -D__AMDGCN_WAVEFRONT_SIZE=$WAVE (correct for $ARCH)"
+    echo "  this papers over the skew; fix it with scripts/install-hip-headers.sh"
     FLAGS="$FLAGS -D__AMDGCN_WAVEFRONT_SIZE=$WAVE"
     if ! hipcc $FLAGS "$WORK/smoke.hip.cpp" -o "$WORK/smoke" 2>"$WORK/err2.txt"; then
         echo
@@ -193,9 +216,11 @@ elif grep -q '__AMDGCN_WAVEFRONT_SIZE' "$WORK/err.txt"; then
         echo
         echo "The headers in $HIP_INC do not match the compiler in"
         echo "$(dirname "$(dirname "$(command -v hipcc)")")."
-        echo "Install headers matching the compiler, e.g. a version-pinned package:"
-        echo "    apt-cache search --names-only 'libamdhip64' "
-        echo "    apt-get install -y libamdhip64-dev=<version matching HIP 7.14>"
+        echo "Install headers matching the compiler:"
+        echo "    bash scripts/install-hip-headers.sh"
+        echo "which picks amdrocm-runtime-dev<version> for this compiler. Do NOT"
+        echo "reach for libamdhip64-dev on Ubuntu 24.04: it is HIP 5.7.1 and it"
+        echo "is what put the wrong headers here in the first place."
         exit 7
     fi
 else
