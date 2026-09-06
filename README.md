@@ -57,6 +57,75 @@ pattern: unknown
   No substitution will be attempted. Translate this kernel by hand or extend the recognizers.
 ```
 
+## Porting a kernel, in one command
+
+`inspect` recognizes and `verify` proves. `port` is both, which is the only one
+of the three that answers the question a user actually has.
+
+```
+$ hipbridge port examples/row_softmax.cu --arch gfx942
+kernel:  row_softmax
+pattern: reduce_serial
+confidence: likely
+
+proposing: hipbridge.kernels.softmax (Triton, AMD-tuned)
+  - calls expf, so it is not a plain sum
+  - takes a maximum, the usual stability pass
+  - divides by an accumulated total
+  - one input and one output pointer (row_softmax)
+  - two scalar arguments (rows, cols), read as rows/cols
+
+proving against examples/row_softmax.cu compiled with hipcc
+  launch: grid one block per row, block=(1, 1, 1)
+PASS  row_softmax vs hipbridge.kernels.softmax: 84/84 cases, worst ulp=593
+      [accuracy vs original: better=6, equivalent=78, up to 297x closer to float64]
+
+SUBSTITUTION PROVED. Use it like this:
+
+    from hipbridge.kernels.softmax import softmax_rowwise
+
+    out = softmax_rowwise(x)   # replaces row_softmax
+```
+
+**A pattern is not a licence to substitute.** `row_softmax.cu` is recognized as
+`reduce_serial`, and so is a kernel that sums a row, and so is one that takes a
+product. Substituting a softmax into either would corrupt data silently, so a
+proposal needs corroborating evidence in the source and then, crucially, a
+numeric proof. Recognition proposes; the float64 oracle decides.
+
+The proof compiles **your** kernel, not the copy shipped in `examples/`. Proving
+a substitution against our own original would prove nothing about yours.
+
+Exit codes are the interface:
+
+| Code | Meaning |
+|---|---|
+| 0 | substituted and proved on device |
+| 3 | nothing to propose; the kernel is unrecognized, or its pattern is not enough |
+| 4 | proposed, but the proof failed, or the original itself is not sane |
+| 5 | no toolchain or device to prove it on, with `--require` |
+
+Refusals are the common case and are meant to be. Of the five kernels in
+`examples/`, three are refused: `tiled_transpose.cu` because nothing recognizes
+it, `tree_reduce.cu` and `saxpy.cu` because sharing a pattern with softmax is
+not evidence of being softmax.
+
+### It checks the original before trusting it
+
+Oracle mode passes the candidate when it is closer to the truth than the
+original is, which has a hole: if the original is garbage, the candidate is
+trivially closer and the run reports a proof. That is not theoretical. An early
+version of `port` reused the suite's launch geometry, so `row_softmax_tuned.cu`
+ran at `block=(1,1,1)`, read uninitialised shared memory in its tree reduction,
+and the harness scored the candidate **3.9e75x "better"** than the wreckage and
+declared the substitution proved.
+
+Two fixes, both kept: launch geometry is now inferred from the kernel itself
+(no `threadIdx` means one thread per row; a shared buffer means a block as wide
+as the buffer; `--block` overrides), and the original is checked against the
+oracle before any comparison with it is believed. A reference that cannot
+reproduce its own maths is not a baseline, and the run stops with exit 4.
+
 ## Verifying an implementation
 
 ```python

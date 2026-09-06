@@ -239,6 +239,153 @@ def _cmd_bench(args) -> int:
     return 1 if (failed and args.require) else 0
 
 
+def _cmd_port(args) -> int:
+    """recognize -> propose a substitute -> prove it on device -> emit the code.
+
+    The whole pipeline in one command, and the only one of them that answers the
+    question a user actually has: can I replace this kernel, and how do I know.
+
+    Exit codes are the interface here: 0 substituted and proved, 3 recognized but
+    nothing to propose, 4 proposed but the proof failed, 5 no device to prove it
+    on. A substitution is never recommended on the strength of recognition alone.
+    """
+    kernels = parse_file(args.file)
+    if not kernels:
+        print(f"no kernel definitions found in {args.file}", file=sys.stderr)
+        return 1
+
+    facts = kernels[0]
+    if args.kernel:
+        match = [k for k in kernels if k.name == args.kernel]
+        if not match:
+            names = ", ".join(k.name for k in kernels)
+            print(f"no kernel named {args.kernel} in {args.file} (found: {names})")
+            return 1
+        facts = match[0]
+
+    result = recognize(facts)
+    print(result.report())
+    print()
+
+    from hipbridge import verify
+
+    if not verify.available():
+        print("SKIP: [verify] extra not installed, so no substitution can be proved")
+        return 1 if args.require else 0
+
+    from hipbridge.verify import substitutions, suites
+
+    source = Path(args.file).read_text(encoding="utf-8")
+    proposal = substitutions.propose(source, facts, result.pattern)
+    if proposal is None:
+        print("no substitution proposed.")
+        print()
+        if result.recognized:
+            print(f"  {facts.name} is a {result.pattern.value}, but a pattern is not a")
+            print("  licence to substitute: several different computations share it.")
+            print("  Nothing here matched this kernel's maths closely enough to try.")
+        else:
+            print("  no recognizer claimed this kernel, so there is nothing to propose.")
+        print()
+        print("  Translate it by hand, or extend hipbridge.verify.substitutions.")
+        return 3
+
+    candidate, described = suites.candidate_for(proposal.suite)
+    print(f"proposing: {described}")
+    for e in proposal.evidence:
+        print(f"  - {e}")
+    print()
+
+    # The proof compiles the CALLER'S kernel, not the shipped example. Proving a
+    # substitution against our own copy of the original would prove nothing.
+    block = None
+    if args.block:
+        block = (int(args.block), 1, 1)
+    launch = substitutions.reference_launch(proposal.suite, facts, block)
+    ref = verify.NativeReference(
+        source=source,
+        launch=launch,
+        toolchain=args.toolchain,
+        command_prefix=verify.wsl(args.wsl) if args.wsl else [],
+        extra_flags=(["--offload-arch=" + args.arch] if args.arch else []),
+    )
+    avail = ref.availability()
+    if not avail:
+        print(f"CANNOT PROVE: {avail.reason}")
+        print()
+        print("  The substitution is unproven, so it is not recommended. Re-run this")
+        print("  on a machine with the toolchain and a device.")
+        return 5 if args.require else 0
+
+    print(f"proving against {args.file} compiled with {args.toolchain}")
+    print(f"  launch: grid one block per row, block={launch.block}")
+
+    # Sanity-check the reference itself before trusting any comparison with it.
+    #
+    # Oracle mode passes the candidate when it is closer to the truth than the
+    # reference is. That is the right rule, and it has a hole: if the reference
+    # is garbage, the candidate is trivially closer and the run reports a proof.
+    # Seen for real, with a tuned kernel launched at the wrong block size, which
+    # read uninitialised shared memory and scored the candidate 3.9e75x better.
+    # A reference that cannot reproduce its own maths is not a baseline.
+    probe = verify.generate(verify.InputSpec(shape=(4, 256)))
+    truth = proposal.suite.oracle(probe.double())
+    ref_err = float((ref(probe).double() - truth.cpu()).abs().max())
+    if not (ref_err < 1e-3):
+        print()
+        print(f"REFERENCE IS NOT SANE: {facts.name} disagrees with the float64 oracle")
+        print(f"  by {ref_err:.3e}, which is far too much for it to be a baseline.")
+        print()
+        print("  Either the kernel does not compute what was proposed, or it was")
+        print(f"  launched wrongly. Inferred block={launch.block}; override with --block.")
+        print("  No substitution is claimed, because being better than a broken")
+        print("  reference is not evidence of anything.")
+        return 4
+
+    summary = verify.Harness(
+        candidate=candidate,
+        reference=ref,
+        oracle=proposal.suite.oracle,
+        name=f"{facts.name} vs {described}",
+    ).run(list(proposal.suite.shapes())[: args.limit])
+    print(summary)
+    print()
+
+    if not summary.ok:
+        print("SUBSTITUTION REJECTED. The proposal did not survive verification,")
+        print("which is the system working: recognition proposes, the oracle decides.")
+        return 4
+
+    print("SUBSTITUTION PROVED. Use it like this:")
+    print()
+    print("    from hipbridge.kernels.softmax import softmax_rowwise")
+    print()
+    print(f"    out = softmax_rowwise(x)   # replaces {facts.name}")
+    print()
+    print(
+        f"Proved on {args.toolchain}"
+        f"{' for ' + args.arch if args.arch else ''} against your own kernel,"
+    )
+    print("judged against a float64 oracle rather than against the original's rounding.")
+    if args.report:
+        lines = [
+            "# hipbridge port report",
+            "",
+            f"source: `{args.file}`  kernel: `{facts.name}`",
+            f"pattern: `{result.pattern.value}` ({result.confidence})",
+            f"substitute: {described}",
+            f"toolchain: `{args.toolchain}`  arch: `{args.arch or 'default'}`",
+            "",
+            "```",
+            str(summary),
+            "```",
+            "",
+        ]
+        Path(args.report).write_text("\n".join(lines), encoding="utf-8")
+        print(f"report written to {args.report}")
+    return 0
+
+
 def _cmd_info(args) -> int:
     print(f"hipbridge {__version__}")
     print(f"recognizers: {', '.join(registered())}")
@@ -297,6 +444,27 @@ def main(argv: list[str] | None = None) -> int:
     ben.add_argument("--wsl", default="", metavar="DISTRO")
     ben.add_argument("--require", action="store_true")
     ben.set_defaults(fn=_cmd_bench)
+
+    prt = sub.add_parser("port", help="recognize, substitute and prove, in one step")
+    prt.add_argument("file")
+    prt.add_argument("--kernel", default="", help="which kernel, if the file has several")
+    prt.add_argument("--toolchain", default="hipcc", choices=["hipcc", "nvcc"])
+    prt.add_argument("--arch", default="", help="offload arch, e.g. gfx942 for MI300X")
+    prt.add_argument("--limit", type=int, default=12, help="max shapes to prove over")
+    prt.add_argument(
+        "--block",
+        type=int,
+        default=0,
+        help="threads per block for the original; inferred from the source when unset",
+    )
+    prt.add_argument("--wsl", default="", metavar="DISTRO")
+    prt.add_argument("--report", default="", help="write a markdown report to this path")
+    prt.add_argument(
+        "--require",
+        action="store_true",
+        help="fail instead of skipping when nothing can be proved",
+    )
+    prt.set_defaults(fn=_cmd_port)
 
     info = sub.add_parser("info", help="show capabilities and which extras are installed")
     info.set_defaults(fn=_cmd_info)
