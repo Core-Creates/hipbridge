@@ -96,7 +96,7 @@ def _cmd_verify(args) -> int:
             candidate=candidate,
             reference=ref,
             oracle=suite.oracle,
-            extras=tuple(o.spec for o in suite.extras),
+            extras=tuple(o.build for o in suite.extras),
             name=f"{suite.name} vs original on {args.toolchain}",
         ).run(shape_list)
         ran += 1
@@ -199,7 +199,7 @@ def _cmd_bench(args) -> int:
                 candidate=candidate,
                 reference=refs[0][1],
                 oracle=suite.oracle,
-                extras=tuple(o.spec for o in suite.extras),
+                extras=tuple(o.build for o in suite.extras),
                 name=f"{suite.name}@{shape}",
                 distributions=(verify.Distribution.NORMAL,),
             ).run([shape])
@@ -394,7 +394,7 @@ def _cmd_port(args) -> int:
     spec = verify.InputSpec(shape=(4, 256))
     probe = (
         verify.generate(spec),
-        *(verify.generate(o.spec(spec)) for o in proposal.suite.extras),
+        *(o.build(spec) for o in proposal.suite.extras),
     )
     truth = proposal.suite.oracle(*(t.double() for t in probe))
     ref_err = float((ref(*probe).double() - truth.cpu()).abs().max())
@@ -413,7 +413,7 @@ def _cmd_port(args) -> int:
         candidate=candidate,
         reference=ref,
         oracle=proposal.suite.oracle,
-        extras=tuple(o.spec for o in proposal.suite.extras),
+        extras=tuple(o.build for o in proposal.suite.extras),
         name=f"{facts.name} vs {described}",
     ).run(list(proposal.suite.shapes())[: args.limit])
     print(summary)
@@ -514,7 +514,7 @@ def _cmd_synth(args) -> int:
             candidate=fn,
             reference=ref,
             oracle=suite.oracle,
-            extras=tuple(o.spec for o in suite.extras),
+            extras=tuple(o.build for o in suite.extras),
             name="generated",
         ).run(list(suite.shapes())[: args.limit])
 
