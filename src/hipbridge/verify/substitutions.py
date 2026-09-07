@@ -120,7 +120,14 @@ def _looks_like_rms_norm(source: str, facts: KernelFacts) -> list[str] | None:
     if re.search(r"-\s*mean\b|\bmean\b", source):
         return None  # centring means it is LayerNorm, not RMSNorm
     # A sum of squares: the same value multiplied by itself into an accumulator.
-    if not re.search(r"(\w+)\s*\*\s*\1|\[i\]\s*\*\s*\w*\[i\]", source):
+    #
+    # The optional cast is not decoration. When the example kernels became
+    # element-type generic they came to read `(float)ri[i] * (float)ri[i]`, and
+    # a pattern assuming a bare identifier stopped recognising the very kernel
+    # it was written for. Textual evidence breaks on formatting that has nothing
+    # to do with the maths, which is the argument in #19.
+    cast = r"(?:\([^)]*\)\s*)?"
+    if not re.search(rf"(\w+)\s*\*\s*{cast}\1|\[i\]\s*\*\s*{cast}\w*\[i\]", source):
         return None
     return [
         "accumulates squares and never subtracts a mean",
