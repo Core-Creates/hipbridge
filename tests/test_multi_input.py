@@ -188,7 +188,7 @@ def _propose_affine(tmp_path, first, second):
 
     facts = parse_file(path)[0]
     notes: list[str] = []
-    proposal = substitutions.propose(src, facts, recognize(facts).pattern, notes)
+    proposal = substitutions.propose(facts, recognize(facts).pattern, notes)
     return proposal, notes
 
 

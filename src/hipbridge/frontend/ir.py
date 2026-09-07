@@ -65,6 +65,13 @@ class KernelFacts:
     # maximum, is spelled as a plain assignment and is no less a tree.
     shared_in_halving_loop: bool = False
     scalar_accumulations: int = 0
+    # Every function the kernel calls, sorted and deduplicated. The maths a
+    # kernel does is largely decided by what it calls: expf means it is not a
+    # plain sum, rsqrtf means it normalises by a scale. Recording it here is
+    # what lets substitution evidence stop pattern-matching source text, where
+    # a comment mentioning a function, or a cast in front of one, changed the
+    # answer.
+    calls: list[str] = field(default_factory=list)
     shuffle_intrinsics: list[str] = field(default_factory=list)
     atomics: list[str] = field(default_factory=list)
     uses_block_index: bool = False

@@ -60,8 +60,7 @@ def test_each_kernel_reaches_its_own_substitute(examples, name, expected):
     from hipbridge.verify import substitutions
 
     facts = _facts(examples, name)
-    source = (examples / name).read_text(encoding="utf-8")
-    proposal = substitutions.propose(source, facts, recognize(facts).pattern)
+    proposal = substitutions.propose(facts, recognize(facts).pattern)
 
     assert proposal is not None, f"{name} should propose {expected}"
     assert proposal.name == expected

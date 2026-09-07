@@ -361,7 +361,7 @@ def _cmd_port(args) -> int:
 
     source = Path(args.file).read_text(encoding="utf-8")
     notes: list[str] = []
-    proposal = substitutions.propose(source, facts, result.pattern, notes)
+    proposal = substitutions.propose(facts, result.pattern, notes)
     if proposal is None:
         print("no substitution proposed.")
         print()
@@ -519,7 +519,7 @@ def _cmd_synth(args) -> int:
 
     source = Path(args.file).read_text(encoding="utf-8")
     result = recognize(facts)
-    proposal = substitutions.propose(source, facts, result.pattern)
+    proposal = substitutions.propose(facts, result.pattern)
     if proposal is None:
         print("no suite covers this kernel, so there is no oracle to judge against.")
         print("Generation without a proof is not something this tool will do.")

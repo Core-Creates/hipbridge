@@ -70,6 +70,7 @@ def _kernel_facts(fn) -> KernelFacts:
 
     calls = [n for n in nodes if n.kind == ci.CursorKind.CALL_EXPR]
     barriers = sum(1 for c in calls if c.spelling == "__syncthreads")
+    called = sorted({c.spelling for c in calls if c.spelling})
     shuffles = sorted({c.spelling for c in calls if c.spelling in SHUFFLE_NAMES})
     atomics = sorted({c.spelling for c in calls if c.spelling in ATOMIC_NAMES})
 
@@ -121,6 +122,7 @@ def _kernel_facts(fn) -> KernelFacts:
         shared_accumulations=shared_acc,
         shared_in_halving_loop=shared_in_halving,
         scalar_accumulations=scalar_acc,
+        calls=called,
         shuffle_intrinsics=shuffles,
         atomics=atomics,
         uses_block_index="blockIdx" in refs,
