@@ -18,6 +18,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -60,6 +61,13 @@ class Operand:
     name: str
     spec: Callable[[InputSpec], InputSpec]
     aliases: tuple[str, ...] = ()
+    # Applied to the generated tensor. Exists because some operands are not
+    # free-floating data: RoPE's tables are a cosine and a sine of the same
+    # angles, and feeding it two independent adversarial tensors asks it to
+    # apply something that is not a rotation. In float32 that merely produces
+    # large numbers; in fp16 the products overflow to infinity and the kernel
+    # gets blamed for the sweep's choice of inputs.
+    transform: Callable[[Any], Any] | None = None
 
     @property
     def accepted(self) -> tuple[str, ...]:
@@ -67,6 +75,13 @@ class Operand:
 
     def matches(self, param_name: str) -> bool:
         return param_name.lower().lstrip("_") in self.accepted
+
+    def build(self, primary: InputSpec, device: str = "cpu") -> torch.Tensor:
+        """The tensor this operand contributes for one case."""
+        from hipbridge.verify.inputs import generate
+
+        t = generate(self.spec(primary), device=device)
+        return self.transform(t) if self.transform is not None else t
 
 
 @dataclass(frozen=True)
@@ -323,7 +338,12 @@ def _rope_oracle(x, cos_tab, sin_tab):
     return _rope(x.double(), cos_tab.double(), sin_tab.double())
 
 
-def _half_width(name: str, seed_offset: int, aliases: tuple[str, ...] = ()) -> Operand:
+def _half_width(
+    name: str,
+    seed_offset: int,
+    aliases: tuple[str, ...] = (),
+    transform: Callable[[Any], Any] | None = None,
+) -> Operand:
     """A per-position table holding one angle per channel pair."""
 
     def make(spec: InputSpec) -> InputSpec:
@@ -335,7 +355,7 @@ def _half_width(name: str, seed_offset: int, aliases: tuple[str, ...] = ()) -> O
             seed=spec.seed + seed_offset,
         )
 
-    return Operand(name=name, spec=make, aliases=aliases)
+    return Operand(name=name, spec=make, aliases=aliases, transform=transform)
 
 
 RMS_NORM_AFFINE = Suite(
@@ -369,8 +389,10 @@ ROPE = Suite(
     usage_call="out = rope_rowwise(x, cos_tab, sin_tab)",
     shapes=_even_row_shapes,
     extras=(
-        _half_width("cos_tab", 4001, ("cos", "cos_cache", "freqs_cos", "c")),
-        _half_width("sin_tab", 5003, ("sin", "sin_cache", "freqs_sin", "s")),
+        _half_width("cos_tab", 4001, ("cos", "cos_cache", "freqs_cos", "c"), torch.cos),
+        # Same seed offset as cos, so both are taken from one set of angles and
+        # the pair is an actual rotation rather than two unrelated tables.
+        _half_width("sin_tab", 4001, ("sin", "sin_cache", "freqs_sin", "s"), torch.sin),
     ),
     baselines=(
         Baseline(
@@ -404,7 +426,7 @@ def make_inputs(suite: Suite, spec: InputSpec, device: str = "cpu") -> tuple[tor
 
     return (
         generate(spec, device=device),
-        *(generate(operand.spec(spec), device=device) for operand in suite.extras),
+        *(operand.build(spec, device=device) for operand in suite.extras),
     )
 
 

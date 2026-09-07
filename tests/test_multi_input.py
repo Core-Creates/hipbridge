@@ -26,14 +26,16 @@ def torch_():
 
 
 def _weights(offset):
+    """A per-column operand, built the way the suites build theirs."""
     from hipbridge.verify.inputs import InputSpec
+    from hipbridge.verify.suites import Operand
 
-    def make(spec: InputSpec) -> InputSpec:
-        return InputSpec(
+    return Operand(
+        name=f"w{offset}",
+        spec=lambda spec: InputSpec(
             shape=(spec.shape[-1],), distribution=spec.distribution, seed=spec.seed + offset
-        )
-
-    return make
+        ),
+    ).build
 
 
 def test_extra_operands_reach_every_side(torch_):

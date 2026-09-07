@@ -83,11 +83,19 @@ def test_rope_tables_are_half_as_wide():
     from hipbridge.verify.suites import ROPE
 
     spec = InputSpec(shape=(8, 128))
-    made = [o.spec(spec) for o in ROPE.extras]
+    made = [o.build(spec) for o in ROPE.extras]
 
-    assert [s.shape for s in made] == [(8, 64), (8, 64)]
+    assert [tuple(t.shape) for t in made] == [(8, 64), (8, 64)]
     assert [o.name for o in ROPE.extras] == ["cos_tab", "sin_tab"]
-    assert made[0].seed != made[1].seed, "cos and sin must not be the same table"
+
+    # A cosine and a sine of the SAME angles, so the pair is a rotation. Two
+    # independent adversarial tables are not one, and in fp16 the products
+    # overflow to infinity, which gets blamed on the kernel.
+    import torch
+
+    cos, sin = made
+    assert torch.allclose(cos * cos + sin * sin, torch.ones_like(cos), atol=1e-5)
+    assert float(cos.abs().max()) <= 1.0 and float(sin.abs().max()) <= 1.0
 
 
 def test_rope_matches_torch_on_cpu():

@@ -162,15 +162,16 @@ class Harness:
     # them too. Each entry maps the primary InputSpec to a spec for one more
     # tensor, handed to candidate, reference and oracle in order after it.
     # Empty by default: a single-input kernel behaves exactly as before.
-    extras: Sequence[Callable[[InputSpec], InputSpec]] = ()
+    extras: Sequence[Callable[[InputSpec, str], Any]] = ()
     # Precisions to sweep. float32 alone by default, because that is what the
     # native driver reads and what every shipped example kernel declares.
     # Inference runs in half precision, so a candidate meant for it should be
     # swept in half precision, judged against the same float64 oracle.
     dtypes: Sequence[Any] = ()
 
-    def extra_inputs(self, spec: InputSpec) -> list[InputSpec]:
-        return [make(spec) for make in self.extras]
+    def extra_inputs(self, spec: InputSpec) -> list[Any]:
+        """Build every extra operand for this case, on the sweep's device."""
+        return [make(spec, self.device) for make in self.extras]
 
     def __post_init__(self) -> None:
         if not isinstance(self.reference, Reference):
@@ -187,7 +188,7 @@ class Harness:
         # that only ever hands it one tensor, and an unproven substitution is
         # worth nothing. Their shapes derive from the primary case, so a sweep
         # over shapes sweeps the weights with it.
-        extras = [generate(s, device=self.device) for s in self.extra_inputs(spec)]
+        extras = self.extra_inputs(spec)
         ins = (primary, *extras)
         ins_dev = ins
 
