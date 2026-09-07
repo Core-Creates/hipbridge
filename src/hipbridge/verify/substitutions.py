@@ -127,13 +127,54 @@ def _looks_like_rms_norm(source: str, facts: KernelFacts) -> list[str] | None:
     ]
 
 
+def operand_mismatch(suite: Suite, facts: KernelFacts) -> str | None:
+    """Do the kernel's extra inputs line up with the substitute's, by name?
+
+    Position is not enough. The generated driver binds input buffers in
+    declaration order, so a kernel written `(in, beta, gamma, out, ...)` gets
+    gamma where it expects beta. LayerNorm with its scale and shift exchanged
+    still runs, still produces finite output, and is wrong on every row. The
+    oracle would fail it and say only that the numbers disagreed.
+
+    Returns None when the names line up, or a sentence naming the problem. A
+    kernel using unfamiliar names is not refused for that alone: names are a
+    weaker signal than the numeric proof, so an unrecognised spelling is
+    allowed through while a recognised one in the wrong position is not.
+    """
+    if not suite.extras:
+        return None
+
+    got = [p.name for p in facts.inputs[1:]]
+    if len(got) != len(suite.extras):
+        return f"expected {len(suite.extras)} extra inputs, found {len(got)}"
+
+    for i, (operand, name) in enumerate(zip(suite.extras, got, strict=True)):
+        if operand.matches(name):
+            continue
+        # Does it belong to a different position? That is a swap, not a
+        # vocabulary difference, and it is the dangerous case.
+        for j, other in enumerate(suite.extras):
+            if j != i and other.matches(name):
+                return (
+                    f"operand {i + 1} is named `{name}`, which this substitute "
+                    f"expects at position {j + 1}: the weights appear to be in a "
+                    f"different order than `{'`, `'.join(o.name for o in suite.extras)}`"
+                )
+    return None
+
+
 # Patterns a row-wise reduction can legitimately be written as. Serial is the
 # naive form; tree and shuffle are the competent ones. Anything else is not a
 # row-wise reduction at all and is refused before the evidence is examined.
 _ROW_PATTERNS = (Pattern.REDUCE_SERIAL, Pattern.REDUCE_TREE, Pattern.REDUCE_SHUFFLE)
 
 
-def propose(source: str, facts: KernelFacts, pattern: Pattern) -> Proposal | None:
+def propose(
+    source: str,
+    facts: KernelFacts,
+    pattern: Pattern,
+    notes: list[str] | None = None,
+) -> Proposal | None:
     """The substitute to try for this kernel, or None to decline.
 
     Declining is a first-class outcome. `port` reports UNKNOWN and stops rather
@@ -141,6 +182,11 @@ def propose(source: str, facts: KernelFacts, pattern: Pattern) -> Proposal | Non
     in that each test is exclusive of the others: softmax exponentiates,
     LayerNorm centres, RMSNorm does neither, and a kernel matching none of them
     gets no proposal at all.
+
+    Pass `notes` to collect the reasons a near miss was declined. A kernel that
+    matched every test but wired its weights in another order is the case worth
+    explaining, because "no substitution proposed" would send someone hunting
+    for a missing feature rather than reading their own signature.
     """
     if pattern not in _ROW_PATTERNS:
         return None
@@ -164,6 +210,14 @@ def propose(source: str, facts: KernelFacts, pattern: Pattern) -> Proposal | Non
         # the other would drop or invent a scale and shift, silently.
         wanted_inputs = 1 + len(suite.extras)
         if len(facts.inputs) != wanted_inputs or len(facts.outputs) != 1 or len(scalars) != 2:
+            continue
+
+        # Names, once the count is right. A recognised name in the wrong slot is
+        # a swap, and a swap runs, returns finite numbers and is wrong.
+        problem = operand_mismatch(suite, facts)
+        if problem:
+            if notes is not None:
+                notes.append(f"{suite.name}: {problem}")
             continue
 
         if suite.extras:
