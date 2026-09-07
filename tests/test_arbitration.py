@@ -177,3 +177,30 @@ def test_harness_oracle_mode_accepts_correct_and_rejects_identity(torch_):
     ).run(shapes)
     assert not bad.ok
     assert any("LESS ACCURATE" in f for r in bad.failures for f in r.failures)
+
+
+def test_an_exact_tie_is_equivalent_not_better(torch_):
+    """Identical implementations cannot be closer to the truth than each other.
+
+    The rule was `ratio <= 1.0`, and a tie gives exactly 1.0, so every tie above
+    the noise floor scored as a win. Visible on hardware: the RoPE run reported
+    `worst ulp=0` and `better=12` on the same line, which cannot both be true of
+    output that is bitwise identical to the original.
+    """
+    x, truth = _softmax_case(torch_)
+    same = (torch_.softmax(x.double(), dim=-1) + 1e-3).float()  # well above the floor
+
+    arb = verify.arbitrate(same, same, truth)
+    assert arb.ratio == 1.0
+    assert arb.verdict == "equivalent", f"a tie scored as {arb.verdict}"
+
+
+def test_strictly_closer_is_still_better(torch_):
+    """Tightening the tie must not cost a real win."""
+    x, truth = _softmax_case(torch_)
+    good = torch_.softmax(x, dim=-1)
+    sloppy = (good.double() + 1e-6).float()
+
+    arb = verify.arbitrate(good, sloppy, truth)
+    assert arb.ratio < 1.0
+    assert arb.verdict == "better", str(arb)

@@ -303,3 +303,43 @@ def test_row_softmax_carries_a_competent_baseline():
     assert tuned.launch.block == (256, 1, 1), "a fair baseline uses the whole wavefront"
     assert "__syncthreads" in src and "__shared__" in src, "expected a tree reduction"
     assert "blockIdx.x" in src
+
+
+@needs_verify
+def test_the_latency_bound_threshold_flips_exactly_once():
+    """The 25% line was never exercised at its boundary.
+
+    Two shapes with the same time: the larger does more work per millisecond, so
+    it sets the best throughput and the smaller is judged against it. Sizing the
+    small one either side of a quarter of that throughput moves the label and
+    nothing else.
+    """
+    from hipbridge.verify.bench import LATENCY_BOUND_FRACTION, mark_latency_bound
+
+    def sweep(small_elements):
+        # Equal times, so throughput is decided purely by element count.
+        small = _row((1, small_elements), cand=0.010, original=1.0)
+        large = _row((1, 1000), cand=0.010, original=1.0)
+        mark_latency_bound([small, large])
+        return small.latency_bound, large.latency_bound
+
+    just_under = int(1000 * LATENCY_BOUND_FRACTION) - 1  # 249 elements
+    just_over = int(1000 * LATENCY_BOUND_FRACTION) + 1  # 251 elements
+
+    assert sweep(just_under) == (True, False), "below the line must be labelled"
+    assert sweep(just_over) == (False, False), "above the line must not be"
+
+
+@needs_verify
+def test_a_single_shape_cannot_be_judged():
+    """One shape is its own best throughput, so calling it compute-bound is circular."""
+    from hipbridge.verify.bench import mark_latency_bound, render
+
+    only = _row((1, 1024), cand=0.018, original=0.325)
+    judged = mark_latency_bound([only])
+
+    assert judged is False
+    assert only.latency_bound is False
+    out = render([only])
+    assert "latency-bound" not in out.replace("labelled latency-bound", "")
+    assert "no faster run of the same kernel" in out, "silence here would be misleading"
