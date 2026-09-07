@@ -48,6 +48,10 @@ on:
         description: Also time the kernels. Costs more GPU minutes.
         type: boolean
         default: true
+      port:
+        description: Also prove each kernel end to end through port.
+        type: boolean
+        default: true
       require_device:
         description: Fail if no AMD device is found, instead of skipping.
         type: boolean
@@ -60,7 +64,10 @@ jobs:
   verify:
     runs-on: ${{ inputs.runner }}
     # Hard ceiling. A hung compile on a metered GPU must not bill for six hours.
-    timeout-minutes: 45
+    # Verify, bench and port across three precisions runs close to 45 minutes on
+    # an MI300X. The ceiling exists so a hung compile cannot bill for hours, not
+    # to cut short a run that is working.
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -112,6 +119,17 @@ jobs:
             --shapes 1x1024,1024x1024,4096x4096 \
             ${{ steps.flags.outputs.dtype }} \
             --report
+
+      # Every substitutable kernel, proved end to end. Without this the artifact
+      # mixes fresh reports with whatever port files happened to be committed,
+      # which is precisely the drift the freshness check exists to catch.
+      - name: Prove each kernel through port
+        if: ${{ inputs.port }}
+        run: |
+          for k in row_softmax layer_norm layer_norm_affine rms_norm rms_norm_affine rope; do
+            echo "== $k"
+            hipbridge port "examples/$k.cu"               --toolchain hipcc               --arch "${{ inputs.arch }}"               --limit "${{ inputs.limit }}"               --report
+          done
 
       # The reports carry the commit, host, device, toolchain and torch build
       # they were produced at, so an artifact from a run nobody watched is still
