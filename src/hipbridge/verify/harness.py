@@ -46,6 +46,12 @@ class CaseResult:
     max_ulp: int | None = None
     failures: list[str] = field(default_factory=list)
     arbitration: Arbitration | None = None
+    # ULP is scale-free and the right metric for softmax, whose outputs are
+    # positive and O(1). It is the wrong one for anything centred on zero:
+    # LayerNorm outputs straddle zero, where +1e-9 and -1e-9 are a hair apart in
+    # magnitude and 1.7 billion ULP apart on the integer line. A committed report
+    # showing only ULP would read as a catastrophe. Carry the absolute error too.
+    max_abs: float | None = None
 
     def __str__(self) -> str:
         mark = "pass" if self.passed else "FAIL"
@@ -101,6 +107,12 @@ class Summary:
     def worst_ulp(self) -> int:
         return max((r.max_ulp or 0) for r in self.results) if self.results else 0
 
+    @property
+    def worst_abs(self) -> float | None:
+        """Largest absolute divergence from the reference, in output units."""
+        errs = [r.max_abs for r in self.results if r.max_abs is not None]
+        return max(errs) if errs else None
+
     def __str__(self) -> str:
         if self.skipped_reason:
             return f"SKIP  {self.name}: {self.skipped_reason}"
@@ -109,6 +121,10 @@ class Summary:
             f"{len(self.results) - len(self.failures)}/{len(self.results)} cases, "
             f"worst ulp={self.worst_ulp}"
         )
+        # A large ULP count on near-zero outputs is arithmetic, not a defect, so
+        # the magnitude that produced it travels with it.
+        if self.worst_abs is not None:
+            head += f" (max abs {self.worst_abs:.3e})"
         # In oracle mode the ULP figure is expected to be large and says little
         # on its own. The accuracy verdict is the number that matters.
         if self.verdicts:
@@ -192,7 +208,7 @@ class Harness:
 
         if self.oracle is None:
             failures = [f for f in report.failures if "IDENTITY" not in f] + extra
-            return CaseResult(label, not failures, report.max_ulp, failures)
+            return CaseResult(label, not failures, report.max_ulp, failures, max_abs=report.max_abs)
 
         # Oracle mode: ULP drift from the reference is expected and fine as long
         # as the candidate is not further from the truth than the reference is.
@@ -201,7 +217,7 @@ class Harness:
         failures = [f for f in failures if "IDENTITY" not in f] + extra
         if arb.verdict == "worse":
             failures.append(f"LESS ACCURATE than the reference: {arb}")
-        return CaseResult(label, not failures, report.max_ulp, failures, arb)
+        return CaseResult(label, not failures, report.max_ulp, failures, arb, report.max_abs)
 
     def run(self, shapes: Iterable[tuple[int, ...]], limit: int | None = None) -> Summary:
         if isinstance(self.reference, Reference):

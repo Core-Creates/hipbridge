@@ -17,6 +17,21 @@ from hipbridge.frontend import parse_file
 from hipbridge.recognize import recognize, registered
 
 
+def _report_path(args, command: str) -> str:
+    """Where a report goes: an explicit path, or the tracked results directory.
+
+    `--report` with no value means "save this where results are kept", which is
+    the common case and the one worth making frictionless. Filenames are
+    deterministic so a re-run shows up as a diff rather than as a new file that
+    nobody compares against the last one.
+    """
+    from hipbridge.verify import provenance
+
+    if args.report == "AUTO":
+        return provenance.default_path(command, args.toolchain, args.arch)
+    return args.report
+
+
 def _cmd_inspect(args) -> int:
     kernels = parse_file(args.file)
     if not kernels:
@@ -89,14 +104,13 @@ def _cmd_verify(args) -> int:
         failed |= not summary.ok
 
     if args.report:
-        Path(args.report).write_text(
-            "# hipbridge verification report\n\n"
-            f"toolchain: `{args.toolchain}`  arch: `{args.arch or 'default'}`\n\n"
-            + "\n\n".join(f"```\n{x}\n```" for x in lines)
-            + "\n",
-            encoding="utf-8",
+        from hipbridge.verify import provenance
+
+        body = "\n\n".join("```\n" + x + "\n```" for x in lines)
+        written = provenance.write(
+            _report_path(args, "verify"), "hipbridge verification", args.toolchain, args.arch, body
         )
-        print(f"\nreport written to {args.report}")
+        print(f"\nreport written to {written}")
 
     if ran == 0:
         print("no suite ran (no device available)")
@@ -126,6 +140,7 @@ def _cmd_bench(args) -> int:
     shapes = [tuple(int(d) for d in s.split("x")) for s in args.shapes.split(",")]
     device = "cuda" if torch.cuda.is_available() else "cpu"
     failed = False
+    report_sections: list[str] = []
     if device != "cuda":
         print("WARNING: no GPU visible to torch, so the candidate runs on the host")
         print("         while the original runs on device. Ratios are suppressed as")
@@ -231,10 +246,37 @@ def _cmd_bench(args) -> int:
                 )
             )
 
-        print(bench.render(rows))
+        table = bench.render(rows)
+        print(table)
         print()
         print("median of runs, [min-max] beside it. latency-bound marks shapes where")
         print("the candidate never reaches the throughput it shows at larger sizes.")
+        report_sections.append(
+            "\n".join(
+                [
+                    f"## {suite.name}",
+                    "",
+                    f"candidate: {described}",
+                    f"reps: {args.reps}, runs: {args.runs}, device: `{device}`",
+                    "",
+                    "```",
+                    table,
+                    "```",
+                ]
+            )
+        )
+
+    if args.report and report_sections:
+        from hipbridge.verify import provenance
+
+        written = provenance.write(
+            _report_path(args, "bench"),
+            "hipbridge benchmark",
+            args.toolchain,
+            args.arch,
+            "\n\n".join(report_sections),
+        )
+        print(f"\nreport written to {written}")
 
     return 1 if (failed and args.require) else 0
 
@@ -368,21 +410,28 @@ def _cmd_port(args) -> int:
     )
     print("judged against a float64 oracle rather than against the original's rounding.")
     if args.report:
-        lines = [
-            "# hipbridge port report",
-            "",
-            f"source: `{args.file}`  kernel: `{facts.name}`",
-            f"pattern: `{result.pattern.value}` ({result.confidence})",
-            f"substitute: {described}",
-            f"toolchain: `{args.toolchain}`  arch: `{args.arch or 'default'}`",
-            "",
-            "```",
-            str(summary),
-            "```",
-            "",
-        ]
-        Path(args.report).write_text("\n".join(lines), encoding="utf-8")
-        print(f"report written to {args.report}")
+        from hipbridge.verify import provenance
+
+        body = "\n".join(
+            [
+                f"source: `{args.file}`  kernel: `{facts.name}`",
+                f"pattern: `{result.pattern.value}` ({result.confidence})",
+                f"substitute: {described}",
+                f"launch: `block={launch.block}`",
+                "",
+                "```",
+                str(summary),
+                "```",
+            ]
+        )
+        written = provenance.write(
+            _report_path(args, f"port-{facts.name}"),
+            "hipbridge port report",
+            args.toolchain,
+            args.arch,
+            body,
+        )
+        print(f"report written to {written}")
     return 0
 
 
@@ -421,7 +470,14 @@ def main(argv: list[str] | None = None) -> int:
     ver.add_argument("--limit", type=int, default=12, help="max shapes per suite (cost control)")
     ver.add_argument("--examples", default="examples", help="directory holding the .cu files")
     ver.add_argument("--wsl", default="", metavar="DISTRO", help="run the toolchain inside WSL2")
-    ver.add_argument("--report", default="", help="write a markdown report to this path")
+    ver.add_argument(
+        "--report",
+        nargs="?",
+        const="AUTO",
+        default="",
+        metavar="PATH",
+        help="write a markdown report; bare flag saves under results/",
+    )
     ver.add_argument(
         "--require",
         action="store_true",
@@ -442,6 +498,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     ben.add_argument("--examples", default="examples")
     ben.add_argument("--wsl", default="", metavar="DISTRO")
+    ben.add_argument(
+        "--report",
+        nargs="?",
+        const="AUTO",
+        default="",
+        metavar="PATH",
+        help="write a markdown report; bare flag saves under results/",
+    )
     ben.add_argument("--require", action="store_true")
     ben.set_defaults(fn=_cmd_bench)
 
@@ -458,7 +522,14 @@ def main(argv: list[str] | None = None) -> int:
         help="threads per block for the original; inferred from the source when unset",
     )
     prt.add_argument("--wsl", default="", metavar="DISTRO")
-    prt.add_argument("--report", default="", help="write a markdown report to this path")
+    prt.add_argument(
+        "--report",
+        nargs="?",
+        const="AUTO",
+        default="",
+        metavar="PATH",
+        help="write a markdown report; bare flag saves under results/",
+    )
     prt.add_argument(
         "--require",
         action="store_true",
