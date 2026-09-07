@@ -174,3 +174,41 @@ def test_the_norms_are_separated_by_how_many_quantities_they_reduce():
 
     assert two is not None and two.name == "layer_norm"
     assert one is not None and one.name == "rms_norm"
+
+
+def test_confidence_is_reported_and_never_gates(examples):
+    """A "likely" match is proposed exactly as readily as a "certain" one.
+
+    The obvious use of the field would be to refuse a substitution on a merely
+    likely recognition. row_softmax.cu is `reduce_serial` at "likely" and its
+    substitution passes 126/126 on device, so gating would reject a correct
+    substitution on weaker evidence than the float64 oracle that follows.
+    Recognition proposes; the proof disposes.
+    """
+    from hipbridge.verify import substitutions
+
+    likely = recognize(parse_file(examples / "row_softmax.cu")[0])
+    certain = recognize(parse_file(examples / "row_softmax_tuned.cu")[0])
+
+    assert likely.confidence == "likely"
+    assert certain.confidence == "certain"
+
+    # Same substitute either way, and propose() cannot even see the confidence.
+    for r in (likely, certain):
+        proposal = substitutions.propose(r.facts, r.pattern)
+        assert proposal is not None and proposal.name == "row_softmax"
+
+    import inspect
+
+    signature = inspect.signature(substitutions.propose)
+    assert "confidence" not in signature.parameters, (
+        "confidence must stay out of the decision, not merely be ignored inside it"
+    )
+
+
+def test_confidence_reaches_the_reader(examples):
+    """Advisory is not the same as hidden: it has to be printed where it helps."""
+    facts = parse_file(examples / "row_softmax.cu")[0]
+    report = recognize(facts).report()
+
+    assert "confidence: likely" in report

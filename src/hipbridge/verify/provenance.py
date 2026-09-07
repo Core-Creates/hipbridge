@@ -15,6 +15,7 @@ write because the GPU name could not be read would be a poor trade.
 
 from __future__ import annotations
 
+import hashlib
 import platform
 import re
 import shutil
@@ -98,6 +99,7 @@ def header(title: str, toolchain: str, arch: str) -> str:
         ("toolchain", f"{toolchain}, {toolchain_version(toolchain)}"),
         ("arch", arch or "default"),
         ("torch", torch_version()),
+        ("measured code", f"`{code_digest()}`"),
     ]
     lines = [f"# {title}", "", "| field | value |", "|---|---|"]
     lines += [f"| {k} | {v} |" for k, v in rows]
@@ -127,6 +129,38 @@ CODE_PATHS = (
     "src/hipbridge/verify",
     "examples",
 )
+
+
+def code_digest(root: Path | None = None) -> str:
+    """A hash of the code a measurement depends on, read off disk.
+
+    Ancestry was the wrong question. A report produced on a feature branch names
+    a commit that rebase-merging rewrites, so every merge made every report look
+    stale while the code they measured had not changed at all. It also could not
+    be answered on CI's shallow checkout, and it treated any change under a
+    measured directory as invalidating, including refactors that cannot move a
+    number.
+
+    Content answers all three: it survives a rebase, needs no history, and
+    changes exactly when the measured files change.
+    """
+    base = root or Path(__file__).resolve().parents[3]
+    h = hashlib.sha256()
+    for rel in CODE_PATHS:
+        target = base / rel
+        if not target.exists():
+            continue
+        for f in sorted(target.rglob("*")):
+            if f.is_file() and f.suffix in {".py", ".cu", ".hip", ".cpp"}:
+                h.update(str(f.relative_to(base)).replace("\\", "/").encode())
+                h.update(f.read_bytes())
+    return h.hexdigest()[:16]
+
+
+def parse_code_digest(report: str) -> str | None:
+    """The digest a report recorded, or None for one written before this existed."""
+    m = re.search(r"\|\s*measured code\s*\|\s*`([0-9a-f]+)`", report)
+    return m.group(1) if m else None
 
 
 def parse_commit(report: str) -> str | None:
@@ -168,31 +202,31 @@ def is_ancestor(older: str, newer: str) -> bool:
 def staleness(report: str) -> tuple[str, str]:
     """Judge one report. Returns (verdict, explanation).
 
-    Verdicts: "fresh", "stale", "unknown". Unknown covers a shallow clone or a
-    missing git, and is deliberately distinct from stale so a caller can decide
-    whether an unanswerable question should fail anything.
+    Verdicts: "fresh", "stale", "unknown". Unknown covers a report written
+    before digests were recorded, and is deliberately distinct from stale so a
+    caller can decide whether an unanswerable question should fail anything.
     """
-    stamped = parse_commit(report)
-    if stamped is None:
+    if parse_commit(report) is None:
         return "unknown", "the report does not name the commit it was produced at"
 
-    code = last_code_change()
-    if code is None:
-        return "unknown", "git history is unavailable here"
-    if not (known(stamped) and known(code)):
-        return "unknown", f"commit {stamped} is not in this clone's history"
+    stamped = parse_code_digest(report)
+    if stamped is None:
+        return "unknown", "the report predates code digests, so it cannot be checked"
 
-    if is_ancestor(code, stamped):
-        return "fresh", f"no measured code has changed since {stamped}"
+    current = code_digest()
+    if stamped == current:
+        return "fresh", f"measured code is unchanged since this run ({current})"
     return (
         "stale",
-        f"measured at {stamped}, but {code} has since changed something it measures",
+        f"measured code was {stamped} and is now {current}; re-run and commit, "
+        "or delete the report rather than leaving it to read as current",
     )
 
 
 __all__ = [
     "CODE_PATHS",
     "RESULTS_DIR",
+    "code_digest",
     "commit",
     "default_path",
     "device",
@@ -200,6 +234,7 @@ __all__ = [
     "is_ancestor",
     "known",
     "last_code_change",
+    "parse_code_digest",
     "parse_commit",
     "staleness",
     "toolchain_version",

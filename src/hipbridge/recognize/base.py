@@ -12,6 +12,10 @@ from collections.abc import Callable
 from hipbridge.frontend.ir import KernelFacts, Pattern, Recognition
 
 # A rule returns (pattern, confidence, rationale) or None to decline.
+#
+# Confidence is reported, never acted on. See Recognition.confidence: gating a
+# substitution on it would reject correct kernels on weaker evidence than the
+# numeric proof that follows, so it exists to inform a reader and nothing else.
 Rule = Callable[[KernelFacts], tuple[Pattern, str, list[str]] | None]
 
 _RULES: list[tuple[int, str, Rule]] = []
