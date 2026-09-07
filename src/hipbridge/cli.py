@@ -412,9 +412,9 @@ def _cmd_port(args) -> int:
 
     print("SUBSTITUTION PROVED. Use it like this:")
     print()
-    print("    from hipbridge.kernels.softmax import softmax_rowwise")
+    print(f"    {proposal.suite.usage_import}")
     print()
-    print(f"    out = softmax_rowwise(x)   # replaces {facts.name}")
+    print(f"    {proposal.suite.usage_call}   # replaces {facts.name}")
     print()
     print(
         f"Proved on {args.toolchain}"

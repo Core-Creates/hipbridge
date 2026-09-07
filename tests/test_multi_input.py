@@ -120,3 +120,33 @@ def test_weight_shapes_follow_the_case(torch_):
         made = [m(spec) for m in LAYER_NORM_AFFINE.extras]
         assert [s.shape for s in made] == [(cols,), (cols,)]
         assert made[0].seed != made[1].seed, "gamma and beta must not be the same tensor twice"
+
+
+def test_every_suite_tells_you_to_call_its_own_kernel():
+    """port printed a hardcoded softmax snippet for every kernel it proved.
+
+    So a proved LayerNorm came with instructions to call softmax_rowwise on it.
+    The proof was correct and the instruction was wrong, which is the worst
+    combination this project can produce, and no test caught it because nothing
+    asserted on the text after the verdict.
+    """
+    from hipbridge.verify.suites import BUILTIN
+
+    for suite in BUILTIN:
+        assert suite.usage_import, f"{suite.name} has no import line"
+        assert suite.usage_call, f"{suite.name} has no call line"
+
+        fn = suite.usage_import.rsplit(" import ", 1)[1]
+        assert fn in suite.usage_call, f"{suite.name} imports {fn} and calls something else"
+
+        if suite.name != "row_softmax":
+            assert "softmax" not in suite.usage_import, (
+                f"{suite.name} tells the caller to use softmax"
+            )
+
+        # A kernel taking weights has to be called with them.
+        if suite.extras:
+            assert suite.usage_call.count(",") >= len(suite.extras), (
+                f"{suite.name} takes {len(suite.extras)} extra operands but the "
+                f"snippet passes none: {suite.usage_call}"
+            )

@@ -61,6 +61,13 @@ class Suite:
     # case. LayerNorm's gamma and beta live here. Empty for the kernels that
     # take one tensor, which is most of them.
     extras: tuple[Callable[[InputSpec], InputSpec], ...] = ()
+    # How a caller actually uses the substitute once it is proved. Held per
+    # suite because `port` printed a hardcoded softmax snippet for every kernel
+    # it proved, so a proved LayerNorm came with instructions to call softmax on
+    # it. The proof was right and the instruction was wrong, which is the worst
+    # combination this project can produce.
+    usage_import: str = ""
+    usage_call: str = ""
 
     def source(self, examples_dir: Path) -> str:
         return (examples_dir / self.source_file).read_text(encoding="utf-8")
@@ -89,6 +96,8 @@ ROW_SOFTMAX = Suite(
     ),
     oracle=lambda t: torch.softmax(t.double(), dim=-1),
     portable=lambda t: torch.softmax(t, dim=-1),
+    usage_import="from hipbridge.kernels.softmax import softmax_rowwise",
+    usage_call="out = softmax_rowwise(x)",
     shapes=_row_shapes,
     baselines=(
         Baseline(
@@ -163,6 +172,8 @@ LAYER_NORM = Suite(
     launch=_norm_launch("layer_norm", (1, 1, 1)),  # serial within the row
     oracle=_layer_norm_oracle,
     portable=_torch_layer_norm,
+    usage_import="from hipbridge.kernels.norm import layer_norm_rowwise",
+    usage_call="out = layer_norm_rowwise(x)",
     portable_name="torch",
     shapes=_row_shapes,
     baselines=(
@@ -181,6 +192,8 @@ RMS_NORM = Suite(
     launch=_norm_launch("rms_norm", (1, 1, 1)),
     oracle=_rms_norm_oracle,
     portable=_torch_rms_norm,
+    usage_import="from hipbridge.kernels.norm import rms_norm_rowwise",
+    usage_call="out = rms_norm_rowwise(x)",
     portable_name="torch",
     shapes=_row_shapes,
     baselines=(
@@ -227,6 +240,8 @@ LAYER_NORM_AFFINE = Suite(
     launch=_norm_launch("layer_norm_affine", (1, 1, 1)),
     oracle=_layer_norm_affine_oracle,
     portable=_torch_layer_norm_affine,
+    usage_import="from hipbridge.kernels.norm import layer_norm_affine_rowwise",
+    usage_call="out = layer_norm_affine_rowwise(x, gamma, beta)",
     shapes=_row_shapes,
     extras=(_per_column(1009), _per_column(2003)),
     baselines=(
