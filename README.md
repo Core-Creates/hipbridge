@@ -2,12 +2,16 @@
 
 Recognize CUDA kernels, substitute verified AMD implementations, prove it numerically.
 
-**Status: pre-alpha.** Correctness has been verified on real hardware, on both
-vendors: nvcc on an RTX 4060 via WSL2, and hipcc on an MI300X (gfx942).
-Performance has been measured on the MI300X against three baselines: 17x to
-76x against the naive original, **2.9x against a competently written HIP
-kernel** at large shapes, and a 3x to 5x regression below roughly 16M elements.
-See
+**Status: pre-alpha.** Six kernels are covered, spanning the row-wise part of a
+transformer's inference path, and all six verify on an MI300X at 84/84 cases
+each. Correctness has been checked on both vendors: nvcc on an RTX 4060 via
+WSL2, and hipcc on an MI300X (gfx942).
+
+Performance has been measured for softmax and the plain norms against three
+baselines: 17x to 76x against the naive original, **2.9x against a competently
+written HIP kernel** at large shapes, and a 3x to 5x regression below roughly
+16M elements. The kernels taking learned weights are proved correct and have
+not been timed. See
 [the status table](#status-of-what-has-actually-been-run) for exactly which
 paths those are. Claims in this README are limited to what has actually been
 run, never to what should follow from it.
@@ -35,6 +39,58 @@ Core installs anywhere. The `kernels` and `verify` extras pull Triton, which
 publishes Linux wheels only; the dependency is marked so it degrades instead of
 failing the install.
 
+## What it covers
+
+Six kernels, which is the row-wise part of a transformer's inference path. Each
+ships a naive original, a competently written HIP baseline to benchmark
+against, a Triton implementation, and a float64 oracle.
+
+| Kernel | Extra operands | Substitute |
+|---|---|---|
+| `row_softmax` | none | `kernels.softmax.softmax_rowwise` |
+| `layer_norm` | none | `kernels.norm.layer_norm_rowwise` |
+| `layer_norm_affine` | `gamma`, `beta` | `kernels.norm.layer_norm_affine_rowwise` |
+| `rms_norm` | none | `kernels.norm.rms_norm_rowwise` |
+| `rms_norm_affine` | `gamma` | `kernels.norm.rms_norm_affine_rowwise` |
+| `rope` | `cos_tab`, `sin_tab` | `kernels.rope.rope_rowwise` |
+
+All six verify on an MI300X, 84/84 cases each. Two things about the list are
+worth saying plainly rather than leaving to be discovered.
+
+**The affine forms take learned weights, and that took a harness change.** A
+kernel scaling by gamma cannot be proved by a harness that hands it one tensor,
+and proving the normalisation alone while substituting something that also
+multiplies by weights would prove one program and ship another. Suites now
+declare their extra operands, which are generated per case, swept with the
+shape, and handed to the candidate, the reference and the oracle alike.
+
+**Operands are matched by name, not only by position.** The generated driver
+binds input buffers in declaration order, so a LayerNorm written
+`(in, beta, gamma, out, rows, cols)` would receive gamma where it expects beta.
+It compiles, it runs, it returns finite numbers, and it is wrong on every row.
+A recognised name in the wrong slot is refused and explained; an unrecognised
+name is allowed through, because names are a weaker signal than the numeric
+proof and refusing every unfamiliar spelling would reject correct kernels for
+their vocabulary. `gamma` also answers to weight, scale, g and w.
+
+**RoPE is not a reduction**, and it did not fit the recognizer. `reduce.serial`
+requires an accumulation across the row and `elementwise.flat` requires no loop
+at all, so RoPE was `UNKNOWN`, correctly. Rather than widen either rule until it
+swallowed something it does not describe, there is a `row_map` pattern for a
+thread that walks a row and accumulates nothing, claimed on that absence, which
+is exactly what makes a row's outputs independent.
+
+The accuracy argument that carries softmax and the norms does not carry RoPE,
+and this README will not pretend otherwise: there is nothing to reduce, so
+there is no serial accumulation to beat. On the MI300X the substitution is
+bitwise identical to the original, `worst ulp=0`, equivalent on all 84 cases.
+The case for substituting it is throughput, not numerics.
+
+Neither the affine norms nor the plain ones fuse anything, and `rope` assumes an
+even head dimension, since pairing channel 2i with 2i+1 has no meaning
+otherwise. Odd widths are dropped from its sweep rather than silently truncated
+and counted as passing.
+
 ## Recognizing a kernel
 
 ```
@@ -53,7 +109,7 @@ When nothing claims the kernel, it says so instead of guessing:
 ```
 $ hipbridge inspect examples/tiled_transpose.cu
 pattern: unknown
-  - no recognizer claimed this kernel (4 tried)
+  - no recognizer claimed this kernel (5 tried)
   No substitution will be attempted. Translate this kernel by hand or extend the recognizers.
 ```
 
@@ -72,8 +128,6 @@ proposing: hipbridge.kernels.softmax (Triton, AMD-tuned)
   - calls expf, so it is not a plain sum
   - takes a maximum, the usual stability pass
   - divides by an accumulated total
-  - one input and one output pointer (row_softmax)
-  - two scalar arguments (rows, cols), read as rows/cols
 
 proving against examples/row_softmax.cu compiled with hipcc
   launch: grid one block per row, block=(1, 1, 1)
@@ -105,10 +159,15 @@ Exit codes are the interface:
 | 4 | proposed, but the proof failed, or the original itself is not sane |
 | 5 | no toolchain or device to prove it on, with `--require` |
 
-Refusals are the common case and are meant to be. Of the five kernels in
-`examples/`, three are refused: `tiled_transpose.cu` because nothing recognizes
-it, `tree_reduce.cu` and `saxpy.cu` because sharing a pattern with softmax is
-not evidence of being softmax.
+Refusals are meant to happen. Of the 15 kernels in `examples/`, three are
+refused: `tiled_transpose.cu` because nothing recognizes it, and `tree_reduce.cu`
+and `saxpy.cu` because sharing a pattern with a substitutable kernel is not
+evidence of being one. `tree_reduce.cu` is a `reduce_tree` exactly as
+`row_softmax_tuned.cu` is, and it sums where the other normalises.
+
+The other twelve are the six covered kernels, each in a naive and a tuned
+form, and the pair reaching the same substitute is the point: written badly or
+written well, it is still the same maths.
 
 ### It checks the original before trusting it
 
@@ -235,9 +294,11 @@ regrows a `triton` dependency.
 | Path | State |
 |---|---|
 | CPU, torch oracle | verified |
-| NVIDIA, nvcc on RTX 4060 via WSL2 | verified, 56/56 cases |
-| AMD, hipcc on MI300X (gfx942) | **verified**, 84/84 cases |
-| AMD, timed on MI300X (gfx942) | **measured**, 2.9x vs tuned HIP at scale, slower below it |
+| NVIDIA, nvcc on RTX 4060 via WSL2 | verified, 56/56 cases, softmax only |
+| AMD, hipcc on MI300X (gfx942) | **verified**, all six suites, 84/84 cases each |
+| AMD, kernels taking learned weights | **verified**, `layer_norm_affine` and `rms_norm_affine` |
+| AMD, timed on MI300X (gfx942) | **measured**, softmax and the plain norms |
+| AMD, timed with weights | not yet measured |
 
 ## The result this project was built to get
 
@@ -281,6 +342,38 @@ never further from it.
 The same effect was first measured on an RTX 4060, where the original kernel
 was 1.4x to 59.7x less accurate than torch across every shape and distribution
 tried. See `compare.arbitrate` and `tests/test_arbitration.py`.
+
+### The same run, across all six kernels
+
+```
+PASS  row_softmax        84/84  ulp=593         (max abs 1.199e-07)  better=6,  equivalent=78, up to 297x closer
+PASS  layer_norm         84/84  ulp=1776828265  (max abs 3.910e-05)  better=5,  equivalent=79, up to  79x closer
+PASS  layer_norm_affine  84/84  ulp=332160      (max abs 6.714e-04)  better=5,  equivalent=79, up to  86x closer
+PASS  rms_norm           84/84  ulp=10          (max abs 1.907e-06)  equivalent=84,            up to  15x closer
+PASS  rms_norm_affine    84/84  ulp=10          (max abs 3.662e-04)  equivalent=84,            up to  11x closer
+PASS  rope               84/84  ulp=0           (max abs 0.000e+00)  equivalent=84
+```
+
+Three of those lines need reading carefully, and the absolute error beside each
+ULP count is why it is printed.
+
+**`layer_norm` diverges by 1.78 billion ULP and is fine.** Its outputs are
+centred, so they sit near zero, and ULP distance explodes there: +1e-9 and -1e-9
+are a hair apart in magnitude and astronomically far apart on the integer line.
+The absolute error is 3.9e-05. ULP is the right scale-free metric for softmax,
+whose outputs are positive and O(1), and the wrong one for anything crossing
+zero.
+
+**`rope` is bitwise identical to the original**, `ulp=0`, equivalent on every
+case. There is no reduction in RoPE, so there is no serial accumulation to beat,
+and the accuracy argument simply does not apply. Substituting it is a throughput
+decision.
+
+**The two `equivalent=84` rows used to read `better=12`.** `arbitrate` scored a
+tie as a win, because a tie gives a ratio of exactly 1.0 and the test was
+`ratio <= 1.0`. Tightening it to `< 1.0` removed 24 false wins across the sweep
+and left the 16 real ones untouched, which is the useful part: the softmax and
+LayerNorm advantages were not artifacts.
 
 First MI300X run, `scripts/smoke-hip.sh`, HIP 7.14, gfx942:
 
