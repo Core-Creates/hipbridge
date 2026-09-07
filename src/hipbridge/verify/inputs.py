@@ -24,6 +24,11 @@ class Distribution(str, Enum):
     MONOTONIC = "monotonic"  # ordered: catches index and stride errors
     SPARSE = "sparse"  # mostly zeros: catches masked accumulation
     WITH_INF = "with_inf"  # +/-inf present: catches inf - inf -> nan
+    # What a trained scale actually looks like: clustered near 1, with a few
+    # zeros and a few negatives. Deliberately NOT in DEFAULT_SWEEP, because it
+    # is a poor input to a kernel and a realistic weight, and those are
+    # different jobs. See the note on WEIGHT_FOR below.
+    WEIGHT = "weight"
 
 
 # Distributions that are safe for any elementwise or reduction kernel.
@@ -78,6 +83,15 @@ def generate(spec: InputSpec, device: str = "cpu") -> torch.Tensor:
     elif d is Distribution.SPARSE:
         t = torch.randn(shape, generator=g)
         t[torch.rand(shape, generator=g) < 0.9] = 0.0
+    elif d is Distribution.WEIGHT:
+        # A learned gamma sits near 1. The zeros matter because a channel that
+        # has been switched off multiplies a whole column away, and the
+        # negatives matter because a kernel that assumes a positive scale (by
+        # folding it into an abs or a rsqrt, say) is wrong on them.
+        t = 1.0 + 0.1 * torch.randn(shape, generator=g)
+        picks = torch.rand(shape, generator=g)
+        t[picks < 0.05] = 0.0
+        t[picks > 0.95] *= -1.0
     elif d is Distribution.WITH_INF:
         t = torch.randn(shape, generator=g)
         flat = t.reshape(-1)
@@ -90,4 +104,33 @@ def generate(spec: InputSpec, device: str = "cpu") -> torch.Tensor:
     return t.to(dtype=spec.dtype, device=device)
 
 
-__all__ = ["DEFAULT_SWEEP", "Distribution", "InputSpec", "generate"]
+# How an operand's distribution follows the primary case's.
+#
+# Weights inherited the input's distribution, so gamma was drawn from the same
+# adversarial sweep as the data: WITH_INF gamma against WITH_INF input was
+# covered and a realistic gamma near 1.0 was not. That is backwards, since the
+# realistic pairing is the one every user hits.
+#
+# It is also not simply "always use WEIGHT", because hostile weights do break
+# kernels and dropping them would trade one blind spot for another. So the
+# ordinary case gets realistic weights, and every adversarial input keeps
+# adversarial weights alongside it. Both are covered, and which is which is
+# decided here rather than left to whatever the primary happened to be.
+WEIGHT_FOR: dict[Distribution, Distribution] = {
+    Distribution.NORMAL: Distribution.WEIGHT,
+}
+
+
+def weight_distribution(primary: Distribution) -> Distribution:
+    """The distribution an operand should use, given the primary case's."""
+    return WEIGHT_FOR.get(primary, primary)
+
+
+__all__ = [
+    "DEFAULT_SWEEP",
+    "WEIGHT_FOR",
+    "Distribution",
+    "InputSpec",
+    "generate",
+    "weight_distribution",
+]

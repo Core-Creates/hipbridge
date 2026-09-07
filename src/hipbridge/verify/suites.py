@@ -22,7 +22,7 @@ from typing import Any
 
 import torch
 
-from hipbridge.verify.inputs import InputSpec
+from hipbridge.verify.inputs import InputSpec, weight_distribution
 from hipbridge.verify.reference import LaunchSpec
 
 
@@ -267,7 +267,7 @@ def _per_column(name: str, seed_offset: int, aliases: tuple[str, ...] = ()) -> O
         return InputSpec(
             shape=(spec.shape[-1],),
             dtype=spec.dtype,
-            distribution=spec.distribution,
+            distribution=weight_distribution(spec.distribution),
             seed=spec.seed + seed_offset,
         )
 
@@ -351,6 +351,9 @@ def _half_width(
         return InputSpec(
             shape=(rows, cols // 2),
             dtype=spec.dtype,
+            # Angles, not weights. The cosine and sine transforms make the pair
+            # a rotation whatever these are, so this follows the primary case
+            # and the hostile inputs keep hostile angles beside them.
             distribution=spec.distribution,
             seed=spec.seed + seed_offset,
         )

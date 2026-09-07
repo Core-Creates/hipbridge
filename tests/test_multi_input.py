@@ -256,3 +256,51 @@ def test_every_suite_can_be_called_the_way_bench_calls_it(torch_):
 
         truth = suite.oracle(*(t.double() for t in ins))
         assert truth.shape == ins[0].shape, f"{suite.name} oracle shape"
+
+
+def test_the_ordinary_case_uses_a_realistic_weight(torch_):
+    """Gamma inherited the input's distribution, so the realistic case was never run.
+
+    WITH_INF gamma against WITH_INF input was covered; a trained scale near 1.0
+    was not, which is the only kind anyone actually deploys.
+    """
+    from hipbridge.verify.inputs import Distribution, InputSpec
+    from hipbridge.verify.suites import LAYER_NORM_AFFINE
+
+    gamma = LAYER_NORM_AFFINE.extras[0]
+    spec = InputSpec(shape=(4, 2000), distribution=Distribution.NORMAL)
+
+    assert gamma.spec(spec).distribution is Distribution.WEIGHT
+    t = gamma.build(spec)
+    near_one = int(((t - 1.0).abs() < 0.2).sum())
+    assert near_one > t.numel() * 0.7, "a learned scale clusters near 1"
+    assert int((t == 0).sum()) > 0, "a switched-off channel is worth testing"
+    assert int((t < 0).sum()) > 0, "a kernel folding gamma into an abs is wrong on these"
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    ["large", "tiny", "sparse", "with_inf", "mixed_sign", "constant", "monotonic"],
+)
+def test_hostile_inputs_keep_hostile_weights(hostile):
+    """Realistic weights must not replace the adversarial ones everywhere.
+
+    Swapping every weight for a well-behaved one would trade one blind spot for
+    another: hostile weights do break kernels. The ordinary case gets a
+    realistic scale, and each adversarial input keeps an adversarial scale
+    beside it.
+    """
+    from hipbridge.verify.inputs import Distribution, InputSpec
+    from hipbridge.verify.suites import LAYER_NORM_AFFINE
+
+    d = Distribution(hostile)
+    spec = InputSpec(shape=(4, 64), distribution=d)
+
+    assert LAYER_NORM_AFFINE.extras[0].spec(spec).distribution is d
+
+
+def test_the_weight_distribution_is_not_swept_as_an_input():
+    """It is a realistic weight and a poor input; those are different jobs."""
+    from hipbridge.verify.inputs import DEFAULT_SWEEP, Distribution
+
+    assert Distribution.WEIGHT not in DEFAULT_SWEEP
