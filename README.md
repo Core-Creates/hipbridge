@@ -7,11 +7,11 @@ transformer's inference path, and all six verify on an MI300X at 84/84 cases
 each. Correctness has been checked on both vendors: nvcc on an RTX 4060 via
 WSL2, and hipcc on an MI300X (gfx942).
 
-Performance has been measured for softmax and the plain norms against three
-baselines: 17x to 76x against the naive original, **2.9x against a competently
-written HIP kernel** at large shapes, and a 3x to 5x regression below roughly
-16M elements. The kernels taking learned weights are proved correct and have
-not been timed. See
+Performance is measured by CI on a self-hosted MI300X across all six kernels
+and three precisions. At large shapes the substitutions beat a **competently
+written HIP kernel by 1.3x to 1.7x** and torch by 1.3x to 1.4x, except RoPE
+which loses to hand-written HIP; below roughly 16M elements every substitution
+is a 3x to 5x regression. See
 [the status table](#status-of-what-has-actually-been-run) for exactly which
 paths those are. Claims in this README are limited to what has actually been
 run, never to what should follow from it.
@@ -486,59 +486,55 @@ WARNING: no GPU visible to torch, so the candidate runs on the host
 
 ### Measured on an MI300X
 
-```
-row_softmax on hipcc, device=cuda, reps=100, runs=5
-  candidate: hipbridge.kernels.softmax (Triton, AMD-tuned)
-  original : row_softmax.cu compiled with hipcc
-  tuned HIP: row_softmax_tuned.cu compiled with hipcc
-  torch    : library call, timed like the candidate
+Every row below was produced by CI on a self-hosted MI300X, not by a person at a
+terminal, and the reports are committed under `results/` with the commit, host,
+device and toolchain they came from. At 4096x4096, float32:
 
-       shape        original (us)     tuned HIP (us)         torch (us)     candidate (us)  vs original  vs tuned HIP  vs torch
-      1x1024   326.1 [325.9-326.2]      3.9 [3.9-4.0]      5.5 [5.4-5.5]   17.1 [16.9-17.3]       19.1x         0.2x      0.3x  (latency-bound)
-     64x1024   334.4 [334.4-334.4]      4.1 [4.1-4.2]      5.9 [5.6-5.9]   19.7 [19.5-20.4]       17.0x         0.2x      0.3x  (latency-bound)
-   1024x1024   363.6 [363.4-364.0]      5.6 [5.6-5.6]      5.2 [5.2-5.5]   17.0 [15.4-18.2]       21.4x         0.3x      0.3x  (latency-bound)
-   4096x4096  2430.4 [2429.3-2432.3]   93.5 [92.4-94.0]   40.3 [40.2-48.3]  31.8 [31.5-32.0]      76.4x         2.9x      1.3x
-   8192x4096  3431.6 [3428.2-3433.2]  180.0 [178.6-180.4] 73.2 [72.0-80.0]  61.2 [60.4-61.3]      56.1x         2.9x      1.2x
-```
+| Kernel | naive original | competent HIP | torch | candidate | vs original | **vs competent** | vs torch |
+|---|---|---|---|---|---|---|---|
+| `row_softmax` | 2431.9 us | 53.3 us | 40.6 us | **31.7 us** | 76.7x | **1.7x** | 1.3x |
+| `layer_norm` | 1739.7 us | 45.7 us | 44.7 us | **31.0 us** | 56.1x | **1.5x** | 1.4x |
+| `layer_norm_affine` | 1829.9 us | 46.9 us | 45.7 us | **33.2 us** | 55.2x | **1.4x** | 1.4x |
+| `rms_norm` | 1428.3 us | 41.2 us | 43.1 us | **31.2 us** | 45.8x | **1.3x** | 1.4x |
+| `rms_norm_affine` | 1578.2 us | 41.4 us | 43.6 us | **32.0 us** | 49.4x | **1.3x** | 1.4x |
+| `rope` | 1371.6 us | **45.7 us** | 241.3 us | 53.1 us | 25.8x | **0.9x** | 4.5x |
 
-Median across 5 runs of 100 reps, min and max beside it.
-
-**The 76x is the least interesting number here, and it is close to meaningless.**
-It is measured against `row_softmax.cu`, which launches one thread per block and
-leaves a 304-CU device idle. Any competent kernel beats it. That is why the
+**The 25x to 77x column is the least interesting one and is close to
+meaningless.** It is measured against kernels that launch one thread per block
+and leave a 304-CU device idle. Any competent kernel beats them. That is why the
 table carries two baselines that can actually win.
 
-Read the last two columns instead:
+**The column that matters is `vs competent`, and it used to read 2.9x.** The
+first version of `row_softmax_tuned.cu` made three passes over the row and torch
+beat it by 2.3x, so "2.9x against a competently written HIP kernel" was really
+2.9x against a mediocre one. Rewriting it as an online softmax, two passes
+instead of three, took it from 94.2 us to 53.3 us, and the claim fell to 1.7x.
+The LayerNorm baselines moved the same way once they used Welford in a single
+pass rather than separate mean and variance passes.
 
-| Regime | vs a competent HIP kernel | vs `torch.softmax` | Verdict |
-|---|---|---|---|
-| Rows up to ~1M elements | **0.2x to 0.3x** | **0.3x** | the substitution is a **regression** |
-| 16M elements and up | **2.9x** | **1.2x to 1.3x** | the substitution is worth making |
+So the honest claim is: **at large shapes the tuned Triton kernels beat a
+competently written HIP kernel by 1.3x to 1.7x and torch by 1.3x to 1.4x, and
+RoPE loses to a good hand-written kernel outright.** That is a smaller number
+than this README used to carry and a much harder one to argue with, and finding
+it out cost nothing except being willing to improve the opponent.
 
-So the honest claim is not "77x faster". It is: **at large shapes the tuned
-Triton kernel beats a competently written HIP kernel by 2.9x and torch by about
-1.25x, and below roughly 16M elements it loses to both by 3x to 5x.**
+RoPE deserves its own sentence: hand-written HIP wins at 0.9x, and the 4.5x
+against torch says more about torch having no fused RoPE than about the kernel.
+There is no reduction in RoPE, so there is nothing for a tuned implementation to
+recover.
 
-The crossover is dispatch cost, and it is measurable rather than assumed. On
-this box, an in-place torch op that does no work at all costs **4.9 us** to
-launch from Python, `torch.softmax` on a 1x1024 row costs **5.5 us**, and the
-Triton candidate costs **17 us**. About 12 us of that is Triton's own launch
-path, and it is fixed, so it dominates until the kernel has real work to do.
-Below the crossover the ratio describes dispatch overhead, not the kernel, which
-is what the `latency-bound` label marks.
+Below roughly 16M elements every substitution is a **3x to 5x regression**,
+marked `latency-bound` in the tables. The crossover is dispatch cost, measured
+rather than assumed: on this box an in-place torch op that does no work costs
+**4.9 us** to launch from Python, `torch.softmax` on one row costs **5.5 us**,
+and the Triton candidate costs **17 us**. About 12 us is Triton's own launch
+path and it is fixed, so it dominates until the kernel has real work to do.
 
-One asymmetry worth stating: the native baselines are timed inside the generated
-C++ driver with device events, so they never pay Python dispatch, while the
-candidate and torch are timed through Python and do. That flatters the native
-side by roughly 5 us. It does not change any conclusion here, because the gaps
-at small shapes are 12 us and more, and at large shapes the candidate wins
-anyway.
-
-`row_softmax_tuned.cu` is not a straw baseline either, and it is not optimal:
-one block per row, 256 threads, two shared-memory tree reductions, three passes
-over memory. torch beats it 2.3x at 4096x4096 because a fused implementation
-moves less data. A better hand-written kernel would narrow the 2.9x, and if
-someone writes one, that is a result worth having rather than an embarrassment.
+One asymmetry worth stating: native baselines are timed inside the generated C++
+driver with device events and never pay Python dispatch, while the candidate and
+torch are timed through Python and do. That flatters the native side by roughly
+5 us. It does not change the conclusions, because the small-shape gaps are 12 us
+and more and the large-shape ones run the other way.
 
 Conditions, because a ratio without them is not a measurement:
 
