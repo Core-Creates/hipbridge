@@ -16,6 +16,7 @@ write because the GPU name could not be read would be a poor trade.
 from __future__ import annotations
 
 import platform
+import re
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -118,12 +119,89 @@ def default_path(command: str, toolchain: str, arch: str) -> str:
     return str(Path(RESULTS_DIR) / ("-".join(parts) + ".md"))
 
 
+# Paths whose contents a measurement is actually about. A report is stale as
+# evidence when the code it measured changed, not when any commit landed: a
+# README edit does not invalidate a number, and a new kernel does.
+CODE_PATHS = (
+    "src/hipbridge/kernels",
+    "src/hipbridge/verify",
+    "examples",
+)
+
+
+def parse_commit(report: str) -> str | None:
+    """The commit a report says it was produced at, or None if it does not say."""
+    m = re.search(r"\|\s*hipbridge\s*\|[^|]*commit `([0-9a-f]+)(-dirty)?`", report)
+    return m.group(1) if m else None
+
+
+def last_code_change() -> str | None:
+    """The most recent commit touching anything a measurement depends on."""
+    sha = _run(["git", "log", "-1", "--format=%h", "--", *CODE_PATHS])
+    return sha.splitlines()[0] if sha.strip() else None
+
+
+def known(sha: str) -> bool:
+    """Is this commit present in the local history?
+
+    CI checks out one commit by default, so an ancestry question about anything
+    older is unanswerable there. Unanswerable is not the same as stale, and a
+    freshness check that fails on a shallow clone would be turned off within a
+    week.
+    """
+    return bool(_run(["git", "cat-file", "-t", sha]).startswith("commit"))
+
+
+def is_ancestor(older: str, newer: str) -> bool:
+    """Does `older` come at or before `newer` in history?"""
+    try:
+        r = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", older, newer],
+            capture_output=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
+
+
+def staleness(report: str) -> tuple[str, str]:
+    """Judge one report. Returns (verdict, explanation).
+
+    Verdicts: "fresh", "stale", "unknown". Unknown covers a shallow clone or a
+    missing git, and is deliberately distinct from stale so a caller can decide
+    whether an unanswerable question should fail anything.
+    """
+    stamped = parse_commit(report)
+    if stamped is None:
+        return "unknown", "the report does not name the commit it was produced at"
+
+    code = last_code_change()
+    if code is None:
+        return "unknown", "git history is unavailable here"
+    if not (known(stamped) and known(code)):
+        return "unknown", f"commit {stamped} is not in this clone's history"
+
+    if is_ancestor(code, stamped):
+        return "fresh", f"no measured code has changed since {stamped}"
+    return (
+        "stale",
+        f"measured at {stamped}, but {code} has since changed something it measures",
+    )
+
+
 __all__ = [
+    "CODE_PATHS",
     "RESULTS_DIR",
     "commit",
     "default_path",
     "device",
     "header",
+    "is_ancestor",
+    "known",
+    "last_code_change",
+    "parse_commit",
+    "staleness",
     "toolchain_version",
     "torch_version",
     "write",

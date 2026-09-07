@@ -192,8 +192,10 @@ def _cmd_bench(args) -> int:
             continue
 
         candidate, described = suites.candidate_for(suite)
+        precision = ", ".join(str(d).removeprefix("torch.") for d in _dtypes(args)) or "float32"
         print(
-            f"{suite.name} on {args.toolchain}, device={device}, reps={args.reps}, runs={args.runs}"
+            f"{suite.name} on {args.toolchain}, device={device}, "
+            f"reps={args.reps}, runs={args.runs}, dtype={precision}"
         )
         print(f"  candidate: {described}")
         for base, _ in refs:
@@ -204,7 +206,15 @@ def _cmd_bench(args) -> int:
 
         rows = []
         for shape in shapes:
-            primary = verify.InputSpec(shape=shape)
+            # Time in the precision being verified. Passing --dtype and then
+            # timing float32 anyway would report numbers for a different program
+            # from the one that just passed.
+            sweep = _dtypes(args)
+            primary = (
+                verify.InputSpec(shape=shape, dtype=sweep[0])
+                if sweep
+                else (verify.InputSpec(shape=shape))
+            )
             # Weight tensors for kernels that take them, built the same way the
             # harness builds them so the timed call and the proved call agree.
             ins = suites.make_inputs(suite, primary, device=device)
