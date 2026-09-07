@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import struct
 import subprocess
 import sys
 import tempfile
@@ -86,22 +85,32 @@ _DRIVER = r"""
 #include <cstdlib>
 #include <vector>
 %(header)s
+%(scalar_header)s
+
+// The element type this run uses. Kernels written against HB_SCALAR compile
+// unchanged for float, half and bfloat16; those written against float still
+// compile, and are simply float-only.
+typedef %(scalar)s SCALAR;
+#define HB_SCALAR SCALAR
 
 %(kernel_source)s
 
-static std::vector<float> read_bin(const char* path, size_t n) {
-    std::vector<float> h(n);
+// Raw bytes in, raw bytes out. The host never does arithmetic on the element
+// type, so half and bfloat16 need no host-side conversion and the file layout
+// is exactly what torch wrote.
+static std::vector<SCALAR> read_bin(const char* path, size_t n) {
+    std::vector<SCALAR> h(n);
     FILE* f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "cannot open %%s\n", path); exit(2); }
-    if (fread(h.data(), sizeof(float), n, f) != n) { fprintf(stderr, "short read\n"); exit(3); }
+    if (fread(h.data(), sizeof(SCALAR), n, f) != n) { fprintf(stderr, "short read\n"); exit(3); }
     fclose(f);
     return h;
 }
 
-static void write_bin(const char* path, const std::vector<float>& h) {
+static void write_bin(const char* path, const std::vector<SCALAR>& h) {
     FILE* f = fopen(path, "wb");
     if (!f) { fprintf(stderr, "cannot open %%s\n", path); exit(4); }
-    fwrite(h.data(), sizeof(float), h.size(), f);
+    fwrite(h.data(), sizeof(SCALAR), h.size(), f);
     fclose(f);
 }
 
@@ -109,22 +118,22 @@ int main(int argc, char** argv) {
     // argv: prog n_in (path size)*n_in out_path out_size gx gy gz bx by bz scalars...
     int argi = 1;
     int n_in = atoi(argv[argi++]);
-    std::vector<float*> d_in(n_in);
+    std::vector<SCALAR*> d_in(n_in);
     for (int i = 0; i < n_in; ++i) {
         const char* path = argv[argi++];
         size_t n = (size_t)atoll(argv[argi++]);
         auto h = read_bin(path, n);
-        %(malloc)s(&d_in[i], n * sizeof(float));
-        %(memcpy)s(d_in[i], h.data(), n * sizeof(float), %(h2d)s);
+        %(malloc)s(&d_in[i], n * sizeof(SCALAR));
+        %(memcpy)s(d_in[i], h.data(), n * sizeof(SCALAR), %(h2d)s);
     }
     const char* out_path = argv[argi++];
     size_t out_n = (size_t)atoll(argv[argi++]);
-    float* d_out = nullptr;
-    %(malloc)s(&d_out, out_n * sizeof(float));
+    SCALAR* d_out = nullptr;
+    %(malloc)s(&d_out, out_n * sizeof(SCALAR));
 
     // Fill the output with a sentinel so a kernel that never stores is caught.
-    std::vector<float> sentinel(out_n, -12345.0f);
-    %(memcpy)s(d_out, sentinel.data(), out_n * sizeof(float), %(h2d)s);
+    std::vector<SCALAR> sentinel(out_n, %(from_float)s(-12345.0f));
+    %(memcpy)s(d_out, sentinel.data(), out_n * sizeof(SCALAR), %(h2d)s);
 
     int gx = atoi(argv[argi++]), gy = atoi(argv[argi++]), gz = atoi(argv[argi++]);
     int bx = atoi(argv[argi++]), by = atoi(argv[argi++]), bz = atoi(argv[argi++]);
@@ -140,8 +149,8 @@ int main(int argc, char** argv) {
         return 5;
     }
 
-    std::vector<float> h_out(out_n);
-    %(memcpy)s(h_out.data(), d_out, out_n * sizeof(float), %(d2h)s);
+    std::vector<SCALAR> h_out(out_n);
+    %(memcpy)s(h_out.data(), d_out, out_n * sizeof(SCALAR), %(d2h)s);
     write_bin(out_path, h_out);
 
     // Optional device-side timing, enabled by HIPBRIDGE_REPS so it cannot
@@ -205,6 +214,67 @@ _HIP_TOKENS = {
 }
 
 SENTINEL = -12345.0
+
+# Element types the generated driver can carry, and what each needs to say so.
+# Half precision is what inference runs in, so a reference that could only
+# compile float32 could only prove a claim about a precision nobody deploys.
+#
+# The host never does arithmetic on these: buffers are read and written as raw
+# bytes, so the only host-side conversion is the sentinel that catches a kernel
+# which never stores.
+_SCALARS = {
+    "float32": {
+        "hipcc": ("float", "", "(float)"),
+        "nvcc": ("float", "", "(float)"),
+    },
+    "float16": {
+        "hipcc": ("__half", "#include <hip/hip_fp16.h>", "__float2half"),
+        "nvcc": ("__half", "#include <cuda_fp16.h>", "__float2half"),
+    },
+    "bfloat16": {
+        "hipcc": ("__hip_bfloat16", "#include <hip/hip_bf16.h>", "__float2bfloat16"),
+        "nvcc": ("__nv_bfloat16", "#include <cuda_bf16.h>", "__float2bfloat16"),
+    },
+}
+
+
+def scalar_tokens(dtype_name: str, toolchain: str) -> dict[str, str]:
+    """Driver tokens for one element type, or a clear failure."""
+    per_type = _SCALARS.get(dtype_name)
+    if per_type is None:
+        raise TypeError(
+            f"no driver support for {dtype_name}; known types are "
+            f"{', '.join(sorted(_SCALARS))}"
+        )
+    scalar, header, from_float = per_type[toolchain]
+    return {"scalar": scalar, "scalar_header": header, "from_float": from_float}
+
+
+
+def _to_bytes(t: torch.Tensor) -> bytes:
+    """Tensor to the exact bytes the driver will read.
+
+    numpy has no bfloat16, so that type travels through an int16 view: the bits
+    are the point, and reinterpreting them costs nothing and loses nothing.
+    """
+
+    flat = t.detach().cpu().contiguous().reshape(-1)
+    if flat.dtype is torch.bfloat16:
+        return flat.view(torch.int16).numpy().tobytes()
+    return flat.numpy().tobytes()
+
+
+def _from_bytes(raw: bytes, dtype: torch.dtype) -> torch.Tensor:
+    """The driver's output bytes back into a tensor of the same type."""
+    import numpy as np  # noqa: PLC0415
+
+    if dtype is torch.bfloat16:
+        arr = np.frombuffer(raw, dtype=np.int16).copy()
+        return torch.from_numpy(arr).view(torch.bfloat16)
+    np_dtype = {torch.float32: np.float32, torch.float16: np.float16}.get(dtype)
+    if np_dtype is None:
+        raise TypeError(f"no host mapping for {dtype}")
+    return torch.from_numpy(np.frombuffer(raw, dtype=np_dtype).copy())
 
 
 def _device_present(toolchain: str) -> bool:
@@ -336,6 +406,7 @@ class NativeReference(Reference):
     # check is skipped, since the host compiler is whatever lives on that side.
     command_prefix: list[str] = field(default_factory=list)
     _built: Path | None = field(default=None, init=False, repr=False)
+    _dtype_name: str = field(default="float32", init=False, repr=False)
     _reps: int = field(default=0, init=False, repr=False)
     last_kernel_ms: float | None = field(default=None, init=False, repr=False)
 
@@ -378,6 +449,7 @@ class NativeReference(Reference):
 
     def _render_driver(self) -> str:
         tokens = dict(_CUDA_TOKENS if self.toolchain == "nvcc" else _HIP_TOKENS)
+        tokens.update(scalar_tokens(self._dtype_name, self.toolchain))
         args = ", ".join(
             [f"d_in[{i}]" for i in range(64)][: self._n_inputs]
             + ["d_out"]
@@ -394,8 +466,9 @@ class NativeReference(Reference):
         tokens["kernel_source"] = self.source
         return _DRIVER % tokens
 
-    def build(self, n_inputs: int, n_scalars: int) -> Path:
+    def build(self, n_inputs: int, n_scalars: int, dtype_name: str = "float32") -> Path:
         self._n_inputs, self._n_scalars = n_inputs, n_scalars
+        self._dtype_name = dtype_name
         avail = self.availability()
         if not avail:
             raise RuntimeError(f"cannot build: {avail.reason}")
@@ -455,27 +528,26 @@ class NativeReference(Reference):
         # reinterpret two values as one and compare the result against a correct
         # answer, which is a failure report that says nothing true about the
         # kernel. Refuse with the reason instead.
-        wrong = [t.dtype for t in inputs if t.dtype is not torch.float32]
-        if wrong:
-            raise TypeError(
-                f"NativeReference is float32-only; got {wrong[0]}. The generated "
-                "driver reads 4-byte floats, so half precision needs a driver "
-                "and example kernels templated on the element type."
-            )
+        # One element type per run, taken from the inputs. A kernel handed a
+        # half tensor and a float table would silently read one of them wrong.
+        kinds = {str(t.dtype).removeprefix("torch.") for t in inputs}
+        if len(kinds) != 1:
+            raise TypeError(f"every input must share one dtype; got {sorted(kinds)}")
+        dtype_name = kinds.pop()
 
         shapes = [tuple(t.shape) for t in inputs]
         scalars = self.launch.scalar_args(shapes)
-        if self._built is None:
-            self.build(len(inputs), len(scalars))
+        # Rebuild when the element type changes: the driver is compiled for one.
+        if self._built is None or dtype_name != self._dtype_name:
+            self.build(len(inputs), len(scalars), dtype_name)
         assert self._built is not None
 
         tmp = self._built.parent
         argv: list[str] = [self._path(self._built), str(len(inputs))]
         for i, t in enumerate(inputs):
             p = tmp / f"in{i}.bin"
-            flat = t.detach().cpu().contiguous().float().reshape(-1)
-            p.write_bytes(struct.pack(f"<{flat.numel()}f", *flat.tolist()))
-            argv += [self._path(p), str(flat.numel())]
+            p.write_bytes(_to_bytes(t))
+            argv += [self._path(p), str(t.numel())]
 
         out_shape = self.launch.out_shape(shapes) if self.launch.out_shape else shapes[0]
         out_n = 1
@@ -507,9 +579,7 @@ class NativeReference(Reference):
             if line.startswith("KERNEL_MS "):
                 self.last_kernel_ms = float(line.split()[1])
 
-        raw = out_path.read_bytes()
-        vals = struct.unpack(f"<{out_n}f", raw)
-        return torch.tensor(vals, dtype=torch.float32).reshape(out_shape)
+        return _from_bytes(out_path.read_bytes(), inputs[0].dtype).reshape(out_shape)
 
 
 __all__ = [
