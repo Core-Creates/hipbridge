@@ -282,7 +282,113 @@ LAYER_NORM_AFFINE = Suite(
     ),
 )
 
-BUILTIN: tuple[Suite, ...] = (ROW_SOFTMAX, LAYER_NORM, LAYER_NORM_AFFINE, RMS_NORM)
+
+def _even_row_shapes() -> Sequence[tuple[int, ...]]:
+    """Row shapes with an even width.
+
+    RoPE pairs channel 2i with 2i+1, so an odd head dimension has no pairing.
+    Filtering here rather than silently truncating keeps the sweep honest: the
+    kernel is not defined for those shapes, so they are not claimed as passing.
+    """
+    from hipbridge.verify import shapes
+
+    return [s for s in shapes.sample(shapes.row_wise()) if s[1] % 2 == 0 and s[1] >= 2]
+
+
+def _torch_rms_norm_affine(t: torch.Tensor, gamma: torch.Tensor) -> torch.Tensor:
+    fn = getattr(torch.nn.functional, "rms_norm", None)
+    if fn is not None:
+        return fn(t, (t.shape[-1],), weight=gamma, eps=1e-5)
+    return t * torch.rsqrt((t * t).mean(dim=-1, keepdim=True) + 1e-5) * gamma
+
+
+def _rms_norm_affine_oracle(t: torch.Tensor, gamma: torch.Tensor) -> torch.Tensor:
+    return _rms_norm_oracle(t) * gamma.double()
+
+
+def _rope(x, cos_tab, sin_tab):
+    """Rotate interleaved channel pairs. Used for both the oracle and torch.
+
+    Same expression either way; the oracle differs only in arriving in float64,
+    which is what makes it an oracle rather than a second opinion.
+    """
+    x0, x1 = x[:, 0::2], x[:, 1::2]
+    out = torch.empty_like(x)
+    out[:, 0::2] = x0 * cos_tab - x1 * sin_tab
+    out[:, 1::2] = x0 * sin_tab + x1 * cos_tab
+    return out
+
+
+def _rope_oracle(x, cos_tab, sin_tab):
+    return _rope(x.double(), cos_tab.double(), sin_tab.double())
+
+
+def _half_width(name: str, seed_offset: int, aliases: tuple[str, ...] = ()) -> Operand:
+    """A per-position table holding one angle per channel pair."""
+
+    def make(spec: InputSpec) -> InputSpec:
+        rows, cols = spec.shape[0], spec.shape[1]
+        return InputSpec(
+            shape=(rows, cols // 2),
+            dtype=spec.dtype,
+            distribution=spec.distribution,
+            seed=spec.seed + seed_offset,
+        )
+
+    return Operand(name=name, spec=make, aliases=aliases)
+
+
+RMS_NORM_AFFINE = Suite(
+    name="rms_norm_affine",
+    source_file="rms_norm_affine.cu",
+    kernel="rms_norm_affine",
+    launch=_norm_launch("rms_norm_affine", (1, 1, 1)),
+    oracle=_rms_norm_affine_oracle,
+    portable=_torch_rms_norm_affine,
+    usage_import="from hipbridge.kernels.norm import rms_norm_affine_rowwise",
+    usage_call="out = rms_norm_affine_rowwise(x, gamma)",
+    shapes=_row_shapes,
+    extras=(_per_column("gamma", 3001, ("weight", "scale", "g", "w")),),
+    baselines=(
+        Baseline(
+            name="tuned HIP",
+            source_file="rms_norm_affine_tuned.cu",
+            launch=_norm_launch("rms_norm_affine_tuned", (256, 1, 1)),
+        ),
+    ),
+)
+
+ROPE = Suite(
+    name="rope",
+    source_file="rope.cu",
+    kernel="rope",
+    launch=_norm_launch("rope", (1, 1, 1)),
+    oracle=_rope_oracle,
+    portable=_rope,
+    usage_import="from hipbridge.kernels.rope import rope_rowwise",
+    usage_call="out = rope_rowwise(x, cos_tab, sin_tab)",
+    shapes=_even_row_shapes,
+    extras=(
+        _half_width("cos_tab", 4001, ("cos", "cos_cache", "freqs_cos", "c")),
+        _half_width("sin_tab", 5003, ("sin", "sin_cache", "freqs_sin", "s")),
+    ),
+    baselines=(
+        Baseline(
+            name="tuned HIP",
+            source_file="rope_tuned.cu",
+            launch=_norm_launch("rope_tuned", (256, 1, 1)),
+        ),
+    ),
+)
+
+BUILTIN: tuple[Suite, ...] = (
+    ROW_SOFTMAX,
+    LAYER_NORM,
+    LAYER_NORM_AFFINE,
+    RMS_NORM,
+    RMS_NORM_AFFINE,
+    ROPE,
+)
 
 
 def candidate_for(suite: Suite) -> tuple[Callable[[torch.Tensor], torch.Tensor], str]:
@@ -328,6 +434,23 @@ def candidate_for(suite: Suite) -> tuple[Callable[[torch.Tensor], torch.Tensor],
             return rms_norm_rowwise, "hipbridge.kernels.norm.rms_norm (Triton, AMD-tuned)"
         return _torch_rms_norm, "torch rms_norm (Triton unavailable)"
 
+    if suite.name == "rms_norm_affine":
+        if have_triton:
+            from hipbridge.kernels.norm import rms_norm_affine_rowwise
+
+            return (
+                rms_norm_affine_rowwise,
+                "hipbridge.kernels.norm.rms_norm_affine (Triton, AMD-tuned)",
+            )
+        return _torch_rms_norm_affine, "torch rms_norm affine (Triton unavailable)"
+
+    if suite.name == "rope":
+        if have_triton:
+            from hipbridge.kernels.rope import rope_rowwise
+
+            return rope_rowwise, "hipbridge.kernels.rope (Triton, AMD-tuned)"
+        return _rope, "torch rope (Triton unavailable)"
+
     raise KeyError(suite.name)
 
 
@@ -336,6 +459,8 @@ __all__ = [
     "LAYER_NORM",
     "LAYER_NORM_AFFINE",
     "RMS_NORM",
+    "RMS_NORM_AFFINE",
+    "ROPE",
     "ROW_SOFTMAX",
     "Baseline",
     "Operand",

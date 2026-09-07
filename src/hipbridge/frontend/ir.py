@@ -24,6 +24,12 @@ class Pattern(str, Enum):
     REDUCE_SERIAL = "reduce_serial"  # per-thread serial accumulation
     REDUCE_SHUFFLE = "reduce_shuffle"  # warp/wavefront shuffle reduction
     TRANSPOSE = "transpose"
+    # A thread walks a row and writes each element from a bounded neighbourhood,
+    # accumulating nothing across it. RoPE is the reason this exists: it is not
+    # a reduction, and it is not flat elementwise either because one thread
+    # handles a whole row and reads its neighbour. Calling it either would be a
+    # lie in a field whose only job is to say what the kernel actually is.
+    ROW_MAP = "row_map"
     UNKNOWN = "unknown"
 
 

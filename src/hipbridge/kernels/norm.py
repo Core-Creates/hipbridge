@@ -177,4 +177,61 @@ def rms_norm_rowwise(x, eps: float = 1e-5):
     return _launch(_rms_norm_kernel, x, eps)
 
 
-__all__ = ["layer_norm_affine_rowwise", "layer_norm_rowwise", "rms_norm_rowwise"]
+__all__ = [
+    "layer_norm_affine_rowwise",
+    "layer_norm_rowwise",
+    "rms_norm_affine_rowwise",
+    "rms_norm_rowwise",
+]
+
+
+@triton.jit
+def _rms_norm_affine_kernel(
+    in_ptr,
+    gamma_ptr,
+    out_ptr,
+    in_row_stride,
+    out_row_stride,
+    n_cols,
+    eps,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < n_cols
+
+    x = tl.load(in_ptr + row * in_row_stride + cols, mask=mask, other=0.0)
+    n = tl.sum(mask.to(tl.float32), axis=0)
+
+    ms = tl.sum(x * x, axis=0) / n
+    g = tl.load(gamma_ptr + cols, mask=mask, other=0.0)
+    y = x * tl.rsqrt(ms + eps) * g
+
+    tl.store(out_ptr + row * out_row_stride + cols, y, mask=mask)
+
+
+def rms_norm_affine_rowwise(x, gamma, eps: float = 1e-5):
+    """RMSNorm with a learned scale, the form most current LLMs use."""
+    if x.ndim != 2:
+        raise ValueError(f"expected a 2D tensor, got shape {tuple(x.shape)}")
+    if gamma.shape != (x.shape[-1],):
+        raise ValueError(f"gamma must be ({x.shape[-1]},), got {tuple(gamma.shape)}")
+
+    import torch
+
+    n_rows, n_cols = x.shape
+    out = torch.empty_like(x)
+    block = triton.next_power_of_2(n_cols)
+
+    _rms_norm_affine_kernel[(n_rows,)](
+        x,
+        gamma,
+        out,
+        x.stride(0),
+        out.stride(0),
+        n_cols,
+        eps,
+        BLOCK=block,
+        num_warps=_warps_for(block),
+    )
+    return out

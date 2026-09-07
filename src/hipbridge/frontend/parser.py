@@ -76,7 +76,29 @@ def _kernel_facts(fn) -> KernelFacts:
     loops = [n for n in nodes if n.kind in (ci.CursorKind.FOR_STMT, ci.CursorKind.WHILE_STMT)]
     halving = any("/=" in _tokens(loop) or ">>=" in _tokens(loop) for loop in loops)
 
-    compound = [n for n in nodes if n.kind == ci.CursorKind.COMPOUND_ASSIGNMENT_OPERATOR]
+    # A loop's own step is not an accumulation. `for (i = t; i < n; i += 256)`
+    # advances an induction variable and reduces nothing, but it is spelled with
+    # the same operator as `sum += x[i]`, so counting every compound assignment
+    # classified a strided RoPE kernel as a serial reduction. Kernels whose real
+    # accumulator lives in shared memory were saved from this only because the
+    # tree rule claims them first, which is luck, not correctness.
+    induction = set()
+    for loop in loops:
+        if loop.kind is not ci.CursorKind.FOR_STMT:
+            continue
+        parts = list(loop.get_children())
+        # The increment clause of a for statement, when it is compound.
+        for part in parts[:-1]:
+            for n in [part, *part.walk_preorder()]:
+                if n.kind == ci.CursorKind.COMPOUND_ASSIGNMENT_OPERATOR:
+                    induction.add((n.location.line, n.location.column))
+
+    compound = [
+        n
+        for n in nodes
+        if n.kind == ci.CursorKind.COMPOUND_ASSIGNMENT_OPERATOR
+        and (n.location.line, n.location.column) not in induction
+    ]
     shared_acc = sum(1 for n in compound if any(t in shared_names for t in _tokens(n)))
     scalar_acc = len(compound) - shared_acc
 
