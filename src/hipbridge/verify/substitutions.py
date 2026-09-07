@@ -28,6 +28,8 @@ from hipbridge.verify.suites import (
     LAYER_NORM,
     LAYER_NORM_AFFINE,
     RMS_NORM,
+    RMS_NORM_AFFINE,
+    ROPE,
     ROW_SOFTMAX,
     Suite,
 )
@@ -163,10 +165,38 @@ def operand_mismatch(suite: Suite, facts: KernelFacts) -> str | None:
     return None
 
 
+def _looks_like_rope(source: str, facts: KernelFacts) -> list[str] | None:
+    """A rotation of adjacent channel pairs by a per-position angle.
+
+    RoPE is not a reduction and cannot be identified by what it accumulates,
+    because it accumulates nothing. What identifies it is the shape of the
+    arithmetic: channels are read in pairs at stride two, and the two outputs
+    are a difference and a sum of the same two products. Getting the sign wrong
+    swaps a rotation for its mirror image, which is why both are required rather
+    than either.
+    """
+    if not re.search(r"2\s*\*\s*\w+|\w+\s*\*\s*2", source):
+        return None
+    difference = re.search(r"\w+\s*\*\s*\w+\s*-\s*\w+\s*\*\s*\w+", source)
+    total = re.search(r"\w+\s*\*\s*\w+\s*\+\s*\w+\s*\*\s*\w+", source)
+    if not (difference and total):
+        return None
+    if facts.scalar_accumulations or facts.shared_accumulations:
+        return None
+    return [
+        "indexes channels in pairs at stride two",
+        "writes a difference and a sum of the same two products, which is a rotation",
+        "accumulates nothing across the row, so it is a map and not a reduction",
+    ]
+
+
 # Patterns a row-wise reduction can legitimately be written as. Serial is the
 # naive form; tree and shuffle are the competent ones. Anything else is not a
 # row-wise reduction at all and is refused before the evidence is examined.
 _ROW_PATTERNS = (Pattern.REDUCE_SERIAL, Pattern.REDUCE_TREE, Pattern.REDUCE_SHUFFLE)
+
+# Kernels that walk a row without reducing it. RoPE lives here.
+_MAP_PATTERNS = (Pattern.ROW_MAP,)
 
 
 def propose(
@@ -188,18 +218,23 @@ def propose(
     explaining, because "no substitution proposed" would send someone hunting
     for a missing feature rather than reading their own signature.
     """
-    if pattern not in _ROW_PATTERNS:
-        return None
-
     source = strip_comments(source)
     scalars = [p for p in facts.params if not p.is_pointer]
 
-    for suite, test in (
-        (ROW_SOFTMAX, _looks_like_softmax),
-        (LAYER_NORM, _looks_like_layer_norm),
-        (LAYER_NORM_AFFINE, _looks_like_layer_norm),
-        (RMS_NORM, _looks_like_rms_norm),
+    # Each substitute declares the shapes its maths can legitimately take. RoPE
+    # is the reason this is per-suite rather than one global gate: it is a map,
+    # not a reduction, so the reduction patterns would exclude it and the
+    # reduction suites must not claim a row_map.
+    for suite, patterns, test in (
+        (ROW_SOFTMAX, _ROW_PATTERNS, _looks_like_softmax),
+        (LAYER_NORM, _ROW_PATTERNS, _looks_like_layer_norm),
+        (LAYER_NORM_AFFINE, _ROW_PATTERNS, _looks_like_layer_norm),
+        (RMS_NORM, _ROW_PATTERNS, _looks_like_rms_norm),
+        (RMS_NORM_AFFINE, _ROW_PATTERNS, _looks_like_rms_norm),
+        (ROPE, _MAP_PATTERNS, _looks_like_rope),
     ):
+        if pattern not in patterns:
+            continue
         evidence = test(source, facts)
         if not evidence:
             continue
