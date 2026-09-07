@@ -117,3 +117,34 @@ def test_rope_matches_torch_on_cpu():
             want[r, 2 * i + 1] = x0 * sin[r, i] + x1 * cos[r, i]
 
     assert torch.allclose(got, want, atol=1e-6)
+
+
+def test_a_tree_reduction_need_not_combine_with_a_compound_assignment(examples):
+    """The competent implementations do not use `+=`, and were invisible.
+
+    reduce.tree required a compound assignment into shared memory. An online
+    softmax rescales a running sum onto a new maximum, and Welford merges
+    partial moments; both are plain assignments. So the rule recognised the
+    naive spelling of a tree reduction and missed the two kernels written by
+    someone who knew what they were doing, which is the worst possible thing for
+    a rule whose job is to identify competence.
+    """
+    for name in ("row_softmax_tuned.cu", "layer_norm_tuned.cu", "layer_norm_affine_tuned.cu"):
+        facts = _facts(examples, name)
+        result = recognize(facts)
+
+        assert facts.shared_accumulations == 0, f"{name} should combine by assignment"
+        assert facts.shared_in_halving_loop, f"{name} reduces in shared memory"
+        assert result.pattern is Pattern.REDUCE_TREE, f"{name} is {result.pattern.value}"
+
+
+def test_a_halving_loop_alone_is_not_a_tree_reduction(examples):
+    """The stride has to touch the shared memory, or it proves nothing.
+
+    Without that tie, any kernel with a shared buffer and a loop that halves
+    something unrelated would be claimed as a reduction.
+    """
+    facts = _facts(examples, "rope_tuned.cu")
+
+    assert not facts.shared_in_halving_loop
+    assert recognize(facts).pattern is Pattern.ROW_MAP
