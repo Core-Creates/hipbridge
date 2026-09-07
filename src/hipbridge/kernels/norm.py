@@ -77,6 +77,73 @@ def _rms_norm_kernel(
     tl.store(out_ptr + row * out_row_stride + cols, y, mask=mask)
 
 
+@triton.jit
+def _layer_norm_affine_kernel(
+    in_ptr,
+    gamma_ptr,
+    beta_ptr,
+    out_ptr,
+    in_row_stride,
+    out_row_stride,
+    n_cols,
+    eps,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < n_cols
+
+    x = tl.load(in_ptr + row * in_row_stride + cols, mask=mask, other=0.0)
+    n = tl.sum(mask.to(tl.float32), axis=0)
+
+    mean = tl.sum(x, axis=0) / n
+    centred = tl.where(mask, x - mean, 0.0)
+    var = tl.sum(centred * centred, axis=0) / n
+
+    g = tl.load(gamma_ptr + cols, mask=mask, other=0.0)
+    b = tl.load(beta_ptr + cols, mask=mask, other=0.0)
+    y = centred * tl.rsqrt(var + eps) * g + b
+
+    tl.store(out_ptr + row * out_row_stride + cols, y, mask=mask)
+
+
+def layer_norm_affine_rowwise(x, gamma, beta, eps: float = 1e-5):
+    """LayerNorm with learned scale and shift, the form a transformer uses.
+
+    The weights are per-column, so a row of `n_cols` takes gamma and beta of
+    length `n_cols`. This is the kernel that made the harness carry more than
+    one input: proving the normalisation alone and then substituting something
+    that also multiplies by weights would prove one program and ship another.
+    """
+    if x.ndim != 2:
+        raise ValueError(f"expected a 2D tensor, got shape {tuple(x.shape)}")
+    if gamma.shape != (x.shape[-1],) or beta.shape != (x.shape[-1],):
+        raise ValueError(
+            f"gamma and beta must be ({x.shape[-1]},), got "
+            f"{tuple(gamma.shape)} and {tuple(beta.shape)}"
+        )
+
+    import torch
+
+    n_rows, n_cols = x.shape
+    out = torch.empty_like(x)
+    block = triton.next_power_of_2(n_cols)
+
+    _layer_norm_affine_kernel[(n_rows,)](
+        x,
+        gamma,
+        beta,
+        out,
+        x.stride(0),
+        out.stride(0),
+        n_cols,
+        eps,
+        BLOCK=block,
+        num_warps=_warps_for(block),
+    )
+    return out
+
+
 def _launch(kernel, x, eps):
     if x.ndim != 2:
         raise ValueError(f"expected a 2D tensor, got shape {tuple(x.shape)}")
@@ -110,4 +177,4 @@ def rms_norm_rowwise(x, eps: float = 1e-5):
     return _launch(_rms_norm_kernel, x, eps)
 
 
-__all__ = ["layer_norm_rowwise", "rms_norm_rowwise"]
+__all__ = ["layer_norm_affine_rowwise", "layer_norm_rowwise", "rms_norm_rowwise"]

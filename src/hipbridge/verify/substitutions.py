@@ -24,7 +24,13 @@ import re
 from dataclasses import dataclass, replace
 
 from hipbridge.frontend.ir import KernelFacts, Pattern
-from hipbridge.verify.suites import LAYER_NORM, RMS_NORM, ROW_SOFTMAX, Suite
+from hipbridge.verify.suites import (
+    LAYER_NORM,
+    LAYER_NORM_AFFINE,
+    RMS_NORM,
+    ROW_SOFTMAX,
+    Suite,
+)
 
 
 @dataclass(frozen=True)
@@ -140,19 +146,30 @@ def propose(source: str, facts: KernelFacts, pattern: Pattern) -> Proposal | Non
         return None
 
     source = strip_comments(source)
+    scalars = [p for p in facts.params if not p.is_pointer]
+
     for suite, test in (
         (ROW_SOFTMAX, _looks_like_softmax),
         (LAYER_NORM, _looks_like_layer_norm),
+        (LAYER_NORM_AFFINE, _looks_like_layer_norm),
         (RMS_NORM, _looks_like_rms_norm),
     ):
         evidence = test(source, facts)
-        if evidence:
-            if len(facts.inputs) != 1 or len(facts.outputs) != 1:
-                continue
-            scalars = [p for p in facts.params if not p.is_pointer]
-            if len(scalars) != 2:
-                continue
-            return Proposal(suite=suite, evidence=evidence)
+        if not evidence:
+            continue
+
+        # The signature has to match the substitute's, which is how the plain
+        # and affine forms of the same maths are told apart: they satisfy the
+        # same evidence and differ only in taking weights. Substituting one for
+        # the other would drop or invent a scale and shift, silently.
+        wanted_inputs = 1 + len(suite.extras)
+        if len(facts.inputs) != wanted_inputs or len(facts.outputs) != 1 or len(scalars) != 2:
+            continue
+
+        if suite.extras:
+            names = ", ".join(p.name for p in facts.inputs[1:])
+            evidence = [*evidence, f"takes {len(suite.extras)} weight tensors ({names})"]
+        return Proposal(suite=suite, evidence=evidence)
     return None
 
 
