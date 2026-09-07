@@ -96,6 +96,7 @@ def _cmd_verify(args) -> int:
             candidate=candidate,
             reference=ref,
             oracle=suite.oracle,
+            extras=suite.extras,
             name=f"{suite.name} vs original on {args.toolchain}",
         ).run(shape_list)
         ran += 1
@@ -184,7 +185,11 @@ def _cmd_bench(args) -> int:
 
         rows = []
         for shape in shapes:
-            x = verify.generate(verify.InputSpec(shape=shape), device=device)
+            primary = verify.InputSpec(shape=shape)
+            x = verify.generate(primary, device=device)
+            # Weight tensors for kernels that take them, generated the same way
+            # the harness does so the timed call and the proved call agree.
+            ins = (x, *(verify.generate(make(primary), device=device) for make in suite.extras))
 
             # Verify at this exact shape before timing it. The candidate is
             # checked against the original; each additional baseline is checked
@@ -194,6 +199,7 @@ def _cmd_bench(args) -> int:
                 candidate=candidate,
                 reference=refs[0][1],
                 oracle=suite.oracle,
+                extras=suite.extras,
                 name=f"{suite.name}@{shape}",
                 distributions=(verify.Distribution.NORMAL,),
             ).run([shape])
@@ -205,14 +211,18 @@ def _cmd_bench(args) -> int:
                 measured = []
                 for base, r in refs:
                     if base.name != "original":
-                        arb = verify.arbitrate(r(x), refs[0][1](x), suite.oracle(x.double()))
+                        arb = verify.arbitrate(
+                            r(*ins),
+                            refs[0][1](*ins),
+                            suite.oracle(*(t.double() for t in ins)),
+                        )
                         if arb.verdict == "worse":
                             notes.append(f"{base.name} is LESS ACCURATE than the original")
                             failed = True
                     measured.append(
                         bench.Measurement(
                             base.name,
-                            bench.stat_reference(r, x, reps=args.reps, runs=args.runs),
+                            bench.stat_reference(r, ins, reps=args.reps, runs=args.runs),
                             "cuda",
                         )
                     )
@@ -228,7 +238,7 @@ def _cmd_bench(args) -> int:
                     )
                 cand = bench.Measurement(
                     "candidate",
-                    bench.stat_candidate(candidate, x, reps=args.reps, runs=args.runs),
+                    bench.stat_candidate(candidate, ins, reps=args.reps, runs=args.runs),
                     device,
                 )
             except RuntimeError as exc:
@@ -370,9 +380,10 @@ def _cmd_port(args) -> int:
     # Seen for real, with a tuned kernel launched at the wrong block size, which
     # read uninitialised shared memory and scored the candidate 3.9e75x better.
     # A reference that cannot reproduce its own maths is not a baseline.
-    probe = verify.generate(verify.InputSpec(shape=(4, 256)))
-    truth = proposal.suite.oracle(probe.double())
-    ref_err = float((ref(probe).double() - truth.cpu()).abs().max())
+    spec = verify.InputSpec(shape=(4, 256))
+    probe = (verify.generate(spec), *(verify.generate(m(spec)) for m in proposal.suite.extras))
+    truth = proposal.suite.oracle(*(t.double() for t in probe))
+    ref_err = float((ref(*probe).double() - truth.cpu()).abs().max())
     if not (ref_err < 1e-3):
         print()
         print(f"REFERENCE IS NOT SANE: {facts.name} disagrees with the float64 oracle")
@@ -388,6 +399,7 @@ def _cmd_port(args) -> int:
         candidate=candidate,
         reference=ref,
         oracle=proposal.suite.oracle,
+        extras=proposal.suite.extras,
         name=f"{facts.name} vs {described}",
     ).run(list(proposal.suite.shapes())[: args.limit])
     print(summary)

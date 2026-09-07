@@ -21,6 +21,7 @@ from pathlib import Path
 
 import torch
 
+from hipbridge.verify.inputs import InputSpec
 from hipbridge.verify.reference import LaunchSpec
 
 
@@ -54,8 +55,12 @@ class Suite:
     # The library call a user would reach for instead of substituting anything.
     # Timed on the same device as the candidate, because "why not just use
     # torch" is the first question anyone sensible asks about a substitution.
-    portable: Callable[[torch.Tensor], torch.Tensor] | None = None
+    portable: Callable[..., torch.Tensor] | None = None
     portable_name: str = "torch"
+    # Operands beyond the tensor being transformed, derived from the primary
+    # case. LayerNorm's gamma and beta live here. Empty for the kernels that
+    # take one tensor, which is most of them.
+    extras: tuple[Callable[[InputSpec], InputSpec], ...] = ()
 
     def source(self, examples_dir: Path) -> str:
         return (examples_dir / self.source_file).read_text(encoding="utf-8")
@@ -187,7 +192,53 @@ RMS_NORM = Suite(
     ),
 )
 
-BUILTIN: tuple[Suite, ...] = (ROW_SOFTMAX, LAYER_NORM, RMS_NORM)
+
+def _layer_norm_affine_oracle(t: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor):
+    """float64 affine LayerNorm. Weights arrive as float64 too, from the harness."""
+    return _layer_norm_oracle(t) * gamma.double() + beta.double()
+
+
+def _torch_layer_norm_affine(t: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor):
+    return torch.nn.functional.layer_norm(t, (t.shape[-1],), weight=gamma, bias=beta, eps=1e-5)
+
+
+def _per_column(seed_offset: int):
+    """A weight vector as wide as one row of the primary case.
+
+    Derived from the primary spec so a sweep over shapes sweeps the weights with
+    it, and seeded apart so gamma and beta are not the same tensor twice.
+    """
+
+    def make(spec: InputSpec) -> InputSpec:
+        return InputSpec(
+            shape=(spec.shape[-1],),
+            dtype=spec.dtype,
+            distribution=spec.distribution,
+            seed=spec.seed + seed_offset,
+        )
+
+    return make
+
+
+LAYER_NORM_AFFINE = Suite(
+    name="layer_norm_affine",
+    source_file="layer_norm_affine.cu",
+    kernel="layer_norm_affine",
+    launch=_norm_launch("layer_norm_affine", (1, 1, 1)),
+    oracle=_layer_norm_affine_oracle,
+    portable=_torch_layer_norm_affine,
+    shapes=_row_shapes,
+    extras=(_per_column(1009), _per_column(2003)),
+    baselines=(
+        Baseline(
+            name="tuned HIP",
+            source_file="layer_norm_affine_tuned.cu",
+            launch=_norm_launch("layer_norm_affine_tuned", (256, 1, 1)),
+        ),
+    ),
+)
+
+BUILTIN: tuple[Suite, ...] = (ROW_SOFTMAX, LAYER_NORM, LAYER_NORM_AFFINE, RMS_NORM)
 
 
 def candidate_for(suite: Suite) -> tuple[Callable[[torch.Tensor], torch.Tensor], str]:
@@ -216,6 +267,16 @@ def candidate_for(suite: Suite) -> tuple[Callable[[torch.Tensor], torch.Tensor],
             return layer_norm_rowwise, "hipbridge.kernels.norm.layer_norm (Triton, AMD-tuned)"
         return _torch_layer_norm, "torch.nn.functional.layer_norm (Triton unavailable)"
 
+    if suite.name == "layer_norm_affine":
+        if have_triton:
+            from hipbridge.kernels.norm import layer_norm_affine_rowwise
+
+            return (
+                layer_norm_affine_rowwise,
+                "hipbridge.kernels.norm.layer_norm_affine (Triton, AMD-tuned)",
+            )
+        return _torch_layer_norm_affine, "torch layer_norm affine (Triton unavailable)"
+
     if suite.name == "rms_norm":
         if have_triton:
             from hipbridge.kernels.norm import rms_norm_rowwise
@@ -229,6 +290,7 @@ def candidate_for(suite: Suite) -> tuple[Callable[[torch.Tensor], torch.Tensor],
 __all__ = [
     "BUILTIN",
     "LAYER_NORM",
+    "LAYER_NORM_AFFINE",
     "RMS_NORM",
     "ROW_SOFTMAX",
     "Baseline",

@@ -157,6 +157,14 @@ class Harness:
     # See compare.arbitrate for the measurements behind this.
     oracle: Callable[..., torch.Tensor] | None = None
     oracle_slack: float = 2.0
+    # Additional operands, derived from the primary case so a shape sweep sweeps
+    # them too. Each entry maps the primary InputSpec to a spec for one more
+    # tensor, handed to candidate, reference and oracle in order after it.
+    # Empty by default: a single-input kernel behaves exactly as before.
+    extras: Sequence[Callable[[InputSpec], InputSpec]] = ()
+
+    def extra_inputs(self, spec: InputSpec) -> list[InputSpec]:
+        return [make(spec) for make in self.extras]
 
     def __post_init__(self) -> None:
         if not isinstance(self.reference, Reference):
@@ -166,17 +174,25 @@ class Harness:
 
     def _one(self, spec: InputSpec) -> CaseResult:
         label = spec.describe()
-        x = generate(spec, device=self.device)
-        x_dev = x
+        primary = generate(spec, device=self.device)
+        # Extra operands, for kernels that take more than the tensor being
+        # transformed. LayerNorm's gamma and beta are the reason this exists: a
+        # kernel that scales by learned weights cannot be proved by a harness
+        # that only ever hands it one tensor, and an unproven substitution is
+        # worth nothing. Their shapes derive from the primary case, so a sweep
+        # over shapes sweeps the weights with it.
+        extras = [generate(s, device=self.device) for s in self.extra_inputs(spec)]
+        ins = (primary, *extras)
+        ins_dev = ins
 
         try:
-            got = self.candidate(x)
+            got = self.candidate(*ins)
         except Exception as exc:  # noqa: BLE001 - a raising kernel is a result, not a crash
             why = f"candidate raised {type(exc).__name__}: {exc}"
             return CaseResult(label, False, failures=[why])
 
         try:
-            want = self.reference(x)
+            want = self.reference(*ins)
         except Exception as exc:  # noqa: BLE001
             why = f"reference raised {type(exc).__name__}: {exc}"
             return CaseResult(label, False, failures=[why])
@@ -187,7 +203,8 @@ class Harness:
         got = got.detach().cpu()
         if torch.is_tensor(want):
             want = want.detach().cpu()
-        x = x.detach().cpu()
+        ins = tuple(t.detach().cpu() for t in ins)
+        x = ins[0]
 
         extra: list[str] = []
 
@@ -195,16 +212,18 @@ class Harness:
         # NaN-aware, because torch.equal treats NaN as unequal to itself and a
         # kernel that reliably produces NaN is still deterministic.
         for _ in range(max(0, self.determinism_runs - 1)):
-            again = self.candidate(x_dev).detach().cpu()
+            again = self.candidate(*ins_dev).detach().cpu()
             if not _same_bits(again, got):
                 extra.append("NONDETERMINISTIC: repeated run differed bitwise")
                 break
 
         # Identity: the failure mode that survives every loose tolerance check.
+        # Judged against the primary input only. A weight tensor is not what a
+        # dropped computation would echo back.
         if is_identity(got, x) and not is_identity(want, x):
             extra.append("IDENTITY: output is a byte-exact copy of the input")
 
-        report = check(label, lambda _t: got, lambda _t: want, (x,), max_ulp=self.max_ulp)
+        report = check(label, lambda *_t: got, lambda *_t: want, ins, max_ulp=self.max_ulp)
 
         if self.oracle is None:
             failures = [f for f in report.failures if "IDENTITY" not in f] + extra
@@ -212,7 +231,12 @@ class Harness:
 
         # Oracle mode: ULP drift from the reference is expected and fine as long
         # as the candidate is not further from the truth than the reference is.
-        arb = arbitrate(got, want, self.oracle(x.double()), slack=self.oracle_slack)
+        arb = arbitrate(
+            got,
+            want,
+            self.oracle(*(t.double() for t in ins)),
+            slack=self.oracle_slack,
+        )
         failures = [f for f in report.failures if "exceeds tolerance" not in f]
         failures = [f for f in failures if "IDENTITY" not in f] + extra
         if arb.verdict == "worse":

@@ -168,15 +168,27 @@ def render(rows: list[ShapeRow]) -> str:
     return "\n".join(lines)
 
 
+def _as_tuple(ins) -> tuple[torch.Tensor, ...]:
+    """Accept one tensor or a tuple of them, so single-input callers are unchanged."""
+    return (ins,) if torch.is_tensor(ins) else tuple(ins)
+
+
 def time_candidate(
-    fn: Callable[[torch.Tensor], torch.Tensor],
-    x: torch.Tensor,
+    fn: Callable[..., torch.Tensor],
+    ins,
     reps: int = 100,
 ) -> float:
-    """Per-iteration milliseconds, timed with device events."""
+    """Per-iteration milliseconds, timed with device events.
+
+    `ins` is the full operand list. A kernel taking weights has to be timed with
+    the weights it was proved with, or the measurement describes a different
+    program from the one that passed verification.
+    """
+    ins = _as_tuple(ins)
+    x = ins[0]
     warmup = max(3, reps // 10)
     for _ in range(warmup):
-        fn(x)
+        fn(*ins)
 
     if x.is_cuda:
         torch.cuda.synchronize()
@@ -186,7 +198,7 @@ def time_candidate(
         )
         beg.record()
         for _ in range(reps):
-            fn(x)
+            fn(*ins)
         end.record()
         torch.cuda.synchronize()
         return beg.elapsed_time(end) / reps
@@ -196,15 +208,15 @@ def time_candidate(
 
     t0 = time.perf_counter()
     for _ in range(reps):
-        fn(x)
+        fn(*ins)
     return (time.perf_counter() - t0) * 1000.0 / reps
 
 
-def time_reference(ref: NativeReference, x: torch.Tensor, reps: int = 100) -> float:
+def time_reference(ref: NativeReference, ins, reps: int = 100) -> float:
     """Per-iteration milliseconds for a native kernel, timed on device."""
     ref._reps = reps
     try:
-        ref(x)
+        ref(*_as_tuple(ins))
     finally:
         ref._reps = 0
     if ref.last_kernel_ms is None:
@@ -214,19 +226,14 @@ def time_reference(ref: NativeReference, x: torch.Tensor, reps: int = 100) -> fl
     return ref.last_kernel_ms
 
 
-def stat_candidate(
-    fn: Callable[[torch.Tensor], torch.Tensor],
-    x: torch.Tensor,
-    reps: int = 100,
-    runs: int = 5,
-) -> Stat:
+def stat_candidate(fn: Callable[..., torch.Tensor], ins, reps: int = 100, runs: int = 5) -> Stat:
     """Repeat the candidate timing `runs` times and keep every result."""
-    return Stat(tuple(time_candidate(fn, x, reps) for _ in range(max(1, runs))))
+    return Stat(tuple(time_candidate(fn, ins, reps) for _ in range(max(1, runs))))
 
 
-def stat_reference(ref: NativeReference, x: torch.Tensor, reps: int = 100, runs: int = 5) -> Stat:
+def stat_reference(ref: NativeReference, ins, reps: int = 100, runs: int = 5) -> Stat:
     """Repeat a native timing `runs` times and keep every result."""
-    return Stat(tuple(time_reference(ref, x, reps) for _ in range(max(1, runs))))
+    return Stat(tuple(time_reference(ref, ins, reps) for _ in range(max(1, runs))))
 
 
 __all__ = [
