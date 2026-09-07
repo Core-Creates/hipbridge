@@ -343,3 +343,62 @@ def test_a_single_shape_cannot_be_judged():
     out = render([only])
     assert "latency-bound" not in out.replace("labelled latency-bound", "")
     assert "no faster run of the same kernel" in out, "silence here would be misleading"
+
+
+@needs_verify
+def test_the_amd_workflow_leaves_evidence_behind():
+    """A run nobody watched still has to produce something attributable.
+
+    Every hardware number in this repository was pasted in by hand from an SSH
+    session, and the box producing them went down mid-measurement more than
+    once. A workflow that only reports an exit code repeats that: it tells you
+    something passed and nothing about what.
+    """
+    wf = _workflow("amd-verify.yml")
+    steps = wf["jobs"]["verify"]["steps"]
+    names = [str(s.get("name", "")) for s in steps]
+    body = " ".join(str(s.get("run", "")) for s in steps)
+
+    assert any("upload-artifact" in str(s.get("uses", "")) for s in steps), (
+        "results must leave the runner"
+    )
+    upload = next(s for s in steps if "upload-artifact" in str(s.get("uses", "")))
+    assert upload.get("if") == "always()", "a failed run's evidence is the useful kind"
+    assert "results/" in str(upload["with"]["path"])
+
+    assert "hipbridge verify" in body, "the workflow must actually verify"
+    assert "hipbridge bench" in body, "and time what it verified"
+    assert "--report" in body, "reports carry the commit, host and toolchain"
+    assert names, "steps should be named so a failed run is readable"
+
+
+@needs_verify
+def test_the_amd_workflow_can_sweep_half_precision():
+    """Inference runs in half, so the hardware run has to cover it."""
+    wf = _workflow("amd-verify.yml")
+    triggers = wf.get("on", wf.get(True))
+    inputs = triggers["workflow_dispatch"]["inputs"]
+
+    assert "dtypes" in inputs, "the run should choose its precisions"
+    assert "float16" in str(inputs["dtypes"]["default"])
+    assert "bfloat16" in str(inputs["dtypes"]["default"])
+
+
+@needs_verify
+def test_the_amd_workflow_still_has_no_schedule():
+    """A weekly run on a metered device bills whether anything changed or not.
+
+    Worth an explicit test rather than trusting the trigger check alone: the
+    obvious fix for "nothing runs automatically" is a cron, and the obvious fix
+    is the expensive one. Adding it should be a deliberate decision.
+    """
+    wf = _workflow("amd-verify.yml")
+    triggers = wf.get("on", wf.get(True))
+
+    assert "schedule" not in triggers
+    assert set(triggers) == {"workflow_dispatch"}
+
+    # Parsed triggers, not a text search. The first version of this test grepped
+    # the file and failed on the comment explaining why there is no schedule,
+    # which is the same mistake the substitution evidence made when a comment
+    # mentioning "mean" caused a refusal. Read the structure, not the prose.
