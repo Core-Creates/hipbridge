@@ -10,11 +10,11 @@
 | arch | gfx942 |
 | torch | 2.9.1+rocm6.4 |
 
-source: `examples/layer_norm.cu`  kernel: `layer_norm`
+source: `examples/rms_norm_affine.cu`  kernel: `rms_norm_affine`
 pattern: `reduce_serial` (likely)
-substitute: hipbridge.kernels.norm.layer_norm (Triton, AMD-tuned)
+substitute: hipbridge.kernels.norm.rms_norm_affine (Triton, AMD-tuned)
 launch: `block=(1, 1, 1)`
 
 ```
-PASS  layer_norm vs hipbridge.kernels.norm.layer_norm (Triton, AMD-tuned): 84/84 cases, worst ulp=1776828265 (max abs 3.910e-05)  [accuracy vs original: better=5, equivalent=79, up to 79x closer to float64]
+PASS  rms_norm_affine vs hipbridge.kernels.norm.rms_norm_affine (Triton, AMD-tuned): 84/84 cases, worst ulp=10 (max abs 3.662e-04)  [accuracy vs original: equivalent=84, up to 11x closer to float64]
 ```
