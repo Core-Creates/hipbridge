@@ -117,9 +117,10 @@ def test_weight_shapes_follow_the_case(torch_):
 
     for cols in (63, 64, 1024):
         spec = InputSpec(shape=(8, cols))
-        made = [m(spec) for m in LAYER_NORM_AFFINE.extras]
+        made = [o.spec(spec) for o in LAYER_NORM_AFFINE.extras]
         assert [s.shape for s in made] == [(cols,), (cols,)]
         assert made[0].seed != made[1].seed, "gamma and beta must not be the same tensor twice"
+        assert [o.name for o in LAYER_NORM_AFFINE.extras] == ["gamma", "beta"]
 
 
 def test_every_suite_tells_you_to_call_its_own_kernel():
@@ -150,3 +151,76 @@ def test_every_suite_tells_you_to_call_its_own_kernel():
                 f"{suite.name} takes {len(suite.extras)} extra operands but the "
                 f"snippet passes none: {suite.usage_call}"
             )
+
+
+_AFFINE_BODY = """__global__ void layer_norm_x(const float *in, const float *%s, const float *%s,
+                            float *out, int rows, int cols) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    const float *ri = in + (size_t)row * cols;
+    float *ro = out + (size_t)row * cols;
+    float sum = 0.0f;
+    for (int i = 0; i < cols; i++) sum += ri[i];
+    float mean = sum / (float)cols;
+    float acc = 0.0f;
+    for (int i = 0; i < cols; i++) { float d = ri[i] - mean; acc += d * d; }
+    float inv = rsqrtf(acc / (float)cols + 1e-5f);
+    for (int i = 0; i < cols; i++) ro[i] = (ri[i] - mean) * inv * %s[i] + %s[i];
+}
+"""
+
+
+def _propose_affine(tmp_path, first, second):
+    """Parse a LayerNorm whose two weight parameters are named as given."""
+    from hipbridge import parse_file, recognize
+    from hipbridge.verify import substitutions
+
+    src = _AFFINE_BODY % (
+        first,
+        second,
+        "gamma" if "gamma" in (first, second) else first,
+        "beta" if "beta" in (first, second) else second,
+    )
+    path = tmp_path / "k.cu"
+    path.write_text(src, encoding="utf-8")
+
+    facts = parse_file(path)[0]
+    notes: list[str] = []
+    proposal = substitutions.propose(src, facts, recognize(facts).pattern, notes)
+    return proposal, notes
+
+
+def test_swapped_weights_are_refused_and_explained(tmp_path):
+    """(in, beta, gamma, ...) runs, returns finite numbers, and is wrong everywhere.
+
+    The driver binds input buffers in declaration order, so a kernel declaring
+    beta first receives gamma in it. Nothing crashes. Every row comes out wrong
+    and the oracle would report only that the numbers disagreed.
+    """
+    proposal, notes = _propose_affine(tmp_path, "beta", "gamma")
+
+    assert proposal is None, "weights in the wrong order must not be substituted"
+    assert notes, "a near miss has to say why it was declined"
+    assert "different order" in notes[0]
+    assert "gamma" in notes[0] and "beta" in notes[0]
+
+
+def test_conventional_aliases_are_accepted(tmp_path):
+    """gamma is also called weight or scale; beta is bias or shift."""
+    proposal, notes = _propose_affine(tmp_path, "weight", "bias")
+
+    assert proposal is not None, f"aliases should be accepted, got notes: {notes}"
+    assert proposal.name == "layer_norm_affine"
+
+
+def test_unfamiliar_names_are_allowed_through(tmp_path):
+    """Names are a weaker signal than the proof, so an odd spelling is not fatal.
+
+    Refusing every unrecognised name would reject correct kernels for their
+    vocabulary. A recognised name in the wrong slot is the dangerous case, and
+    that is the one that gets refused.
+    """
+    proposal, _ = _propose_affine(tmp_path, "aa", "bb")
+
+    assert proposal is not None, "an unfamiliar spelling is not evidence of a bug"
+    assert proposal.name == "layer_norm_affine"

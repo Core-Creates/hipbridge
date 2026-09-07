@@ -44,6 +44,32 @@ class Baseline:
 
 
 @dataclass(frozen=True)
+class Operand:
+    """One extra input a kernel takes, beyond the tensor being transformed.
+
+    Carries a name because position alone is not enough. The generated driver
+    binds buffers in declaration order, so a kernel written
+    `(in, beta, gamma, out, ...)` would receive gamma where it expects beta and
+    produce plausible, wrong output. The oracle would fail it without ever
+    saying why. Names are checked against the kernel's own parameters first.
+
+    `aliases` exist because the same operand has several conventional
+    spellings: gamma is weight or scale, beta is bias or shift.
+    """
+
+    name: str
+    spec: Callable[[InputSpec], InputSpec]
+    aliases: tuple[str, ...] = ()
+
+    @property
+    def accepted(self) -> tuple[str, ...]:
+        return (self.name, *self.aliases)
+
+    def matches(self, param_name: str) -> bool:
+        return param_name.lower().lstrip("_") in self.accepted
+
+
+@dataclass(frozen=True)
 class Suite:
     name: str
     source_file: str
@@ -60,7 +86,7 @@ class Suite:
     # Operands beyond the tensor being transformed, derived from the primary
     # case. LayerNorm's gamma and beta live here. Empty for the kernels that
     # take one tensor, which is most of them.
-    extras: tuple[Callable[[InputSpec], InputSpec], ...] = ()
+    extras: tuple[Operand, ...] = ()
     # How a caller actually uses the substitute once it is proved. Held per
     # suite because `port` printed a hardcoded softmax snippet for every kernel
     # it proved, so a proved LayerNorm came with instructions to call softmax on
@@ -215,7 +241,7 @@ def _torch_layer_norm_affine(t: torch.Tensor, gamma: torch.Tensor, beta: torch.T
     return torch.nn.functional.layer_norm(t, (t.shape[-1],), weight=gamma, bias=beta, eps=1e-5)
 
 
-def _per_column(seed_offset: int):
+def _per_column(name: str, seed_offset: int, aliases: tuple[str, ...] = ()) -> Operand:
     """A weight vector as wide as one row of the primary case.
 
     Derived from the primary spec so a sweep over shapes sweeps the weights with
@@ -230,7 +256,7 @@ def _per_column(seed_offset: int):
             seed=spec.seed + seed_offset,
         )
 
-    return make
+    return Operand(name=name, spec=make, aliases=aliases)
 
 
 LAYER_NORM_AFFINE = Suite(
@@ -243,7 +269,10 @@ LAYER_NORM_AFFINE = Suite(
     usage_import="from hipbridge.kernels.norm import layer_norm_affine_rowwise",
     usage_call="out = layer_norm_affine_rowwise(x, gamma, beta)",
     shapes=_row_shapes,
-    extras=(_per_column(1009), _per_column(2003)),
+    extras=(
+        _per_column("gamma", 1009, ("weight", "scale", "g", "w")),
+        _per_column("beta", 2003, ("bias", "shift", "b")),
+    ),
     baselines=(
         Baseline(
             name="tuned HIP",
@@ -309,6 +338,7 @@ __all__ = [
     "RMS_NORM",
     "ROW_SOFTMAX",
     "Baseline",
+    "Operand",
     "Suite",
     "candidate_for",
 ]

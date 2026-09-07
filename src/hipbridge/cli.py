@@ -96,7 +96,7 @@ def _cmd_verify(args) -> int:
             candidate=candidate,
             reference=ref,
             oracle=suite.oracle,
-            extras=suite.extras,
+            extras=tuple(o.spec for o in suite.extras),
             name=f"{suite.name} vs original on {args.toolchain}",
         ).run(shape_list)
         ran += 1
@@ -189,7 +189,7 @@ def _cmd_bench(args) -> int:
             x = verify.generate(primary, device=device)
             # Weight tensors for kernels that take them, generated the same way
             # the harness does so the timed call and the proved call agree.
-            ins = (x, *(verify.generate(make(primary), device=device) for make in suite.extras))
+            ins = (x, *(verify.generate(o.spec(primary), device=device) for o in suite.extras))
 
             # Verify at this exact shape before timing it. The candidate is
             # checked against the original; each additional baseline is checked
@@ -199,7 +199,7 @@ def _cmd_bench(args) -> int:
                 candidate=candidate,
                 reference=refs[0][1],
                 oracle=suite.oracle,
-                extras=suite.extras,
+                extras=tuple(o.spec for o in suite.extras),
                 name=f"{suite.name}@{shape}",
                 distributions=(verify.Distribution.NORMAL,),
             ).run([shape])
@@ -328,10 +328,19 @@ def _cmd_port(args) -> int:
     from hipbridge.verify import substitutions, suites
 
     source = Path(args.file).read_text(encoding="utf-8")
-    proposal = substitutions.propose(source, facts, result.pattern)
+    notes: list[str] = []
+    proposal = substitutions.propose(source, facts, result.pattern, notes)
     if proposal is None:
         print("no substitution proposed.")
         print()
+        # A near miss is worth explaining. Without this, a kernel that matched
+        # everything except the order of its weights reports the same "nothing
+        # to propose" as a kernel nobody recognised, and sends its author
+        # looking for a missing feature instead of reading their signature.
+        for note in notes:
+            print(f"  {note}")
+        if notes:
+            print()
         if result.recognized:
             print(f"  {facts.name} is a {result.pattern.value}, but a pattern is not a")
             print("  licence to substitute: several different computations share it.")
@@ -381,7 +390,10 @@ def _cmd_port(args) -> int:
     # read uninitialised shared memory and scored the candidate 3.9e75x better.
     # A reference that cannot reproduce its own maths is not a baseline.
     spec = verify.InputSpec(shape=(4, 256))
-    probe = (verify.generate(spec), *(verify.generate(m(spec)) for m in proposal.suite.extras))
+    probe = (
+        verify.generate(spec),
+        *(verify.generate(o.spec(spec)) for o in proposal.suite.extras),
+    )
     truth = proposal.suite.oracle(*(t.double() for t in probe))
     ref_err = float((ref(*probe).double() - truth.cpu()).abs().max())
     if not (ref_err < 1e-3):
@@ -399,7 +411,7 @@ def _cmd_port(args) -> int:
         candidate=candidate,
         reference=ref,
         oracle=proposal.suite.oracle,
-        extras=proposal.suite.extras,
+        extras=tuple(o.spec for o in proposal.suite.extras),
         name=f"{facts.name} vs {described}",
     ).run(list(proposal.suite.shapes())[: args.limit])
     print(summary)
