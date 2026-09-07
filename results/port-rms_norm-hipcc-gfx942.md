@@ -10,11 +10,11 @@
 | arch | gfx942 |
 | torch | 2.14.0+cu130 |
 
-source: `examples/rms_norm_affine.cu`  kernel: `rms_norm_affine`
+source: `examples/rms_norm.cu`  kernel: `rms_norm`
 pattern: `reduce_serial` (likely)
-substitute: torch rms_norm affine (Triton unavailable)
+substitute: torch rms_norm (Triton unavailable)
 launch: `block=(1, 1, 1)`
 
 ```
-PASS  rms_norm_affine vs torch rms_norm affine (Triton unavailable): 42/42 cases, worst ulp=3 (max abs 3.052e-05)  [accuracy vs original: equivalent=42, up to 2x closer to float64]
+PASS  rms_norm vs torch rms_norm (Triton unavailable): 42/42 cases, worst ulp=2 (max abs 4.768e-07)  [accuracy vs original: equivalent=42, up to 2x closer to float64]
 ```

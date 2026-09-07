@@ -63,16 +63,20 @@ permissions:
 jobs:
   verify:
     runs-on: ${{ inputs.runner }}
-    # Hard ceiling. A hung compile on a metered GPU must not bill for six hours.
+    # Hard ceiling, so a hung compile on a metered GPU cannot bill for hours.
     # Verify, bench and port across three precisions runs close to 45 minutes on
-    # an MI300X. The ceiling exists so a hung compile cannot bill for hours, not
-    # to cut short a run that is working.
+    # an MI300X, so the ceiling is set above that rather than at it: the point is
+    # to stop a runaway, not to cut short a run that is working.
     timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
 
+      # Only for the hosted dry run. A self-hosted AMD box already has the
+      # interpreter that matters, the one with ROCm-built torch and
+      # pytorch-triton-rocm, and installing a fresh Python here shadows it.
       - uses: actions/setup-python@v5
+        if: ${{ inputs.runner == 'ubuntu-latest' }}
         with:
           python-version: "3.12"
 
@@ -86,11 +90,56 @@ jobs:
       # ROCm images ship a ROCm-built torch and pytorch-triton-rocm. Reinstalling
       # either from PyPI replaces them with NVIDIA builds and breaks the GPU you
       # are paying for, so the extra declares torch and nothing else.
+      #
+      # On a self-hosted box the interpreter to use is the one that already has
+      # them. HIPBRIDGE_PYTHON names it; otherwise the conventional venv path is
+      # tried. The checkout goes on PYTHONPATH rather than being installed, so a
+      # CI run never rewrites what that venv points at.
+      - name: Choose the interpreter
+        id: py
+        run: |
+          PY="${HIPBRIDGE_PYTHON:-}"
+          if [ -z "$PY" ] && [ -x "$HOME/hipbridge/.venv/bin/python" ]; then
+            PY="$HOME/hipbridge/.venv/bin/python"
+          fi
+          if [ -z "$PY" ]; then PY="$(command -v python3 || command -v python)"; fi
+          echo "using $PY"
+          "$PY" -c "import sys; print(sys.version)"
+          echo "python=$PY" >> "$GITHUB_OUTPUT"
+
       - name: Install
-        run: pip install -e ".[verify,dev]"
+        run: |
+          if [ "${{ inputs.runner }}" = "ubuntu-latest" ]; then
+            pip install -e ".[verify,dev]"
+          else
+            echo "using the box's interpreter and its ROCm torch; nothing installed"
+          fi
 
       - name: Capabilities
-        run: hipbridge info
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
+        run: ${{ steps.py.outputs.python }} -m hipbridge.cli info
+
+      # The whole point of a hardware run is to exercise the tuned kernels. When
+      # Triton is missing every suite falls back to torch, and the run reports a
+      # pass for a substitution it never attempted. That happened on the first CI
+      # regeneration and the numbers looked entirely plausible: 126/126 across
+      # six suites, measuring the fallback.
+      - name: Refuse to measure the fallback
+        if: ${{ inputs.runner != 'ubuntu-latest' }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
+        run: |
+          ${{ steps.py.outputs.python }} -c "
+          import sys
+          from hipbridge import kernels
+          if not kernels.available():
+              sys.exit('[kernels] extra unavailable, so every candidate would be the '
+                       'torch fallback. A hardware run that measures the fallback is '
+                       'worse than none: it looks like a pass for a substitution that '
+                       'was never made.')
+          print('tuned Triton kernels are available')
+          "
 
       - name: Build the dtype flags
         id: flags
@@ -100,8 +149,10 @@ jobs:
           echo "dtype=$flags" >> "$GITHUB_OUTPUT"
 
       - name: Verify against device
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
         run: |
-          hipbridge verify \
+          ${{ steps.py.outputs.python }} -m hipbridge.cli verify \
             --toolchain hipcc \
             --arch "${{ inputs.arch }}" \
             --limit "${{ inputs.limit }}" \
@@ -111,8 +162,10 @@ jobs:
 
       - name: Benchmark against device
         if: ${{ inputs.bench }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
         run: |
-          hipbridge bench \
+          ${{ steps.py.outputs.python }} -m hipbridge.cli bench \
             --toolchain hipcc \
             --arch "${{ inputs.arch }}" \
             --runs 3 \
@@ -125,10 +178,16 @@ jobs:
       # which is precisely the drift the freshness check exists to catch.
       - name: Prove each kernel through port
         if: ${{ inputs.port }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
         run: |
           for k in row_softmax layer_norm layer_norm_affine rms_norm rms_norm_affine rope; do
             echo "== $k"
-            hipbridge port "examples/$k.cu"               --toolchain hipcc               --arch "${{ inputs.arch }}"               --limit "${{ inputs.limit }}"               --report
+            ${{ steps.py.outputs.python }} -m hipbridge.cli port "examples/$k.cu" \
+              --toolchain hipcc \
+              --arch "${{ inputs.arch }}" \
+              --limit "${{ inputs.limit }}" \
+              --report
           done
 
       # The reports carry the commit, host, device, toolchain and torch build
