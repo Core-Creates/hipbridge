@@ -391,6 +391,23 @@ BUILTIN: tuple[Suite, ...] = (
 )
 
 
+def make_inputs(suite: Suite, spec: InputSpec, device: str = "cpu") -> tuple[torch.Tensor, ...]:
+    """The full operand list for one case: the primary tensor, then the extras.
+
+    One place, because there were two and they drifted. `bench` built the tuple
+    itself and then handed the bare primary tensor to the torch baseline, so a
+    kernel taking weights crashed with a missing-argument TypeError after the
+    verification had already passed. Callers that need operands should ask for
+    them here rather than assembling their own.
+    """
+    from hipbridge.verify.inputs import generate
+
+    return (
+        generate(spec, device=device),
+        *(generate(operand.spec(spec), device=device) for operand in suite.extras),
+    )
+
+
 def candidate_for(suite: Suite) -> tuple[Callable[[torch.Tensor], torch.Tensor], str]:
     """The implementation being proposed in place of the original.
 
@@ -466,4 +483,5 @@ __all__ = [
     "Operand",
     "Suite",
     "candidate_for",
+    "make_inputs",
 ]

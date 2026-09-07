@@ -224,3 +224,33 @@ def test_unfamiliar_names_are_allowed_through(tmp_path):
 
     assert proposal is not None, "an unfamiliar spelling is not evidence of a bug"
     assert proposal.name == "layer_norm_affine"
+
+
+def test_every_suite_can_be_called_the_way_bench_calls_it(torch_):
+    """The arity contract bench relies on, asserted without a GPU.
+
+    bench assembled the operand tuple itself and then handed the bare primary
+    tensor to the torch baseline. Verification passed, timing crashed with a
+    missing-argument TypeError, and the crash was only visible on hardware
+    because that is the only place bench runs. Operand building now lives in
+    one helper, and this walks every suite through it.
+    """
+    from hipbridge.verify.inputs import InputSpec
+    from hipbridge.verify.suites import BUILTIN, candidate_for, make_inputs
+
+    for suite in BUILTIN:
+        cols = 64 if not suite.extras else 64  # even, so RoPE can pair channels
+        ins = make_inputs(suite, InputSpec(shape=(4, cols)), device="cpu")
+
+        assert len(ins) == 1 + len(suite.extras), f"{suite.name} operand count"
+
+        candidate, _ = candidate_for(suite)
+        out = candidate(*ins)
+        assert out.shape == ins[0].shape, f"{suite.name} candidate shape"
+
+        if suite.portable is not None:
+            ported = suite.portable(*ins)
+            assert ported.shape == ins[0].shape, f"{suite.name} portable shape"
+
+        truth = suite.oracle(*(t.double() for t in ins))
+        assert truth.shape == ins[0].shape, f"{suite.name} oracle shape"

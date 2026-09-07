@@ -186,10 +186,10 @@ def _cmd_bench(args) -> int:
         rows = []
         for shape in shapes:
             primary = verify.InputSpec(shape=shape)
-            x = verify.generate(primary, device=device)
-            # Weight tensors for kernels that take them, generated the same way
-            # the harness does so the timed call and the proved call agree.
-            ins = (x, *(verify.generate(o.spec(primary), device=device) for o in suite.extras))
+            # Weight tensors for kernels that take them, built the same way the
+            # harness builds them so the timed call and the proved call agree.
+            ins = suites.make_inputs(suite, primary, device=device)
+            x = ins[0]
 
             # Verify at this exact shape before timing it. The candidate is
             # checked against the original; each additional baseline is checked
@@ -232,7 +232,9 @@ def _cmd_bench(args) -> int:
                     measured.append(
                         bench.Measurement(
                             suite.portable_name,
-                            bench.stat_candidate(suite.portable, x, reps=args.reps, runs=args.runs),
+                            bench.stat_candidate(
+                                suite.portable, ins, reps=args.reps, runs=args.runs
+                            ),
                             device,
                         )
                     )
