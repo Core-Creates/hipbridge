@@ -37,9 +37,29 @@ from hipbridge.verify.reference import NativeReference
 
 # A shape is called latency-bound when its throughput falls this far below the
 # best throughput the same implementation reached at any shape in the sweep.
-# Below that, the measurement is dominated by fixed launch overhead and the
-# ratio says more about dispatch than about the kernel.
+#
+# Why a quarter. Throughput here is elements per millisecond, so a shape at
+# fraction f of the best is spending (1 - f) of its time on something other than
+# the work. At 0.25 that is three quarters of the measurement, which is past any
+# reading of "the kernel's speed" and safely clear of ordinary variation: the
+# same shape moves by about 15% between runs on the MI300X, and the observed
+# small shapes sit near 0.001 of the best rather than anywhere near the line.
+# The threshold is therefore not delicately placed, and the label is a warning
+# about interpretation rather than a precise classification.
+#
+# An absolute rule was considered and rejected: compare each time against the
+# measured cost of launching a kernel that does no work (4.9 us from Python on
+# that box). It fails because each implementation has its own launch cost, and
+# Triton's is roughly 17 us against torch's 5.5 us, so one absolute threshold
+# would label the same shape differently depending on who is being timed. The
+# relative rule asks the only question that survives that: is this shape slow
+# compared with how fast this same implementation can go.
 LATENCY_BOUND_FRACTION = 0.25
+
+# Below this many shapes there is nothing to compare against, so no shape is
+# labelled at all. A single-shape sweep is its own best throughput by
+# definition, and calling it compute-bound on that basis would be circular.
+LATENCY_BOUND_MIN_SHAPES = 2
 
 
 @dataclass(frozen=True)
@@ -119,27 +139,35 @@ class ShapeRow:
         return None
 
 
-def mark_latency_bound(rows: list[ShapeRow]) -> None:
+def mark_latency_bound(rows: list[ShapeRow]) -> bool:
     """Flag shapes where the candidate never gets to show its throughput.
 
     Compares each shape's elements-per-millisecond against the best the same
     candidate managed anywhere in the sweep. Well under that best means the
     kernel spent its time being launched rather than working, so the ratio there
     is a statement about dispatch overhead and should not be read as throughput.
+
+    Returns whether the sweep was large enough to judge. A short sweep leaves
+    every row unlabelled rather than quietly declaring them all compute-bound,
+    which is the answer a single shape would always give about itself.
     """
     rates = [(r, r.elements / r.candidate.stat.median) for r in rows if r.candidate.stat.median]
-    if not rates:
-        return
+    if len({r.shape for r, _ in rates}) < LATENCY_BOUND_MIN_SHAPES:
+        for row, _ in rates:
+            row.latency_bound = False
+        return False
+
     best = max(rate for _, rate in rates)
     for row, rate in rates:
         row.latency_bound = rate < best * LATENCY_BOUND_FRACTION
+    return True
 
 
 def render(rows: list[ShapeRow]) -> str:
     """One aligned table for the whole sweep."""
     if not rows:
         return "no shapes measured"
-    mark_latency_bound(rows)
+    judged = mark_latency_bound(rows)
     names = [b.name for b in rows[0].baselines]
 
     head = f"{'shape':>12}  " + "".join(f"{n + ' (us)':>24}" for n in names)
@@ -165,6 +193,12 @@ def render(rows: list[ShapeRow]) -> str:
         if flags:
             line += "  (" + "; ".join(flags) + ")"
         lines.append(line)
+    if not judged:
+        lines.append(
+            f"  (fewer than {LATENCY_BOUND_MIN_SHAPES} distinct shapes, so nothing is "
+            "labelled latency-bound: there is no faster run of the same kernel to "
+            "compare against)"
+        )
     return "\n".join(lines)
 
 
@@ -238,6 +272,7 @@ def stat_reference(ref: NativeReference, ins, reps: int = 100, runs: int = 5) ->
 
 __all__ = [
     "LATENCY_BOUND_FRACTION",
+    "LATENCY_BOUND_MIN_SHAPES",
     "Measurement",
     "ShapeRow",
     "Stat",

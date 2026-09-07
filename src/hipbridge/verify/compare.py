@@ -176,7 +176,11 @@ def arbitrate(
     if e_cand <= floor and e_ref <= floor:
         return Arbitration(e_cand, e_ref, "equivalent", ratio)
 
-    if ratio <= 1.0:
+    # Strictly closer, not merely as close. A tie gives a ratio of exactly 1.0,
+    # and calling that "better" inflated every count: the RoPE run reported
+    # `worst ulp=0` and `better=12` in the same line, which cannot both be true,
+    # because output identical to the original cannot be nearer the truth.
+    if ratio < 1.0:
         verdict = "better"
     elif ratio <= slack:
         verdict = "equivalent"
