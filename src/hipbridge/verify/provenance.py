@@ -40,12 +40,23 @@ def _run(cmd: list[str]) -> str:
 
 
 def commit() -> str:
-    """The commit this measurement was produced at, marked if the tree is dirty."""
+    """The commit this measurement was produced at, marked if the tree is dirty.
+
+    Results themselves do not count as dirt. Writing a report necessarily
+    modifies the tree, so counting it would stamp every measurement `-dirty`,
+    including the ones taken from a pristine checkout, and a marker that is
+    always on carries no information. What matters is whether the *code* that
+    produced the number differed from the commit named beside it.
+    """
     sha = _run(["git", "rev-parse", "--short", "HEAD"]).split("\n")[0]
     if not sha:
         return "unknown"
-    dirty = _run(["git", "status", "--porcelain"])
-    return f"{sha}-dirty" if dirty else sha
+    changes = [
+        line
+        for line in _run(["git", "status", "--porcelain"]).splitlines()
+        if line.strip() and RESULTS_DIR + "/" not in line.replace("\\", "/")
+    ]
+    return f"{sha}-dirty" if changes else sha
 
 
 def toolchain_version(toolchain: str) -> str:
