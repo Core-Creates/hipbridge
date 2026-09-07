@@ -366,10 +366,36 @@ def test_the_amd_workflow_leaves_evidence_behind():
     assert upload.get("if") == "always()", "a failed run's evidence is the useful kind"
     assert "results/" in str(upload["with"]["path"])
 
-    assert "hipbridge verify" in body, "the workflow must actually verify"
-    assert "hipbridge bench" in body, "and time what it verified"
+    assert "hipbridge.cli verify" in body, "the workflow must actually verify"
+    assert "hipbridge.cli bench" in body, "and time what it verified"
+    assert "hipbridge.cli port" in body, "and prove each kernel end to end"
     assert "--report" in body, "reports carry the commit, host and toolchain"
     assert names, "steps should be named so a failed run is readable"
+
+
+@needs_verify
+def test_the_amd_workflow_refuses_to_measure_the_torch_fallback():
+    """A hardware run that measures the fallback is worse than no hardware run.
+
+    The first CI regeneration installed a fresh CPU-only torch over the box's
+    ROCm build, so `[kernels] extra: not installed` and every suite quietly used
+    torch instead of the Triton kernel under test. It reported 126/126 across
+    six suites and the numbers looked entirely plausible. Nothing in the output
+    said the substitution had never been attempted.
+    """
+    wf = _workflow("amd-verify.yml")
+    steps = wf["jobs"]["verify"]["steps"]
+
+    guard = next((s for s in steps if "fallback" in str(s.get("name", "")).lower()), None)
+    assert guard is not None, "a hardware run must check the tuned kernels are present"
+    assert "kernels.available()" in str(guard["run"])
+    assert "ubuntu-latest" in str(guard.get("if")), "the dry run has no kernels and should skip it"
+
+    # And it must not shadow the box's ROCm interpreter to begin with.
+    setup = next(s for s in steps if "setup-python" in str(s.get("uses", "")))
+    assert "ubuntu-latest" in str(setup.get("if")), (
+        "installing a fresh Python on the AMD box is what caused the fallback"
+    )
 
 
 @needs_verify

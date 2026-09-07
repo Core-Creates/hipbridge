@@ -2,19 +2,19 @@
 
 | field | value |
 |---|---|
-| generated | 2026-09-07 16:36 UTC |
-| hipbridge | 0.1.0.dev0 at commit `50b7935` |
+| generated | 2026-09-07 19:40 UTC |
+| hipbridge | 0.1.0.dev0 at commit `89e542b` |
 | host | 2 (Linux x86_64) |
-| device | AMD Radeon Graphics |
+| device | no device visible to torch |
 | toolchain | hipcc, HIP version: 7.14.60850-0000000 |
 | arch | gfx942 |
-| torch | 2.9.1+rocm6.4 |
+| torch | 2.14.0+cu130 |
 
 source: `examples/rope.cu`  kernel: `rope`
 pattern: `row_map` (likely)
-substitute: hipbridge.kernels.rope (Triton, AMD-tuned)
+substitute: torch rope (Triton unavailable)
 launch: `block=(1, 1, 1)`
 
 ```
-PASS  rope vs hipbridge.kernels.rope (Triton, AMD-tuned): 84/84 cases, worst ulp=0 (max abs 0.000e+00)  [accuracy vs original: equivalent=84]
+PASS  rope vs torch rope (Triton unavailable): 42/42 cases, worst ulp=1568 (max abs 3.052e-05)  [accuracy vs original: equivalent=42]
 ```
