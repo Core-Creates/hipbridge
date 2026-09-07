@@ -243,12 +243,10 @@ def scalar_tokens(dtype_name: str, toolchain: str) -> dict[str, str]:
     per_type = _SCALARS.get(dtype_name)
     if per_type is None:
         raise TypeError(
-            f"no driver support for {dtype_name}; known types are "
-            f"{', '.join(sorted(_SCALARS))}"
+            f"no driver support for {dtype_name}; known types are {', '.join(sorted(_SCALARS))}"
         )
     scalar, header, from_float = per_type[toolchain]
     return {"scalar": scalar, "scalar_header": header, "from_float": from_float}
-
 
 
 def _to_bytes(t: torch.Tensor) -> bytes:
