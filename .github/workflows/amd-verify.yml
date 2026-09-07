@@ -8,15 +8,21 @@ name: AMD verify
 # covers everything that does not need a GPU; this runs when you have something
 # worth spending money to verify.
 #
+# There is deliberately no `schedule:` trigger. A weekly run on a metered device
+# bills whether or not anything changed, and three tests assert this workflow
+# stays dispatch-only. Adding a schedule should be a decision someone makes on
+# purpose, with the cost in front of them, not something that arrives in a diff.
+#
 # Setup, once you have a device:
 #   1. Rent an MI300X (AMD Developer Cloud credits, TensorWave, DigitalOcean).
-#   2. On that box: install the repo's [verify] extra and register a GitHub
-#      self-hosted runner with the labels  self-hosted, amd
+#   2. On that box:  bash scripts/register-amd-runner.sh <url> <token>
 #   3. Actions -> AMD verify -> Run workflow -> runner: self-hosted
 #
 # With runner: ubuntu-latest it is a free dry run. No AMD device exists there,
 # so every suite reports SKIP with a reason and the job passes. That verifies
-# the plumbing without spending anything.
+# the plumbing without spending anything, and is worth doing after any change
+# to this file, because the alternative is discovering a YAML mistake on a
+# machine that charges by the hour.
 
 on:
   workflow_dispatch:
@@ -34,6 +40,14 @@ on:
         description: Max shapes per suite. Lower is cheaper.
         type: string
         default: "12"
+      dtypes:
+        description: Precisions to sweep, space separated.
+        type: string
+        default: "float32 float16 bfloat16"
+      bench:
+        description: Also time the kernels. Costs more GPU minutes.
+        type: boolean
+        default: true
       require_device:
         description: Fail if no AMD device is found, instead of skipping.
         type: boolean
@@ -46,7 +60,7 @@ jobs:
   verify:
     runs-on: ${{ inputs.runner }}
     # Hard ceiling. A hung compile on a metered GPU must not bill for six hours.
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
@@ -62,11 +76,21 @@ jobs:
           command -v rocm-smi && rocm-smi || echo "rocm-smi: not present"
           command -v rocminfo && rocminfo | grep -m1 gfx || echo "rocminfo: not present"
 
+      # ROCm images ship a ROCm-built torch and pytorch-triton-rocm. Reinstalling
+      # either from PyPI replaces them with NVIDIA builds and breaks the GPU you
+      # are paying for, so the extra declares torch and nothing else.
       - name: Install
         run: pip install -e ".[verify,dev]"
 
       - name: Capabilities
         run: hipbridge info
+
+      - name: Build the dtype flags
+        id: flags
+        run: |
+          flags=""
+          for d in ${{ inputs.dtypes }}; do flags="$flags --dtype $d"; done
+          echo "dtype=$flags" >> "$GITHUB_OUTPUT"
 
       - name: Verify against device
         run: |
@@ -74,13 +98,38 @@ jobs:
             --toolchain hipcc \
             --arch "${{ inputs.arch }}" \
             --limit "${{ inputs.limit }}" \
-            --report amd-verify-report.md \
+            ${{ steps.flags.outputs.dtype }} \
+            --report \
             ${{ inputs.require_device == true && '--require' || '' }}
 
-      - name: Upload report
+      - name: Benchmark against device
+        if: ${{ inputs.bench }}
+        run: |
+          hipbridge bench \
+            --toolchain hipcc \
+            --arch "${{ inputs.arch }}" \
+            --runs 3 \
+            --shapes 1x1024,1024x1024,4096x4096 \
+            ${{ steps.flags.outputs.dtype }} \
+            --report
+
+      # The reports carry the commit, host, device, toolchain and torch build
+      # they were produced at, so an artifact from a run nobody watched is still
+      # attributable months later. A result that lives only in a log is an
+      # anecdote; this project has lost two of those to a droplet already.
+      - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: amd-verify-report-${{ inputs.arch }}
-          path: amd-verify-report.md
-          if-no-files-found: ignore
+          name: hipbridge-results-${{ inputs.arch }}-${{ github.run_id }}
+          path: results/
+          if-no-files-found: warn
+
+      - name: Show what changed against the committed results
+        if: always()
+        run: |
+          echo "Reports differing from what is on this branch:"
+          git --no-pager diff --stat -- results/ || true
+          echo
+          echo "Download the artifact above and commit it if these numbers"
+          echo "should become the record."

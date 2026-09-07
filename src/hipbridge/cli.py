@@ -17,6 +17,24 @@ from hipbridge.frontend import parse_file
 from hipbridge.recognize import recognize, registered
 
 
+def _dtypes(args) -> tuple:
+    """Precisions to sweep, from repeated --dtype flags.
+
+    Empty means float32 alone, which is what the harness defaults to. Named
+    here rather than deep in the harness so a CI run can ask for the precision
+    it cares about without a code change.
+    """
+    import torch
+
+    known = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
+    out = []
+    for name in args.dtype or []:
+        if name not in known:
+            raise SystemExit(f"unknown dtype {name}; choose from {', '.join(known)}")
+        out.append(known[name])
+    return tuple(out)
+
+
 def _report_path(args, command: str) -> str:
     """Where a report goes: an explicit path, or the tracked results directory.
 
@@ -97,6 +115,7 @@ def _cmd_verify(args) -> int:
             reference=ref,
             oracle=suite.oracle,
             extras=tuple(o.build for o in suite.extras),
+            dtypes=_dtypes(args),
             name=f"{suite.name} vs original on {args.toolchain}",
         ).run(shape_list)
         ran += 1
@@ -200,6 +219,7 @@ def _cmd_bench(args) -> int:
                 reference=refs[0][1],
                 oracle=suite.oracle,
                 extras=tuple(o.build for o in suite.extras),
+                dtypes=_dtypes(args),
                 name=f"{suite.name}@{shape}",
                 distributions=(verify.Distribution.NORMAL,),
             ).run([shape])
@@ -600,6 +620,13 @@ def main(argv: list[str] | None = None) -> int:
     ver.add_argument("--examples", default="examples", help="directory holding the .cu files")
     ver.add_argument("--wsl", default="", metavar="DISTRO", help="run the toolchain inside WSL2")
     ver.add_argument(
+        "--dtype",
+        action="append",
+        default=[],
+        choices=["float32", "float16", "bfloat16"],
+        help="precision to sweep; repeatable, defaults to float32",
+    )
+    ver.add_argument(
         "--report",
         nargs="?",
         const="AUTO",
@@ -627,6 +654,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     ben.add_argument("--examples", default="examples")
     ben.add_argument("--wsl", default="", metavar="DISTRO")
+    ben.add_argument(
+        "--dtype",
+        action="append",
+        default=[],
+        choices=["float32", "float16", "bfloat16"],
+        help="precision to sweep; repeatable, defaults to float32",
+    )
     ben.add_argument(
         "--report",
         nargs="?",
