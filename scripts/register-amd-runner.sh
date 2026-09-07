@@ -80,6 +80,30 @@ fi
     --name "$(hostname)-amd" \
     --work _work
 
+say "Credentials this box should NOT have"
+# A runner executes workflow code from the repository. Anything readable here is
+# readable by anyone who can land a change to a workflow file, which is a much
+# shorter path than needing SSH access to the machine.
+#
+# So the box gets a read-only deploy key scoped to this one repository, and
+# nothing else. It does not need a personal access token: the runner
+# authenticates with its own registration, and Actions supplies a per-job token
+# to the checkout.
+if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    echo "WARNING: gh is logged in on this box."
+    echo "  A CI runner does not need it, and a token here is readable by any"
+    echo "  workflow change. Remove it with:  gh auth logout"
+    echo
+fi
+if [ ! -f "$HOME/.ssh/hipbridge_deploy" ]; then
+    echo "No deploy key found. To give this box read-only access to one repo:"
+    echo "  ssh-keygen -t ed25519 -N '' -f ~/.ssh/hipbridge_deploy"
+    echo "  gh api -X POST repos/<owner>/<repo>/keys -f title='ci box' \\"
+    echo "      -f key=\"\$(cat ~/.ssh/hipbridge_deploy.pub)\" -F read_only=true"
+    echo "  git remote set-url origin git@github.com:<owner>/<repo>.git"
+    echo
+fi
+
 say "Running"
 echo "Ctrl-C stops it. The runner appears under Settings -> Actions -> Runners."
 echo "Then: Actions -> AMD verify -> Run workflow -> runner: self-hosted"
