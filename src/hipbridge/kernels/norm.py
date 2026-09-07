@@ -44,7 +44,7 @@ def _layer_norm_kernel(
     mask = cols < n_cols
 
     # Zero-fill rather than -inf: these values enter a sum, not a maximum.
-    x = tl.load(in_ptr + row * in_row_stride + cols, mask=mask, other=0.0)
+    x = tl.load(in_ptr + row * in_row_stride + cols, mask=mask, other=0.0).to(tl.float32)
     n = tl.sum(mask.to(tl.float32), axis=0)
 
     mean = tl.sum(x, axis=0) / n
@@ -52,7 +52,7 @@ def _layer_norm_kernel(
     var = tl.sum(centred * centred, axis=0) / n
 
     y = centred * tl.rsqrt(var + eps)
-    tl.store(out_ptr + row * out_row_stride + cols, y, mask=mask)
+    tl.store(out_ptr + row * out_row_stride + cols, y.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 @triton.jit
@@ -69,12 +69,12 @@ def _rms_norm_kernel(
     cols = tl.arange(0, BLOCK)
     mask = cols < n_cols
 
-    x = tl.load(in_ptr + row * in_row_stride + cols, mask=mask, other=0.0)
+    x = tl.load(in_ptr + row * in_row_stride + cols, mask=mask, other=0.0).to(tl.float32)
     n = tl.sum(mask.to(tl.float32), axis=0)
 
     ms = tl.sum(x * x, axis=0) / n
     y = x * tl.rsqrt(ms + eps)
-    tl.store(out_ptr + row * out_row_stride + cols, y, mask=mask)
+    tl.store(out_ptr + row * out_row_stride + cols, y.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 @triton.jit
@@ -93,18 +93,18 @@ def _layer_norm_affine_kernel(
     cols = tl.arange(0, BLOCK)
     mask = cols < n_cols
 
-    x = tl.load(in_ptr + row * in_row_stride + cols, mask=mask, other=0.0)
+    x = tl.load(in_ptr + row * in_row_stride + cols, mask=mask, other=0.0).to(tl.float32)
     n = tl.sum(mask.to(tl.float32), axis=0)
 
     mean = tl.sum(x, axis=0) / n
     centred = tl.where(mask, x - mean, 0.0)
     var = tl.sum(centred * centred, axis=0) / n
 
-    g = tl.load(gamma_ptr + cols, mask=mask, other=0.0)
-    b = tl.load(beta_ptr + cols, mask=mask, other=0.0)
+    g = tl.load(gamma_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(beta_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     y = centred * tl.rsqrt(var + eps) * g + b
 
-    tl.store(out_ptr + row * out_row_stride + cols, y, mask=mask)
+    tl.store(out_ptr + row * out_row_stride + cols, y.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 def layer_norm_affine_rowwise(x, gamma, beta, eps: float = 1e-5):
@@ -200,14 +200,14 @@ def _rms_norm_affine_kernel(
     cols = tl.arange(0, BLOCK)
     mask = cols < n_cols
 
-    x = tl.load(in_ptr + row * in_row_stride + cols, mask=mask, other=0.0)
+    x = tl.load(in_ptr + row * in_row_stride + cols, mask=mask, other=0.0).to(tl.float32)
     n = tl.sum(mask.to(tl.float32), axis=0)
 
     ms = tl.sum(x * x, axis=0) / n
-    g = tl.load(gamma_ptr + cols, mask=mask, other=0.0)
+    g = tl.load(gamma_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     y = x * tl.rsqrt(ms + eps) * g
 
-    tl.store(out_ptr + row * out_row_stride + cols, y, mask=mask)
+    tl.store(out_ptr + row * out_row_stride + cols, y.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 def rms_norm_affine_rowwise(x, gamma, eps: float = 1e-5):

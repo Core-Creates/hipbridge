@@ -31,18 +31,41 @@ class Report:
         return "\n".join([head, *(f"    {f}" for f in self.failures)])
 
 
+# The integer type each float type can be reinterpreted through, and its width.
+# ULP distance is only meaningful in the precision the kernel actually used:
+# upcasting float16 to float32 before counting turns a one-ULP disagreement into
+# roughly 8192, which reads as catastrophic and is not. Inference runs in half
+# precision, so this had to stop being a float32-only measurement.
+_INT_VIEW: dict[torch.dtype, tuple[torch.dtype, int]] = {
+    torch.float16: (torch.int16, 16),
+    torch.bfloat16: (torch.int16, 16),
+    torch.float32: (torch.int32, 32),
+    torch.float64: (torch.int64, 64),
+}
+
+
 def ulp_diff(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Distance in representable floats. Order-independent and scale-free."""
+    """Distance in representable floats, counted in the operands' own precision.
+
+    Order-independent and scale-free. bfloat16 is included and is worth a word:
+    it has the exponent range of float32 with eight mantissa bits, so its ULPs
+    are coarse and a handful of them is a large relative error. The count means
+    what it says; the interpretation differs per type.
+    """
     if a.dtype != b.dtype:
         raise TypeError(f"dtype mismatch: {a.dtype} vs {b.dtype}")
-    if a.dtype not in (torch.float32, torch.float64):
-        a, b = a.float(), b.float()
 
-    ia = a.detach().cpu().contiguous().view(torch.int32).to(torch.int64)
-    ib = b.detach().cpu().contiguous().view(torch.int32).to(torch.int64)
+    view, bits = _INT_VIEW.get(a.dtype, (None, 0))
+    if view is None:
+        a, b = a.float(), b.float()
+        view, bits = torch.int32, 32
+
+    ia = a.detach().cpu().contiguous().view(view).to(torch.int64)
+    ib = b.detach().cpu().contiguous().view(view).to(torch.int64)
     # Map the sign-magnitude layout onto a monotonic integer line.
-    ia = torch.where(ia < 0, torch.tensor(-(2**31), dtype=torch.int64) - ia, ia)
-    ib = torch.where(ib < 0, torch.tensor(-(2**31), dtype=torch.int64) - ib, ib)
+    floor_int = torch.tensor(-(2 ** (bits - 1)), dtype=torch.int64)
+    ia = torch.where(ia < 0, floor_int - ia, ia)
+    ib = torch.where(ib < 0, floor_int - ib, ib)
     return (ia - ib).abs()
 
 
@@ -83,7 +106,12 @@ def check(
     if primary is not None and is_identity(got, primary):
         failures.append("IDENTITY: output is a byte-exact copy of the input")
 
-    d = ulp_diff(got.float(), ref.float())
+    # ULP in the precision the kernel used, magnitudes in float32. Counting ULPs
+    # after an upcast would inflate a one-ULP half-precision disagreement into
+    # thousands; measuring magnitudes in half would round the error being
+    # measured. The two questions want different arithmetic.
+    common = got.dtype if got.dtype == ref.dtype else torch.float32
+    d = ulp_diff(got.to(common), ref.to(common))
     worst = int(d.max().item())
     abs_err = float((got.float() - ref.float()).abs().max().item())
     rel_den = ref.float().abs().clamp_min(1e-30)
@@ -171,8 +199,13 @@ def arbitrate(
     # sits at the floor on every finite distribution while the serial original
     # does not, so the ratio never got consulted and the verdict never said
     # "better" for a kernel that always was.
+    # The floor follows the working precision, not float32. fp16 resolves about
+    # 1e-3 where float32 resolves 1e-7, so a float32 floor applied to half
+    # precision is roughly 8000x too tight: it would rank two implementations
+    # that are both exact to the last representable bit, on rounding noise that
+    # neither could have avoided.
     scale = float(t.abs().max()) or 1.0
-    floor = 8.0 * torch.finfo(torch.float32).eps * scale
+    floor = 8.0 * torch.finfo(candidate.dtype).eps * scale
     if e_cand <= floor and e_ref <= floor:
         return Arbitration(e_cand, e_ref, "equivalent", ratio)
 

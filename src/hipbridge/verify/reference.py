@@ -450,6 +450,19 @@ class NativeReference(Reference):
         return exe
 
     def __call__(self, *inputs: torch.Tensor) -> torch.Tensor:
+        # The generated driver reads and writes 4-byte floats and the example
+        # kernels take `const float *`. Handing it half precision would
+        # reinterpret two values as one and compare the result against a correct
+        # answer, which is a failure report that says nothing true about the
+        # kernel. Refuse with the reason instead.
+        wrong = [t.dtype for t in inputs if t.dtype is not torch.float32]
+        if wrong:
+            raise TypeError(
+                f"NativeReference is float32-only; got {wrong[0]}. The generated "
+                "driver reads 4-byte floats, so half precision needs a driver "
+                "and example kernels templated on the element type."
+            )
+
         shapes = [tuple(t.shape) for t in inputs]
         scalars = self.launch.scalar_args(shapes)
         if self._built is None:

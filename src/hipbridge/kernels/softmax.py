@@ -25,7 +25,11 @@ def _softmax_rowwise_kernel(
     cols = tl.arange(0, BLOCK)
     mask = cols < n_cols
 
+    # Load in whatever precision the caller used, reduce in float32. A half
+    # precision sum of 4096 exponentials loses most of its mantissa, and the
+    # kernel this replaces would not have made that mistake in fp32.
     x = tl.load(in_ptr + row * in_row_stride + cols, mask=mask, other=-float("inf"))
+    x = x.to(tl.float32)
 
     # Max subtraction for numerical stability. Dropping this is the single most
     # common softmax translation bug and it is silent on small inputs.
@@ -34,7 +38,7 @@ def _softmax_rowwise_kernel(
     den = tl.sum(num, axis=0)
     y = num / den
 
-    tl.store(out_ptr + row * out_row_stride + cols, y, mask=mask)
+    tl.store(out_ptr + row * out_row_stride + cols, y.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 def softmax_rowwise(x):
