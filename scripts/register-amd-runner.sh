@@ -57,6 +57,20 @@ if [ ! -x ./config.sh ]; then
 fi
 
 say "Registering"
+# The runner refuses to configure as root, which is a reasonable guard: CI jobs
+# execute arbitrary workflow code from the repository, and doing that as root is
+# a poor trade on a machine holding anything worth stealing.
+#
+# Rented GPU boxes are handed to you as root, with ROCm, the repo and the venv
+# all set up there, so a dedicated user means re-doing that and adding it to the
+# render and video groups for device access. RUNNER_ALLOW_RUNASROOT is the
+# official escape hatch and is set here deliberately, on the understanding that
+# this box is disposable. Do not do this on a machine you care about, and note
+# that a box holding a broadly scoped token is one you care about.
+if [ "$(id -u)" = "0" ]; then
+    echo "running as root: setting RUNNER_ALLOW_RUNASROOT=1 (see the comment above)"
+    export RUNNER_ALLOW_RUNASROOT=1
+fi
 # --unattended so this never blocks on a prompt, --replace so re-running after
 # the box is rebuilt does not accumulate dead runners in the repository's list.
 ./config.sh --unattended --replace \
