@@ -4,10 +4,24 @@
 // idle. If a competent HIP kernel closes the gap, the substitution is not worth
 // making and this file is how we find that out.
 //
-// One block per row, 256 threads, strided loads, two shared-memory tree
-// reductions. Same three passes and same maths as the naive version, parallel
-// within the row instead of serial. Deliberately portable: only constructs HIP
-// and CUDA spell identically, so the same source compiles under hipcc and nvcc.
+// Online softmax (Milakov and Gimelshein), so the row is read twice rather than
+// three times. The obvious formulation makes three passes: find the maximum,
+// exponentiate and sum, then divide. This one carries a running maximum and a
+// running sum together, rescaling the sum whenever the maximum moves:
+//
+//     m' = max(m, x)      s' = s * exp(m - m') + exp(x - m')
+//
+// which is associative, so a block can reduce partial (m, s) pairs the same way
+// it would reduce a plain sum. Softmax at these sizes is memory bound, so a
+// third of the traffic is close to a third of the time.
+//
+// The first version of this file did make three passes, and torch beat it by
+// 2.3x, which made "2.9x against a competent kernel" softer than it sounded.
+// A baseline that is merely better than terrible is not a baseline.
+//
+// One block per row, 256 threads, strided loads, shared-memory tree reductions.
+// Deliberately portable: only constructs HIP and CUDA spell identically, so the
+// same source compiles under hipcc and nvcc.
 
 // Element type comes from the driver, which defines HB_SCALAR for the run.
 // Loads and stores use it; the arithmetic in between is float, because a half
@@ -16,10 +30,12 @@
 #ifndef HB_SCALAR
 #define HB_SCALAR float
 #endif
+
 #define HB_TILE 256
 
 __global__ void row_softmax_tuned(const HB_SCALAR *in, HB_SCALAR *out, int rows, int cols) {
-    __shared__ float red[HB_TILE];
+    __shared__ float red_m[HB_TILE];
+    __shared__ float red_s[HB_TILE];
 
     int row = blockIdx.x;
     if (row >= rows) return;
@@ -28,37 +44,38 @@ __global__ void row_softmax_tuned(const HB_SCALAR *in, HB_SCALAR *out, int rows,
     HB_SCALAR *ro = out + (size_t)row * cols;
     int t = threadIdx.x;
 
-    // Pass 1: row maximum, strided scan then a tree reduction.
+    // Pass 1: one walk of the row carrying both the maximum and the sum.
     float m = -1e20f;
-    for (int i = t; i < cols; i += HB_TILE)
-        m = fmaxf(m, (float)ri[i]);
-    red[t] = m;
-    __syncthreads();
-    for (int s = HB_TILE / 2; s > 0; s >>= 1) {
-        if (t < s) red[t] = fmaxf(red[t], red[t + s]);
-        __syncthreads();
-    }
-    m = red[0];
-    __syncthreads();
-
-    // Pass 2: exponentials and their sum. Pairwise here, which is also why this
-    // kernel disagrees with the serial original in the last few ULPs.
-    float acc = 0.0f;
+    float s = 0.0f;
     for (int i = t; i < cols; i += HB_TILE) {
-        float v = expf((float)ri[i] - m);
-        ro[i] = (HB_SCALAR)v;
-        acc += v;
+        float v = (float)ri[i];
+        float mn = fmaxf(m, v);
+        s = s * expf(m - mn) + expf(v - mn);
+        m = mn;
     }
-    red[t] = acc;
-    __syncthreads();
-    for (int s = HB_TILE / 2; s > 0; s >>= 1) {
-        if (t < s) red[t] += red[t + s];
-        __syncthreads();
-    }
-    float total = red[0];
+    red_m[t] = m;
+    red_s[t] = s;
     __syncthreads();
 
-    // Pass 3: normalise.
+    // Combine partials pairwise. Rescaling the smaller sum onto the larger
+    // maximum is what makes this reduction associative, and it never
+    // exponentiates a positive number, so it cannot overflow.
+    for (int stride = HB_TILE / 2; stride > 0; stride >>= 1) {
+        if (t < stride) {
+            float m_other = red_m[t + stride];
+            float s_other = red_s[t + stride];
+            float m_new = fmaxf(red_m[t], m_other);
+            red_s[t] = red_s[t] * expf(red_m[t] - m_new) + s_other * expf(m_other - m_new);
+            red_m[t] = m_new;
+        }
+        __syncthreads();
+    }
+    float total_max = red_m[0];
+    float total_sum = red_s[0];
+    __syncthreads();
+
+    // Pass 2: exponentiate and normalise in one go, so nothing is written twice.
+    float inv = 1.0f / total_sum;
     for (int i = t; i < cols; i += HB_TILE)
-        ro[i] = (HB_SCALAR)((float)ro[i] / total);
+        ro[i] = (HB_SCALAR)(expf((float)ri[i] - total_max) * inv);
 }

@@ -74,7 +74,8 @@ def _kernel_facts(fn) -> KernelFacts:
     atomics = sorted({c.spelling for c in calls if c.spelling in ATOMIC_NAMES})
 
     loops = [n for n in nodes if n.kind in (ci.CursorKind.FOR_STMT, ci.CursorKind.WHILE_STMT)]
-    halving = any("/=" in _tokens(loop) or ">>=" in _tokens(loop) for loop in loops)
+    halving_loops = [loop for loop in loops if "/=" in _tokens(loop) or ">>=" in _tokens(loop)]
+    halving = bool(halving_loops)
 
     # A loop's own step is not an accumulation. `for (i = t; i < n; i += 256)`
     # advances an induction variable and reduces nothing, but it is spelled with
@@ -102,6 +103,12 @@ def _kernel_facts(fn) -> KernelFacts:
     shared_acc = sum(1 for n in compound if any(t in shared_names for t in _tokens(n)))
     scalar_acc = len(compound) - shared_acc
 
+    # Does the halving loop actually touch shared memory? That ties the stride to
+    # the reduction rather than accepting any kernel that happens to have both.
+    shared_in_halving = any(
+        any(tok in shared_names for tok in _tokens(loop)) for loop in halving_loops
+    )
+
     refs = {n.spelling for n in nodes if n.kind == ci.CursorKind.DECL_REF_EXPR}
 
     return KernelFacts(
@@ -112,6 +119,7 @@ def _kernel_facts(fn) -> KernelFacts:
         loops=len(loops),
         has_halving_stride=halving,
         shared_accumulations=shared_acc,
+        shared_in_halving_loop=shared_in_halving,
         scalar_accumulations=scalar_acc,
         shuffle_intrinsics=shuffles,
         atomics=atomics,

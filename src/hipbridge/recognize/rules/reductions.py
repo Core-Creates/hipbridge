@@ -15,7 +15,14 @@ from hipbridge.recognize.base import rule
 
 @rule("reduce.tree", priority=10)
 def tree_reduction(f: KernelFacts):
-    if not (f.shared and f.barriers >= 2 and f.has_halving_stride and f.shared_accumulations):
+    # A tree reduction is shared memory, barriers, and a halving stride that
+    # touches that shared memory. It does NOT have to combine with `+=`: an
+    # online softmax rescales a running sum onto a new maximum, and Welford
+    # merges partial moments, both spelled as plain assignments. Requiring a
+    # compound assignment made both invisible, and they are the competent
+    # implementations, which is precisely the wrong thing to miss.
+    combines = f.shared_accumulations or f.shared_in_halving_loop
+    if not (f.shared and f.barriers >= 2 and f.has_halving_stride and combines):
         return None
     return (
         Pattern.REDUCE_TREE,
@@ -27,7 +34,11 @@ def tree_reduction(f: KernelFacts):
             ),
             f"{f.barriers} __syncthreads() calls",
             "loop stride is halved (log-depth tree)",
-            f"{f.shared_accumulations} compound assignment(s) into shared memory",
+            (
+                f"{f.shared_accumulations} compound assignment(s) into shared memory"
+                if f.shared_accumulations
+                else "the halving loop combines values held in shared memory"
+            ),
             "AMD note: wavefront is 64 wide, tree needs 6 steps not 5",
         ],
     )
