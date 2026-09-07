@@ -461,6 +461,109 @@ def _cmd_port(args) -> int:
     return 0
 
 
+def _cmd_synth(args) -> int:
+    """Ask a generator for a kernel, then let the oracle decide.
+
+    The same proof `port` uses, pointed at code nobody has read. That is the
+    point: coverage grows one hand-written Triton kernel at a time, and a model
+    can write those quickly, but only if something trustworthy decides which to
+    keep. This repository already is that something.
+
+    Nothing is recommended on the strength of having been generated. A candidate
+    that passes has matched the caller's compiled kernel across the same sweep
+    every shipped kernel had to pass; one that fails is recorded and discarded.
+    """
+    kernels = parse_file(args.file)
+    if not kernels:
+        print(f"no kernel definitions found in {args.file}", file=sys.stderr)
+        return 1
+    facts = kernels[0]
+
+    from hipbridge import synth, verify
+
+    if not verify.available():
+        print("SKIP: [verify] extra not installed, so nothing could be proved")
+        return 1 if args.require else 0
+
+    from hipbridge.verify import substitutions
+
+    source = Path(args.file).read_text(encoding="utf-8")
+    result = recognize(facts)
+    proposal = substitutions.propose(source, facts, result.pattern)
+    if proposal is None:
+        print("no suite covers this kernel, so there is no oracle to judge against.")
+        print("Generation without a proof is not something this tool will do.")
+        return 3
+
+    suite = proposal.suite
+    ref = verify.NativeReference(
+        source=source,
+        launch=substitutions.reference_launch(suite, facts),
+        toolchain=args.toolchain,
+        command_prefix=verify.wsl(args.wsl) if args.wsl else [],
+        extra_flags=(["--offload-arch=" + args.arch] if args.arch else []),
+    )
+    avail = ref.availability()
+    if not avail:
+        print(f"CANNOT PROVE: {avail.reason}")
+        print("Generated code is worth nothing unproved, so nothing is generated.")
+        return 5 if args.require else 0
+
+    def verify_one(fn):
+        return verify.Harness(
+            candidate=fn,
+            reference=ref,
+            oracle=suite.oracle,
+            extras=tuple(o.spec for o in suite.extras),
+            name="generated",
+        ).run(list(suite.shapes())[: args.limit])
+
+    generator = (
+        synth.ScriptGenerator(command=args.generator.split())
+        if args.generator
+        else synth.StaticGenerator(
+            sources=[Path(p).read_text(encoding="utf-8") for p in args.file_candidate]
+        )
+    )
+
+    prompt = synth.prompt_for(source, facts.name, args.arch or "gfx942")
+    if args.show_prompt:
+        print(prompt)
+        print()
+
+    print(f"generating up to {args.count} candidate(s) for {facts.name}")
+    print(f"judged against {args.file} compiled with {args.toolchain}, and a float64 oracle")
+    print()
+
+    try:
+        found = synth.search(
+            generator,
+            prompt,
+            verify_one,
+            count=args.count,
+            allow_untrusted_code=args.allow_untrusted_code,
+        )
+    except synth.UntrustedCodeError as exc:
+        print(f"REFUSED: {exc}")
+        print()
+        print("  Generated kernels execute in this process with its privileges.")
+        print("  Pass --allow-untrusted-code once you are on a machine where that")
+        print("  is acceptable, which is not one holding credentials you care about.")
+        return 2
+
+    print(found)
+    winner = found.winner
+    if winner is None:
+        return 1 if args.require else 4
+
+    print()
+    print(winner.summary)
+    if args.out:
+        Path(args.out).write_text(winner.candidate.source, encoding="utf-8")
+        print(f"kernel written to {args.out}")
+    return 0
+
+
 def _cmd_info(args) -> int:
     print(f"hipbridge {__version__}")
     print(f"recognizers: {', '.join(registered())}")
@@ -562,6 +665,36 @@ def main(argv: list[str] | None = None) -> int:
         help="fail instead of skipping when nothing can be proved",
     )
     prt.set_defaults(fn=_cmd_port)
+
+    syn = sub.add_parser("synth", help="generate candidate kernels and prove them on device")
+    syn.add_argument("file")
+    syn.add_argument("--toolchain", default="hipcc", choices=["hipcc", "nvcc"])
+    syn.add_argument("--arch", default="", help="offload arch, e.g. gfx942 for MI300X")
+    syn.add_argument("--count", type=int, default=5, help="how many candidates to ask for")
+    syn.add_argument("--limit", type=int, default=12, help="max shapes to prove over")
+    syn.add_argument("--wsl", default="", metavar="DISTRO")
+    syn.add_argument(
+        "--generator",
+        default="",
+        metavar="CMD",
+        help="command that prints a Triton kernel on stdout, given the prompt on stdin",
+    )
+    syn.add_argument(
+        "--file-candidate",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="propose this file instead of calling a generator; repeatable",
+    )
+    syn.add_argument("--out", default="", help="write the surviving kernel here")
+    syn.add_argument("--show-prompt", action="store_true", help="print the prompt and continue")
+    syn.add_argument(
+        "--allow-untrusted-code",
+        action="store_true",
+        help="execute generated code in this process; it is not sandboxed",
+    )
+    syn.add_argument("--require", action="store_true")
+    syn.set_defaults(fn=_cmd_synth)
 
     info = sub.add_parser("info", help="show capabilities and which extras are installed")
     info.set_defaults(fn=_cmd_info)
