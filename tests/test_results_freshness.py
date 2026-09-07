@@ -78,6 +78,49 @@ def test_the_verify_report_covers_every_suite():
     assert not missing, f"the committed verification does not mention: {', '.join(missing)}"
 
 
+def test_freshness_survives_a_rebase():
+    """Ancestry was the wrong question, and it failed on this repo's own workflow.
+
+    Every merge here is a rebase merge, which rewrites the commit a report was
+    produced at, so a report generated on a feature branch named a commit that
+    never landed on main. The check called that stale while the code it measured
+    had not changed at all. Content answers the question ancestry could not.
+    """
+    from hipbridge.verify import provenance
+
+    header = provenance.header("t", "hipcc", "gfx942")
+    verdict, why = provenance.staleness(header)
+
+    assert verdict == "fresh", why
+    assert provenance.parse_code_digest(header) == provenance.code_digest()
+
+
+def test_a_report_without_a_digest_is_unknown_not_stale():
+    """Reports written before digests existed cannot be judged, only re-run."""
+    from hipbridge.verify import provenance
+
+    old_style = "| hipbridge | 0.1 at commit `abc1234` |"
+    verdict, why = provenance.staleness(old_style)
+
+    assert verdict == "unknown"
+    assert "predates" in why
+
+
+def test_a_changed_kernel_makes_a_report_stale(tmp_path):
+    """The whole point: editing measured code has to invalidate the numbers."""
+    from hipbridge.verify import provenance
+
+    (tmp_path / "examples").mkdir()
+    kernel = tmp_path / "examples" / "k.cu"
+    kernel.write_text("__global__ void k() {}", encoding="utf-8")
+    before = provenance.code_digest(tmp_path)
+
+    kernel.write_text("__global__ void k() { int x = 1; }", encoding="utf-8")
+    after = provenance.code_digest(tmp_path)
+
+    assert before != after, "a changed kernel must change the digest"
+
+
 def test_staleness_reads_the_commit_out_of_a_header():
     """The parser, without depending on what happens to be committed."""
     from hipbridge.verify import provenance
@@ -91,12 +134,16 @@ def test_staleness_reads_the_commit_out_of_a_header():
     assert provenance.parse_commit("| hipbridge | 0.1 at commit `abc1234-dirty` |") == "abc1234"
 
 
-def test_an_unreadable_history_is_unknown_rather_than_stale(monkeypatch):
-    """Unanswerable is not the same as wrong, and must not fail a build."""
+def test_a_report_missing_its_commit_is_unknown():
+    """A report that does not say where it came from cannot be judged at all.
+
+    This used to test git being unavailable, which no longer matters: freshness
+    reads the working tree, so a shallow clone, a missing git and an offline box
+    all answer the same question correctly.
+    """
     from hipbridge.verify import provenance
 
-    monkeypatch.setattr(provenance, "_run", lambda cmd: "")
-    verdict, why = provenance.staleness("| hipbridge | 0.1 at commit `abc1234` |")
+    verdict, why = provenance.staleness("no header at all")
 
     assert verdict == "unknown"
-    assert "unavailable" in why or "not in this clone" in why
+    assert "does not name the commit" in why

@@ -385,6 +385,11 @@ def _cmd_port(args) -> int:
 
     candidate, described = suites.candidate_for(proposal.suite)
     print(f"proposing: {described}")
+    # The structural read that got us here, restated beside the evidence rather
+    # than left twenty lines up. It is advisory: a "likely" match is proposed
+    # exactly as readily as a "certain" one, because the proof that follows is
+    # stronger evidence than the recognizer could ever be.
+    print(f"  - recognized as {result.pattern.value} ({result.confidence}), which is advisory")
     for e in proposal.evidence:
         print(f"  - {e}")
     print()

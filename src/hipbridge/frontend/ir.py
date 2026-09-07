@@ -97,7 +97,20 @@ class Recognition:
 
     facts: KernelFacts
     pattern: Pattern
-    confidence: str  # "certain" | "likely"
+    # "certain" | "likely". ADVISORY, and deliberately so: nothing branches on
+    # it and nothing should.
+    #
+    # The obvious use would be to refuse a substitution on a merely "likely"
+    # match. That is worse than it sounds. row_softmax.cu is `reduce_serial` at
+    # "likely" and its substitution passes 126/126 on device, so gating would
+    # reject a correct substitution on a weaker signal than the one already
+    # deciding: the float64 oracle. Recognition proposes, the oracle disposes,
+    # and a field that ranked proposals would be a second opinion competing with
+    # a proof.
+    #
+    # What it is for is telling a human how firm the structural read was, so it
+    # is printed everywhere the pattern is printed and used for nothing else.
+    confidence: str
     rationale: list[str] = field(default_factory=list)
 
     @property
