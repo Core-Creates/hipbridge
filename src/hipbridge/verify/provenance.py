@@ -130,6 +130,12 @@ CODE_PATHS = (
     "examples",
 )
 
+# This file is the reporting machinery, not the measured code. Including it made
+# the digest self-referential: editing how a report records its provenance
+# invalidated every report, even though not one measured number had moved, and
+# each round cost a 40-minute metered GPU run to restore green.
+DIGEST_EXCLUDE = frozenset({"provenance.py"})
+
 
 def code_digest(root: Path | None = None) -> str:
     """A hash of the code a measurement depends on, read off disk.
@@ -151,9 +157,18 @@ def code_digest(root: Path | None = None) -> str:
         if not target.exists():
             continue
         for f in sorted(target.rglob("*")):
+            if f.name in DIGEST_EXCLUDE:
+                continue
             if f.is_file() and f.suffix in {".py", ".cu", ".hip", ".cpp"}:
                 h.update(str(f.relative_to(base)).replace("\\", "/").encode())
-                h.update(f.read_bytes())
+                # Line endings are normalised, or the digest answers a question
+                # about checkouts rather than about code. A Windows working tree
+                # stores CRLF where git and a Linux runner store LF, so the same
+                # commit hashed differently on the two machines and every CI
+                # result read as stale the moment it was checked locally.
+                raw = f.read_bytes()
+                raw = raw.replace(bytes([13, 10]), bytes([10]))
+                h.update(raw.replace(bytes([13]), bytes([10])))
     return h.hexdigest()[:16]
 
 
@@ -225,6 +240,7 @@ def staleness(report: str) -> tuple[str, str]:
 
 __all__ = [
     "CODE_PATHS",
+    "DIGEST_EXCLUDE",
     "RESULTS_DIR",
     "code_digest",
     "commit",
