@@ -4,21 +4,29 @@
 //
 // Only one reduction here against LayerNorm's two, which is the whole reason
 // RMSNorm displaced it in LLM inference.
+
+// Element type comes from the driver, which defines HB_SCALAR for the run.
+// Loads and stores use it; the arithmetic in between is float, because a half
+// precision sum of a long row loses most of its mantissa and the point of this
+// kernel is to be a fair reference, not a fast one.
+#ifndef HB_SCALAR
+#define HB_SCALAR float
+#endif
 #define HB_TILE 256
 
-__global__ void rms_norm_tuned(const float *in, float *out, int rows, int cols) {
+__global__ void rms_norm_tuned(const HB_SCALAR *in, HB_SCALAR *out, int rows, int cols) {
     __shared__ float red[HB_TILE];
 
     int row = blockIdx.x;
     if (row >= rows) return;
 
-    const float *ri = in + (size_t)row * cols;
-    float *ro = out + (size_t)row * cols;
+    const HB_SCALAR *ri = in + (size_t)row * cols;
+    HB_SCALAR *ro = out + (size_t)row * cols;
     int t = threadIdx.x;
 
     float acc = 0.0f;
     for (int i = t; i < cols; i += HB_TILE) {
-        float v = ri[i];
+        float v = (float)ri[i];
         acc += v * v;
     }
     red[t] = acc;
@@ -31,5 +39,5 @@ __global__ void rms_norm_tuned(const float *in, float *out, int rows, int cols) 
     __syncthreads();
 
     for (int i = t; i < cols; i += HB_TILE)
-        ro[i] = ri[i] * inv;
+        ro[i] = (HB_SCALAR)((float)ri[i] * inv);
 }

@@ -8,23 +8,31 @@
 //
 // One row is one position, cols is the head dimension, and the tables hold
 // cols/2 angles per row. (in, cos_tab, sin_tab, out, rows, cols).
-__global__ void rope(const float *in, const float *cos_tab, const float *sin_tab,
-                     float *out, int rows, int cols) {
+
+// Element type comes from the driver, which defines HB_SCALAR for the run.
+// Loads and stores use it; the arithmetic in between is float, because a half
+// precision sum of a long row loses most of its mantissa and the point of this
+// kernel is to be a fair reference, not a fast one.
+#ifndef HB_SCALAR
+#define HB_SCALAR float
+#endif
+__global__ void rope(const HB_SCALAR *in, const HB_SCALAR *cos_tab, const HB_SCALAR *sin_tab,
+                     HB_SCALAR *out, int rows, int cols) {
     int row = blockIdx.x;
     if (row >= rows) return;
 
     int half = cols / 2;
-    const float *ri = in + (size_t)row * cols;
-    float *ro = out + (size_t)row * cols;
-    const float *rc = cos_tab + (size_t)row * half;
-    const float *rs = sin_tab + (size_t)row * half;
+    const HB_SCALAR *ri = in + (size_t)row * cols;
+    HB_SCALAR *ro = out + (size_t)row * cols;
+    const HB_SCALAR *rc = cos_tab + (size_t)row * half;
+    const HB_SCALAR *rs = sin_tab + (size_t)row * half;
 
     for (int i = 0; i < half; i++) {
-        float x0 = ri[2 * i];
-        float x1 = ri[2 * i + 1];
-        float c = rc[i];
-        float s = rs[i];
-        ro[2 * i] = x0 * c - x1 * s;
-        ro[2 * i + 1] = x0 * s + x1 * c;
+        float x0 = (float)ri[2 * i];
+        float x1 = (float)ri[2 * i + 1];
+        float c = (float)rc[i];
+        float s = (float)rs[i];
+        ro[2 * i] = (HB_SCALAR)(x0 * c - x1 * s);
+        ro[2 * i + 1] = (HB_SCALAR)(x0 * s + x1 * c);
     }
 }

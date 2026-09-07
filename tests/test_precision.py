@@ -131,22 +131,72 @@ def test_a_dropped_stability_pass_is_caught_in_every_precision(torch_, name):
     assert not run(Distribution.LARGE).ok, f"{name}: large inputs must expose it"
 
 
-def test_the_native_reference_says_it_cannot_read_half(torch_):
-    """A driver reading 4-byte floats handed fp16 would compare noise.
+@pytest.mark.parametrize(
+    ("name", "toolchain", "scalar", "header"),
+    [
+        ("float32", "hipcc", "float", ""),
+        ("float16", "hipcc", "__half", "hip_fp16.h"),
+        ("bfloat16", "hipcc", "__hip_bfloat16", "hip_bf16.h"),
+        ("float16", "nvcc", "__half", "cuda_fp16.h"),
+        ("bfloat16", "nvcc", "__nv_bfloat16", "cuda_bf16.h"),
+    ],
+)
+def test_the_driver_is_templated_on_the_element_type(name, toolchain, scalar, header):
+    """Each vendor spells half precision differently, and both must compile."""
+    from hipbridge.verify.reference import scalar_tokens
 
-    Two half values would be reinterpreted as one float and measured against a
-    correct answer, producing a failure report that says nothing true about the
-    kernel. Refusing with the reason is the only honest option until the driver
-    and the example kernels are templated on the element type.
-    """
+    tokens = scalar_tokens(name, toolchain)
+
+    assert tokens["scalar"] == scalar
+    assert header in tokens["scalar_header"]
+    if name != "float32":
+        assert tokens["from_float"].startswith("__float2"), "the sentinel needs converting"
+
+
+def test_an_unsupported_element_type_says_so():
+    from hipbridge.verify.reference import scalar_tokens
+
+    with pytest.raises(TypeError, match="no driver support"):
+        scalar_tokens("float8_e4m3fn", "hipcc")
+
+
+@pytest.mark.parametrize("name", [*HALF, "float32"])
+def test_the_generated_source_declares_the_right_scalar(torch_, name):
+    """The kernel sees HB_SCALAR, so one .cu compiles for every precision."""
     from hipbridge import verify
     from hipbridge.verify.suites import ROW_SOFTMAX
 
     ref = verify.NativeReference(
-        source="__global__ void row_softmax(const float*, float*, int, int) {}",
+        source="__global__ void row_softmax(const HB_SCALAR*, HB_SCALAR*, int, int) {}",
         launch=ROW_SOFTMAX.launch,
         toolchain="hipcc",
     )
+    ref._n_inputs, ref._n_scalars = 1, 2
+    ref._dtype_name = name
 
-    with pytest.raises(TypeError, match="float32-only"):
-        ref(torch_.zeros((2, 4), dtype=torch_.float16))
+    src = ref._render_driver()
+    scalar = {"float32": "float", "float16": "__half", "bfloat16": "__hip_bfloat16"}[name]
+
+    assert f"typedef {scalar} SCALAR;" in src
+    assert "#define HB_SCALAR SCALAR" in src
+    assert "sizeof(SCALAR)" in src, "buffers must be sized by the element type"
+    assert "sizeof(float)" not in src, "no float-sized allocation should survive"
+
+
+@pytest.mark.parametrize("name", [*HALF, "float32"])
+def test_tensors_survive_the_round_trip_to_bytes(torch_, name):
+    """The bytes the driver reads are exactly the bytes torch wrote.
+
+    numpy has no bfloat16, so that type crosses through an int16 view. The bits
+    are the point; reinterpreting them costs nothing.
+    """
+    from hipbridge.verify.reference import _from_bytes, _to_bytes
+
+    dtype = getattr(torch_, name)
+    t = torch_.arange(12, dtype=torch_.float32).reshape(3, 4).to(dtype)
+
+    back = _from_bytes(_to_bytes(t), dtype).reshape(3, 4)
+
+    assert back.dtype is dtype
+    assert torch_.equal(back, t)
+    assert len(_to_bytes(t)) == t.numel() * t.element_size()
