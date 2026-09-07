@@ -59,6 +59,11 @@ class KernelFacts:
     loops: int = 0
     has_halving_stride: bool = False
     shared_accumulations: int = 0
+    # A halving-stride loop that touches shared memory. Distinct from
+    # shared_accumulations because a tree reduction does not have to combine
+    # with `+=`: taking a maximum, or rescaling a running sum onto a new
+    # maximum, is spelled as a plain assignment and is no less a tree.
+    shared_in_halving_loop: bool = False
     scalar_accumulations: int = 0
     shuffle_intrinsics: list[str] = field(default_factory=list)
     atomics: list[str] = field(default_factory=list)
