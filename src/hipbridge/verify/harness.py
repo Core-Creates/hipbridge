@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 
@@ -162,6 +163,11 @@ class Harness:
     # tensor, handed to candidate, reference and oracle in order after it.
     # Empty by default: a single-input kernel behaves exactly as before.
     extras: Sequence[Callable[[InputSpec], InputSpec]] = ()
+    # Precisions to sweep. float32 alone by default, because that is what the
+    # native driver reads and what every shipped example kernel declares.
+    # Inference runs in half precision, so a candidate meant for it should be
+    # swept in half precision, judged against the same float64 oracle.
+    dtypes: Sequence[Any] = ()
 
     def extra_inputs(self, spec: InputSpec) -> list[InputSpec]:
         return [make(spec) for make in self.extras]
@@ -251,14 +257,23 @@ class Harness:
 
         summary = Summary(self.name)
         n = 0
+        sweep = self.dtypes or (torch.float32,)
         for shape in shapes:
             for dist in self.distributions:
-                if limit is not None and n >= limit:
-                    return summary
-                summary.results.append(
-                    self._one(InputSpec(shape=tuple(shape), distribution=dist, seed=n))
-                )
-                n += 1
+                for dtype in sweep:
+                    if limit is not None and n >= limit:
+                        return summary
+                    summary.results.append(
+                        self._one(
+                            InputSpec(
+                                shape=tuple(shape),
+                                dtype=dtype,
+                                distribution=dist,
+                                seed=n,
+                            )
+                        )
+                    )
+                    n += 1
         return summary
 
 

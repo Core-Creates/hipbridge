@@ -36,13 +36,16 @@ def _rope_kernel(
     mask = i < half
 
     # Interleaved pairs: channel 2i and 2i+1 rotate together.
-    x0 = tl.load(in_ptr + row * in_row_stride + 2 * i, mask=mask, other=0.0)
-    x1 = tl.load(in_ptr + row * in_row_stride + 2 * i + 1, mask=mask, other=0.0)
-    c = tl.load(cos_ptr + row * tab_row_stride + i, mask=mask, other=1.0)
-    s = tl.load(sin_ptr + row * tab_row_stride + i, mask=mask, other=0.0)
+    # Rotate in float32 even when the data is half: the products cancel, and a
+    # cancellation evaluated in fp16 loses bits that were never recoverable.
+    x0 = tl.load(in_ptr + row * in_row_stride + 2 * i, mask=mask, other=0.0).to(tl.float32)
+    x1 = tl.load(in_ptr + row * in_row_stride + 2 * i + 1, mask=mask, other=0.0).to(tl.float32)
+    c = tl.load(cos_ptr + row * tab_row_stride + i, mask=mask, other=1.0).to(tl.float32)
+    s = tl.load(sin_ptr + row * tab_row_stride + i, mask=mask, other=0.0).to(tl.float32)
 
-    tl.store(out_ptr + row * out_row_stride + 2 * i, x0 * c - x1 * s, mask=mask)
-    tl.store(out_ptr + row * out_row_stride + 2 * i + 1, x0 * s + x1 * c, mask=mask)
+    out_ty = out_ptr.dtype.element_ty
+    tl.store(out_ptr + row * out_row_stride + 2 * i, (x0 * c - x1 * s).to(out_ty), mask=mask)
+    tl.store(out_ptr + row * out_row_stride + 2 * i + 1, (x0 * s + x1 * c).to(out_ty), mask=mask)
 
 
 def rope_rowwise(x, cos_tab, sin_tab):

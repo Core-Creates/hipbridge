@@ -61,7 +61,11 @@ def generate(spec: InputSpec, device: str = "cpu") -> torch.Tensor:
     elif d is Distribution.LARGE:
         t = torch.randn(shape, generator=g) * 100.0
     elif d is Distribution.TINY:
-        t = torch.randn(shape, generator=g) * 1e-30
+        # Scaled to the working precision rather than fixed at 1e-30, which is
+        # far below what half precision can represent: in fp16 every value would
+        # flush to zero and the case would silently stop testing anything. This
+        # lands just above the smallest normal for the dtype in use.
+        t = torch.randn(shape, generator=g) * (torch.finfo(spec.dtype).tiny * 16)
     elif d is Distribution.MIXED_SIGN:
         t = torch.randn(shape, generator=g)
         t[t.abs() < 0.5] = 0.0
