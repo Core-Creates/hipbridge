@@ -19,11 +19,8 @@ pytestmark = pytest.mark.skipif(not available(), reason="[verify] extra not inst
 def _propose(examples, name):
     from hipbridge.verify import substitutions
 
-    kernels = parse_file(examples / name)
-    facts = kernels[0]
-    result = recognize(facts)
-    source = (examples / name).read_text(encoding="utf-8")
-    return substitutions.propose(source, facts, result.pattern), facts
+    facts = parse_file(examples / name)[0]
+    return substitutions.propose(facts, recognize(facts).pattern), facts
 
 
 def test_a_naive_softmax_is_proposed(examples):
@@ -91,8 +88,11 @@ def test_layer_norm_and_rms_norm_are_not_confused(examples):
 
     assert ln is not None and ln.name == "layer_norm"
     assert rn is not None and rn.name == "rms_norm"
-    assert any("centres" in e for e in ln.evidence)
-    assert any("never subtracts a mean" in e for e in rn.evidence)
+    assert any("separates it from RMSNorm" in e for e in ln.evidence)
+    assert any("never centres" in e for e in rn.evidence)
+    assert any("reduces 2 quantities" in e for e in ln.evidence), (
+        "the count is the structural difference, so it belongs in the evidence"
+    )
 
 
 def test_the_tuned_norms_map_to_the_same_substitutes(examples):
@@ -106,22 +106,71 @@ def test_the_tuned_norms_map_to_the_same_substitutes(examples):
         assert proposal.name == expected
 
 
-def test_comments_are_not_evidence():
-    """A kernel was once refused because of a word in its own documentation.
+def test_comments_and_formatting_cannot_reach_the_decision():
+    """Evidence is now read off the parser, so prose is structurally excluded.
 
-    rms_norm.cu says in a comment that it "skips the mean entirely", and the
-    LayerNorm test excluded anything mentioning a mean, so the correct kernel
-    was rejected by its own prose. The reverse is worse: a comment must never
-    be able to talk the tool into proposing a substitution.
-    """
-    from hipbridge.verify.substitutions import strip_comments
+    This test used to check that comments were stripped before matching. The
+    stripping worked and the approach did not: three separate regressions came
+    from text that had nothing to do with the maths, including a kernel refused
+    because its own comment said "skips the mean entirely" and a sum-of-squares
+    pattern broken by an added cast.
 
-    src = """
-    // this comment mentions mean, expf and fmaxf to be difficult
-    /* so does this block comment: mean expf fmaxf */
-    __global__ void k(const float *in, float *out, int r, int c) { out[0] = in[0]; }
+    The dangerous direction is the one that never happened: a comment mentioning
+    expf talking the tool into proposing a softmax. It cannot now, because
+    comments are not part of a KernelFacts.
     """
-    stripped = strip_comments(src)
-    for word in ("mean", "expf", "fmaxf"):
-        assert word not in stripped, f"{word} survived from a comment"
-    assert "__global__" in stripped and "out[0] = in[0]" in stripped
+    from hipbridge.frontend.ir import KernelFacts, Param, Pattern
+    from hipbridge.verify import substitutions
+
+    def facts(**kw):
+        return KernelFacts(
+            name="k",
+            params=[
+                Param("in", "const float *", True, True),
+                Param("out", "float *", True, False),
+                Param("rows", "int", False, False),
+                Param("cols", "int", False, False),
+            ],
+            **kw,
+        )
+
+    # Says nothing, calls nothing: no proposal, whatever it claims in prose.
+    assert substitutions.propose(facts(), Pattern.REDUCE_SERIAL) is None
+
+    # Calls expf and a maximum: softmax, whatever it is named or commented.
+    proposal = substitutions.propose(
+        facts(calls=["expf", "fmaxf"], scalar_accumulations=1), Pattern.REDUCE_SERIAL
+    )
+    assert proposal is not None
+    assert proposal.name == "row_softmax"
+
+
+def test_the_norms_are_separated_by_how_many_quantities_they_reduce():
+    """LayerNorm needs a mean and a variance. RMSNorm needs one sum.
+
+    That holds however either is written, naively as scalar accumulations or in
+    a tuned version as the shared buffers a block reduction needs, so it does
+    not depend on a variable being called `mean`. A kernel using `mu` is judged
+    the same as one that does not.
+    """
+    from hipbridge.frontend.ir import KernelFacts, Param, Pattern
+    from hipbridge.verify import substitutions
+
+    def facts(**kw):
+        return KernelFacts(
+            name="k",
+            params=[
+                Param("in", "const float *", True, True),
+                Param("out", "float *", True, False),
+                Param("rows", "int", False, False),
+                Param("cols", "int", False, False),
+            ],
+            calls=["rsqrtf"],
+            **kw,
+        )
+
+    two = substitutions.propose(facts(scalar_accumulations=2), Pattern.REDUCE_SERIAL)
+    one = substitutions.propose(facts(scalar_accumulations=1), Pattern.REDUCE_SERIAL)
+
+    assert two is not None and two.name == "layer_norm"
+    assert one is not None and one.name == "rms_norm"

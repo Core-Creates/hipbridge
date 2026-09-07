@@ -8,19 +8,37 @@ the computation, not the maths.
 
 So a proposal needs two things the recognizer does not supply:
 
-  1. corroborating evidence in the source, spelled out per substitution below,
-     narrow enough that the guess is defensible
+  1. corroborating evidence, spelled out per substitution below, narrow enough
+     that the guess is defensible
   2. a numeric proof, which is the part that actually makes it safe
 
 Only the second one is load bearing. The evidence decides what to try; the
 harness decides whether it was right, by compiling the caller's own kernel and
 comparing both against a float64 oracle on device. A wrong guess fails there and
 is reported as a failure, never as a substitution.
+
+## Evidence comes from the parser, not from the source text
+
+It used to be regular expressions over the .cu file, and that broke three times
+in one week, every time on something that had nothing to do with the maths:
+
+  - `rms_norm.cu` explained in a comment that it "skips the mean entirely", and
+    the LayerNorm test excluded anything mentioning a mean, so the correct
+    kernel was refused by its own documentation
+  - making the kernels element-type generic turned `ri[i] * ri[i]` into
+    `(float)ri[i] * (float)ri[i]`, and the sum-of-squares pattern stopped
+    recognising RMSNorm
+  - a test asserting the CI workflow has no schedule failed on the comment
+    explaining why it has no schedule
+
+The dangerous direction is the one that did not happen yet: a comment
+mentioning expf talking this into proposing a softmax for a kernel that computes
+nothing of the kind. Everything below now reads `KernelFacts`, so comments,
+casts, whitespace and variable names cannot reach the decision at all.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, replace
 
 from hipbridge.frontend.ir import KernelFacts, Pattern
@@ -33,6 +51,11 @@ from hipbridge.verify.suites import (
     ROW_SOFTMAX,
     Suite,
 )
+
+# Spellings of the same operation across dialects and precisions.
+_EXP = {"exp", "expf", "__expf", "exp2f", "hexp"}
+_MAX = {"max", "fmax", "fmaxf", "fmaxf16", "hmax"}
+_RSQRT = {"rsqrt", "rsqrtf", "sqrt", "sqrtf", "hrsqrt", "__frsqrt_rn"}
 
 
 @dataclass(frozen=True)
@@ -47,92 +70,93 @@ class Proposal:
         return self.suite.name
 
 
-def strip_comments(source: str) -> str:
-    """Code only. Comments are prose and must not be treated as evidence.
+def _calls_any(facts: KernelFacts, names: set[str]) -> bool:
+    return any(c in names for c in facts.calls)
 
-    Found the hard way: rms_norm.cu explains in a comment that it "skips the
-    mean entirely", and the LayerNorm test excluded it for containing the word
-    mean, so the correct kernel was refused by its own documentation. The same
-    hole runs the other way and matters more: a comment mentioning expf could
-    talk this into proposing a softmax for a kernel that computes nothing of the
-    kind. Evidence has to come from what the kernel does.
+
+def _reduced_quantities(facts: KernelFacts) -> int:
+    """How many separate quantities the kernel reduces over the row.
+
+    LayerNorm needs two, a mean and a variance. RMSNorm needs one. That holds
+    however either is written: naively they show up as scalar accumulations, and
+    in a tuned version as the shared buffers a block reduction needs. Counting
+    them is what separates the two without asking whether a variable happens to
+    be called `mean`, and a kernel using `mu` is judged the same as one that
+    does not.
     """
-    source = re.sub(r"/\*.*?\*/", " ", source, flags=re.DOTALL)
-    return re.sub(r"//[^\n]*", " ", source)
+    return max(facts.scalar_accumulations, len(facts.shared))
 
 
-def _looks_like_softmax(source: str, facts: KernelFacts) -> list[str] | None:
-    """Softmax has a signature no other row-wise reduction shares.
+def _looks_like_softmax(facts: KernelFacts) -> list[str] | None:
+    """Exponentiation plus a maximum. No other row-wise reduction has both.
 
-    Exponentiation, a maximum for numerical stability, and a division by the
-    accumulated total. A row sum has the third and not the first two. Requiring
-    all three is what keeps this from claiming every reduction it meets.
+    A row sum has neither, a LayerNorm has neither, and a logsumexp has both and
+    would be proposed here, tried, and rejected by the oracle. That is the
+    intended division of labour.
     """
-    evidence = []
-    if not re.search(r"\bexpf?\s*\(", source):
+    if not _calls_any(facts, _EXP):
         return None
-    evidence.append("calls expf, so it is not a plain sum")
-    if not re.search(r"\bfmaxf?\s*\(|\bmax\s*\(", source):
-        return None
-    evidence.append("takes a maximum, the usual stability pass")
-    if not re.search(r"/=|/\s*\w*(sum|total|s)\b", source):
-        return None
-    evidence.append("divides by an accumulated total")
-
-    return evidence
-
-
-def _normalises_by_scale(source: str) -> bool:
-    """Divides by a root of an accumulated quantity, however it is spelled."""
-    return bool(re.search(r"\brsqrtf?\s*\(|\bsqrtf?\s*\(|\brsqrt\b", source))
-
-
-def _looks_like_layer_norm(source: str, facts: KernelFacts) -> list[str] | None:
-    """LayerNorm centres before it scales. That is what separates it from RMSNorm.
-
-    Two accumulations and a subtraction of the first from every element, then a
-    reciprocal square root. RMSNorm has the scale and not the centring, which is
-    the whole difference between them and the one that must not be confused:
-    substituting RMSNorm for LayerNorm changes the output of every non-zero-mean
-    row, silently.
-    """
-    if not _normalises_by_scale(source):
-        return None
-    if not re.search(r"\bmean\b", source):
-        return None
-    # A deviation from the mean, spelled as a subtraction of it.
-    if not re.search(r"-\s*mean\b", source):
-        return None
-    if facts.scalar_accumulations + facts.shared_accumulations < 2:
+    if not _calls_any(facts, _MAX):
         return None
     return [
-        "computes a mean and subtracts it, so it centres before scaling",
-        "scales by a reciprocal square root of an accumulated quantity",
-        f"{facts.scalar_accumulations + facts.shared_accumulations} accumulations, "
-        "consistent with a mean pass and a variance pass",
+        f"calls {', '.join(c for c in facts.calls if c in _EXP)}, so it is not a plain sum",
+        f"calls {', '.join(c for c in facts.calls if c in _MAX)}, the usual stability pass",
     ]
 
 
-def _looks_like_rms_norm(source: str, facts: KernelFacts) -> list[str] | None:
-    """RMSNorm scales by the root mean square and never centres."""
-    if not _normalises_by_scale(source):
+def _looks_like_layer_norm(facts: KernelFacts) -> list[str] | None:
+    """Scales by a reciprocal square root, and reduces two quantities."""
+    if _calls_any(facts, _EXP):
+        return None  # exponentiating makes it a softmax, not a normalisation
+    if not _calls_any(facts, _RSQRT):
         return None
-    if re.search(r"-\s*mean\b|\bmean\b", source):
-        return None  # centring means it is LayerNorm, not RMSNorm
-    # A sum of squares: the same value multiplied by itself into an accumulator.
-    #
-    # The optional cast is not decoration. When the example kernels became
-    # element-type generic they came to read `(float)ri[i] * (float)ri[i]`, and
-    # a pattern assuming a bare identifier stopped recognising the very kernel
-    # it was written for. Textual evidence breaks on formatting that has nothing
-    # to do with the maths, which is the argument in #19.
-    cast = r"(?:\([^)]*\)\s*)?"
-    if not re.search(rf"(\w+)\s*\*\s*{cast}\1|\[i\]\s*\*\s*{cast}\w*\[i\]", source):
+    n = _reduced_quantities(facts)
+    if n < 2:
         return None
     return [
-        "accumulates squares and never subtracts a mean",
-        "scales by a reciprocal square root of that accumulation",
-        "no centring pass, which is what separates RMSNorm from LayerNorm",
+        "scales by a reciprocal square root of an accumulated quantity",
+        f"reduces {n} quantities over the row, consistent with a mean and a variance",
+        "centres before scaling, which is what separates it from RMSNorm",
+    ]
+
+
+def _looks_like_rms_norm(facts: KernelFacts) -> list[str] | None:
+    """Scales by a root mean square, reducing one quantity and never centring.
+
+    The confusion that must not happen: substituting RMSNorm for LayerNorm
+    changes the output of every row whose mean is not zero, silently. One
+    reduced quantity against two is the structural difference between them.
+    """
+    if _calls_any(facts, _EXP):
+        return None
+    if not _calls_any(facts, _RSQRT):
+        return None
+    if _reduced_quantities(facts) != 1:
+        return None
+    return [
+        "scales by a reciprocal square root of an accumulated quantity",
+        "reduces exactly one quantity, so it never centres",
+        "no mean pass, which is what separates RMSNorm from LayerNorm",
+    ]
+
+
+def _looks_like_rope(facts: KernelFacts) -> list[str] | None:
+    """A per-position map that accumulates nothing and scales by nothing.
+
+    RoPE cannot be identified by what it accumulates, because it accumulates
+    nothing, and the pattern gate has already established that. What remains is
+    the absence of the operations that would make it something else: no
+    exponential, no reciprocal square root, no reduction. Combined with the
+    signature check it is narrow enough to try, and the oracle settles it.
+    """
+    if _calls_any(facts, _EXP) or _calls_any(facts, _RSQRT):
+        return None
+    if facts.scalar_accumulations or facts.shared_accumulations:
+        return None
+    return [
+        "accumulates nothing across the row, so it is a map and not a reduction",
+        "calls neither an exponential nor a reciprocal square root",
+        "takes per-position tables alongside the tensor it transforms",
     ]
 
 
@@ -160,8 +184,6 @@ def operand_mismatch(suite: Suite, facts: KernelFacts) -> str | None:
     for i, (operand, name) in enumerate(zip(suite.extras, got, strict=True)):
         if operand.matches(name):
             continue
-        # Does it belong to a different position? That is a swap, not a
-        # vocabulary difference, and it is the dangerous case.
         for j, other in enumerate(suite.extras):
             if j != i and other.matches(name):
                 return (
@@ -170,31 +192,6 @@ def operand_mismatch(suite: Suite, facts: KernelFacts) -> str | None:
                     f"different order than `{'`, `'.join(o.name for o in suite.extras)}`"
                 )
     return None
-
-
-def _looks_like_rope(source: str, facts: KernelFacts) -> list[str] | None:
-    """A rotation of adjacent channel pairs by a per-position angle.
-
-    RoPE is not a reduction and cannot be identified by what it accumulates,
-    because it accumulates nothing. What identifies it is the shape of the
-    arithmetic: channels are read in pairs at stride two, and the two outputs
-    are a difference and a sum of the same two products. Getting the sign wrong
-    swaps a rotation for its mirror image, which is why both are required rather
-    than either.
-    """
-    if not re.search(r"2\s*\*\s*\w+|\w+\s*\*\s*2", source):
-        return None
-    difference = re.search(r"\w+\s*\*\s*\w+\s*-\s*\w+\s*\*\s*\w+", source)
-    total = re.search(r"\w+\s*\*\s*\w+\s*\+\s*\w+\s*\*\s*\w+", source)
-    if not (difference and total):
-        return None
-    if facts.scalar_accumulations or facts.shared_accumulations:
-        return None
-    return [
-        "indexes channels in pairs at stride two",
-        "writes a difference and a sum of the same two products, which is a rotation",
-        "accumulates nothing across the row, so it is a map and not a reduction",
-    ]
 
 
 # Patterns a row-wise reduction can legitimately be written as. Serial is the
@@ -207,7 +204,6 @@ _MAP_PATTERNS = (Pattern.ROW_MAP,)
 
 
 def propose(
-    source: str,
     facts: KernelFacts,
     pattern: Pattern,
     notes: list[str] | None = None,
@@ -215,17 +211,13 @@ def propose(
     """The substitute to try for this kernel, or None to decline.
 
     Declining is a first-class outcome. `port` reports UNKNOWN and stops rather
-    than reaching for the nearest kernel it happens to own. Order matters only
-    in that each test is exclusive of the others: softmax exponentiates,
-    LayerNorm centres, RMSNorm does neither, and a kernel matching none of them
-    gets no proposal at all.
+    than reaching for the nearest kernel it happens to own.
 
     Pass `notes` to collect the reasons a near miss was declined. A kernel that
     matched every test but wired its weights in another order is the case worth
     explaining, because "no substitution proposed" would send someone hunting
     for a missing feature rather than reading their own signature.
     """
-    source = strip_comments(source)
     scalars = [p for p in facts.params if not p.is_pointer]
 
     # Each substitute declares the shapes its maths can legitimately take. RoPE
@@ -242,7 +234,7 @@ def propose(
     ):
         if pattern not in patterns:
             continue
-        evidence = test(source, facts)
+        evidence = test(facts)
         if not evidence:
             continue
 
@@ -300,4 +292,10 @@ def reference_launch(suite: Suite, facts: KernelFacts, block: tuple[int, int, in
     return replace(suite.launch, kernel=facts.name, block=block or infer_block(facts))
 
 
-__all__ = ["Proposal", "infer_block", "propose", "reference_launch", "strip_comments"]
+__all__ = [
+    "Proposal",
+    "infer_block",
+    "operand_mismatch",
+    "propose",
+    "reference_launch",
+]
