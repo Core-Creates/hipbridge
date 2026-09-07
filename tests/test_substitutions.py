@@ -76,3 +76,52 @@ def test_launch_geometry_comes_from_the_kernel_not_the_suite(examples):
 
     override = substitutions.reference_launch(ROW_SOFTMAX, tuned, (64, 1, 1))
     assert override.block == (64, 1, 1), "--block has to win over inference"
+
+
+def test_layer_norm_and_rms_norm_are_not_confused(examples):
+    """The one confusion that would corrupt data silently.
+
+    RMSNorm scales without centring. Substituting it for LayerNorm changes the
+    output of every row whose mean is not zero, and nothing about the shape of
+    the two kernels distinguishes them: both are row-wise reductions ending in a
+    reciprocal square root.
+    """
+    ln, _ = _propose(examples, "layer_norm.cu")
+    rn, _ = _propose(examples, "rms_norm.cu")
+
+    assert ln is not None and ln.name == "layer_norm"
+    assert rn is not None and rn.name == "rms_norm"
+    assert any("centres" in e for e in ln.evidence)
+    assert any("never subtracts a mean" in e for e in rn.evidence)
+
+
+def test_the_tuned_norms_map_to_the_same_substitutes(examples):
+    """Written well or written naively, it is still the same maths."""
+    for name, expected in (
+        ("layer_norm_tuned.cu", "layer_norm"),
+        ("rms_norm_tuned.cu", "rms_norm"),
+    ):
+        proposal, _ = _propose(examples, name)
+        assert proposal is not None, f"{name} should be recognized as {expected}"
+        assert proposal.name == expected
+
+
+def test_comments_are_not_evidence():
+    """A kernel was once refused because of a word in its own documentation.
+
+    rms_norm.cu says in a comment that it "skips the mean entirely", and the
+    LayerNorm test excluded anything mentioning a mean, so the correct kernel
+    was rejected by its own prose. The reverse is worse: a comment must never
+    be able to talk the tool into proposing a substitution.
+    """
+    from hipbridge.verify.substitutions import strip_comments
+
+    src = """
+    // this comment mentions mean, expf and fmaxf to be difficult
+    /* so does this block comment: mean expf fmaxf */
+    __global__ void k(const float *in, float *out, int r, int c) { out[0] = in[0]; }
+    """
+    stripped = strip_comments(src)
+    for word in ("mean", "expf", "fmaxf"):
+        assert word not in stripped, f"{word} survived from a comment"
+    assert "__global__" in stripped and "out[0] = in[0]" in stripped

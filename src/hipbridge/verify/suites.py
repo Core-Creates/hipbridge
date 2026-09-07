@@ -100,7 +100,94 @@ ROW_SOFTMAX = Suite(
     ),
 )
 
-BUILTIN: tuple[Suite, ...] = (ROW_SOFTMAX,)
+
+def _norm_launch(kernel: str, block: tuple[int, int, int]) -> LaunchSpec:
+    """LayerNorm and RMSNorm share softmax's launch shape: one block per row."""
+    return LaunchSpec(
+        kernel=kernel,
+        grid=lambda s: (s[0][0], 1, 1),
+        block=block,
+        scalar_args=lambda s: [s[0][0], s[0][1]],
+        out_shape=lambda s: s[0],
+    )
+
+
+def _torch_layer_norm(t: torch.Tensor) -> torch.Tensor:
+    """What a user would call instead of substituting anything.
+
+    F.layer_norm uses the biased variance and no affine terms when weight and
+    bias are omitted, which is exactly the maths under test. Kept in float32:
+    timing the oracle would compare a float64 implementation against float32
+    kernels and report a difference that is about precision, not about speed.
+    """
+    return torch.nn.functional.layer_norm(t, (t.shape[-1],), eps=1e-5)
+
+
+def _torch_rms_norm(t: torch.Tensor) -> torch.Tensor:
+    fn = getattr(torch.nn.functional, "rms_norm", None)
+    if fn is not None:
+        return fn(t, (t.shape[-1],), eps=1e-5)
+    # Older torch: the same maths, still float32.
+    return t * torch.rsqrt((t * t).mean(dim=-1, keepdim=True) + 1e-5)
+
+
+def _layer_norm_oracle(t: torch.Tensor) -> torch.Tensor:
+    """float64 LayerNorm, biased variance, no affine terms.
+
+    Biased because the kernels divide by n, not n-1. Matching the oracle to the
+    maths under test is the point; an oracle computing something adjacent would
+    make every case fail for a reason that has nothing to do with the kernel.
+    """
+    d = t.double()
+    mean = d.mean(dim=-1, keepdim=True)
+    centred = d - mean
+    var = (centred * centred).mean(dim=-1, keepdim=True)
+    return centred * torch.rsqrt(var + 1e-5)
+
+
+def _rms_norm_oracle(t: torch.Tensor) -> torch.Tensor:
+    d = t.double()
+    ms = (d * d).mean(dim=-1, keepdim=True)
+    return d * torch.rsqrt(ms + 1e-5)
+
+
+LAYER_NORM = Suite(
+    name="layer_norm",
+    source_file="layer_norm.cu",
+    kernel="layer_norm",
+    launch=_norm_launch("layer_norm", (1, 1, 1)),  # serial within the row
+    oracle=_layer_norm_oracle,
+    portable=_torch_layer_norm,
+    portable_name="torch",
+    shapes=_row_shapes,
+    baselines=(
+        Baseline(
+            name="tuned HIP",
+            source_file="layer_norm_tuned.cu",
+            launch=_norm_launch("layer_norm_tuned", (256, 1, 1)),
+        ),
+    ),
+)
+
+RMS_NORM = Suite(
+    name="rms_norm",
+    source_file="rms_norm.cu",
+    kernel="rms_norm",
+    launch=_norm_launch("rms_norm", (1, 1, 1)),
+    oracle=_rms_norm_oracle,
+    portable=_torch_rms_norm,
+    portable_name="torch",
+    shapes=_row_shapes,
+    baselines=(
+        Baseline(
+            name="tuned HIP",
+            source_file="rms_norm_tuned.cu",
+            launch=_norm_launch("rms_norm_tuned", (256, 1, 1)),
+        ),
+    ),
+)
+
+BUILTIN: tuple[Suite, ...] = (ROW_SOFTMAX, LAYER_NORM, RMS_NORM)
 
 
 def candidate_for(suite: Suite) -> tuple[Callable[[torch.Tensor], torch.Tensor], str]:
@@ -111,15 +198,40 @@ def candidate_for(suite: Suite) -> tuple[Callable[[torch.Tensor], torch.Tensor],
     a torch implementation so the suite still runs and still means something on a
     machine without Triton.
     """
-    if suite.name == "row_softmax":
-        from hipbridge import kernels
+    from hipbridge import kernels
 
-        if kernels.available():
+    have_triton = kernels.available()
+
+    if suite.name == "row_softmax":
+        if have_triton:
             from hipbridge.kernels.softmax import softmax_rowwise
 
             return softmax_rowwise, "hipbridge.kernels.softmax (Triton, AMD-tuned)"
         return (lambda t: torch.softmax(t, dim=-1)), "torch.softmax (Triton unavailable)"
+
+    if suite.name == "layer_norm":
+        if have_triton:
+            from hipbridge.kernels.norm import layer_norm_rowwise
+
+            return layer_norm_rowwise, "hipbridge.kernels.norm.layer_norm (Triton, AMD-tuned)"
+        return _torch_layer_norm, "torch.nn.functional.layer_norm (Triton unavailable)"
+
+    if suite.name == "rms_norm":
+        if have_triton:
+            from hipbridge.kernels.norm import rms_norm_rowwise
+
+            return rms_norm_rowwise, "hipbridge.kernels.norm.rms_norm (Triton, AMD-tuned)"
+        return _torch_rms_norm, "torch rms_norm (Triton unavailable)"
+
     raise KeyError(suite.name)
 
 
-__all__ = ["BUILTIN", "ROW_SOFTMAX", "Baseline", "Suite", "candidate_for"]
+__all__ = [
+    "BUILTIN",
+    "LAYER_NORM",
+    "RMS_NORM",
+    "ROW_SOFTMAX",
+    "Baseline",
+    "Suite",
+    "candidate_for",
+]

@@ -24,7 +24,7 @@ import re
 from dataclasses import dataclass, replace
 
 from hipbridge.frontend.ir import KernelFacts, Pattern
-from hipbridge.verify.suites import ROW_SOFTMAX, Suite
+from hipbridge.verify.suites import LAYER_NORM, RMS_NORM, ROW_SOFTMAX, Suite
 
 
 @dataclass(frozen=True)
@@ -37,6 +37,20 @@ class Proposal:
     @property
     def name(self) -> str:
         return self.suite.name
+
+
+def strip_comments(source: str) -> str:
+    """Code only. Comments are prose and must not be treated as evidence.
+
+    Found the hard way: rms_norm.cu explains in a comment that it "skips the
+    mean entirely", and the LayerNorm test excluded it for containing the word
+    mean, so the correct kernel was refused by its own documentation. The same
+    hole runs the other way and matters more: a comment mentioning expf could
+    talk this into proposing a softmax for a kernel that computes nothing of the
+    kind. Evidence has to come from what the kernel does.
+    """
+    source = re.sub(r"/\*.*?\*/", " ", source, flags=re.DOTALL)
+    return re.sub(r"//[^\n]*", " ", source)
 
 
 def _looks_like_softmax(source: str, facts: KernelFacts) -> list[str] | None:
@@ -57,35 +71,88 @@ def _looks_like_softmax(source: str, facts: KernelFacts) -> list[str] | None:
         return None
     evidence.append("divides by an accumulated total")
 
-    if len(facts.inputs) != 1 or len(facts.outputs) != 1:
-        return None
-    evidence.append(f"one input and one output pointer ({facts.name})")
-
-    scalars = [p for p in facts.params if not p.is_pointer]
-    if len(scalars) != 2:
-        return None
-    evidence.append(
-        f"two scalar arguments ({', '.join(p.name for p in scalars)}), read as rows/cols"
-    )
     return evidence
 
 
-# Patterns a row-wise softmax can legitimately be written as. Serial is the
+def _normalises_by_scale(source: str) -> bool:
+    """Divides by a root of an accumulated quantity, however it is spelled."""
+    return bool(re.search(r"\brsqrtf?\s*\(|\bsqrtf?\s*\(|\brsqrt\b", source))
+
+
+def _looks_like_layer_norm(source: str, facts: KernelFacts) -> list[str] | None:
+    """LayerNorm centres before it scales. That is what separates it from RMSNorm.
+
+    Two accumulations and a subtraction of the first from every element, then a
+    reciprocal square root. RMSNorm has the scale and not the centring, which is
+    the whole difference between them and the one that must not be confused:
+    substituting RMSNorm for LayerNorm changes the output of every non-zero-mean
+    row, silently.
+    """
+    if not _normalises_by_scale(source):
+        return None
+    if not re.search(r"\bmean\b", source):
+        return None
+    # A deviation from the mean, spelled as a subtraction of it.
+    if not re.search(r"-\s*mean\b", source):
+        return None
+    if facts.scalar_accumulations + facts.shared_accumulations < 2:
+        return None
+    return [
+        "computes a mean and subtracts it, so it centres before scaling",
+        "scales by a reciprocal square root of an accumulated quantity",
+        f"{facts.scalar_accumulations + facts.shared_accumulations} accumulations, "
+        "consistent with a mean pass and a variance pass",
+    ]
+
+
+def _looks_like_rms_norm(source: str, facts: KernelFacts) -> list[str] | None:
+    """RMSNorm scales by the root mean square and never centres."""
+    if not _normalises_by_scale(source):
+        return None
+    if re.search(r"-\s*mean\b|\bmean\b", source):
+        return None  # centring means it is LayerNorm, not RMSNorm
+    # A sum of squares: the same value multiplied by itself into an accumulator.
+    if not re.search(r"(\w+)\s*\*\s*\1|\[i\]\s*\*\s*\w*\[i\]", source):
+        return None
+    return [
+        "accumulates squares and never subtracts a mean",
+        "scales by a reciprocal square root of that accumulation",
+        "no centring pass, which is what separates RMSNorm from LayerNorm",
+    ]
+
+
+# Patterns a row-wise reduction can legitimately be written as. Serial is the
 # naive form; tree and shuffle are the competent ones. Anything else is not a
 # row-wise reduction at all and is refused before the evidence is examined.
-_SOFTMAX_PATTERNS = (Pattern.REDUCE_SERIAL, Pattern.REDUCE_TREE, Pattern.REDUCE_SHUFFLE)
+_ROW_PATTERNS = (Pattern.REDUCE_SERIAL, Pattern.REDUCE_TREE, Pattern.REDUCE_SHUFFLE)
 
 
 def propose(source: str, facts: KernelFacts, pattern: Pattern) -> Proposal | None:
     """The substitute to try for this kernel, or None to decline.
 
     Declining is a first-class outcome. `port` reports UNKNOWN and stops rather
-    than reaching for the nearest kernel it happens to own.
+    than reaching for the nearest kernel it happens to own. Order matters only
+    in that each test is exclusive of the others: softmax exponentiates,
+    LayerNorm centres, RMSNorm does neither, and a kernel matching none of them
+    gets no proposal at all.
     """
-    if pattern in _SOFTMAX_PATTERNS:
-        evidence = _looks_like_softmax(source, facts)
+    if pattern not in _ROW_PATTERNS:
+        return None
+
+    source = strip_comments(source)
+    for suite, test in (
+        (ROW_SOFTMAX, _looks_like_softmax),
+        (LAYER_NORM, _looks_like_layer_norm),
+        (RMS_NORM, _looks_like_rms_norm),
+    ):
+        evidence = test(source, facts)
         if evidence:
-            return Proposal(suite=ROW_SOFTMAX, evidence=evidence)
+            if len(facts.inputs) != 1 or len(facts.outputs) != 1:
+                continue
+            scalars = [p for p in facts.params if not p.is_pointer]
+            if len(scalars) != 2:
+                continue
+            return Proposal(suite=suite, evidence=evidence)
     return None
 
 
@@ -120,4 +187,4 @@ def reference_launch(suite: Suite, facts: KernelFacts, block: tuple[int, int, in
     return replace(suite.launch, kernel=facts.name, block=block or infer_block(facts))
 
 
-__all__ = ["Proposal", "propose", "reference_launch"]
+__all__ = ["Proposal", "infer_block", "propose", "reference_launch", "strip_comments"]
