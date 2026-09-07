@@ -74,3 +74,34 @@ def test_absolute_error_travels_with_the_ulp_count():
     assert "worst ulp=1776828265" in text
     assert "max abs 3.910e-05" in text
     assert s.worst_abs == pytest.approx(3.91e-05)
+
+
+def test_results_do_not_count_against_their_own_provenance(tmp_path, monkeypatch):
+    """Writing a report must not stamp the report -dirty.
+
+    The first run of this feature produced files headed `538007a-dirty` from a
+    pristine checkout, because the untracked results/ directory it had just
+    created was itself the only modification. A marker that is always on carries
+    no information.
+    """
+    from hipbridge.verify import provenance
+
+    def fake_run(cmd):
+        if cmd[:2] == ["git", "rev-parse"]:
+            return "abc1234"
+        if cmd[:2] == ["git", "status"]:
+            return "?? results/verify-hipcc-gfx942.md\n?? results/bench-hipcc-gfx942.md"
+        return ""
+
+    monkeypatch.setattr(provenance, "_run", fake_run)
+    assert provenance.commit() == "abc1234", "results/ must not mark the tree dirty"
+
+    def fake_run_real_change(cmd):
+        if cmd[:2] == ["git", "rev-parse"]:
+            return "abc1234"
+        if cmd[:2] == ["git", "status"]:
+            return " M src/hipbridge/verify/bench.py\n?? results/verify.md"
+        return ""
+
+    monkeypatch.setattr(provenance, "_run", fake_run_real_change)
+    assert provenance.commit() == "abc1234-dirty", "a real source change must still show"
