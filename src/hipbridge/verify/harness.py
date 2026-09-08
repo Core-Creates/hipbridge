@@ -103,10 +103,16 @@ class Summary:
         how much. "better=84" and a 1.02x edge read identically, so the margin
         is reported alongside them and comes from the same measurements.
         """
+        # Only cases the verdict actually called a win. The ratio is the tensor's
+        # aggregate margin while the verdict is decided per row, so a case can
+        # be closer overall and still be rejected for one row it got wrong.
+        # Quoting that as a win would advertise a margin off a failed case.
         wins = [
             r.arbitration.ratio
             for r in self.results
-            if r.arbitration and 0.0 < r.arbitration.ratio < 1.0
+            if r.arbitration
+            and r.arbitration.verdict == "better"
+            and 0.0 < r.arbitration.ratio < 1.0
         ]
         return 1.0 / min(wins) if wins else None
 
