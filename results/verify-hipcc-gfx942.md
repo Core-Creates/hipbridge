@@ -2,13 +2,14 @@
 
 | field | value |
 |---|---|
-| generated | 2026-09-07 20:56 UTC |
-| hipbridge | 0.1.0.dev0 at commit `e413170` |
+| generated | 2026-09-07 23:35 UTC |
+| hipbridge | 0.1.0.dev0 at commit `c2da609` |
 | host | 2 (Linux x86_64) |
 | device | AMD Radeon Graphics |
 | toolchain | hipcc, HIP version: 7.14.60850-0000000 |
 | arch | gfx942 |
 | torch | 2.9.1+rocm6.4 |
+| measured code | `7503dc7ace15d391` |
 
 ```
 PASS  row_softmax vs original on hipcc: 126/126 cases, worst ulp=35 (max abs 4.883e-04)  [accuracy vs original: equivalent=126, up to 16x closer to float64]
@@ -27,7 +28,7 @@ PASS  rms_norm vs original on hipcc: 126/126 cases, worst ulp=3 (max abs 4.768e-
 ```
 
 ```
-PASS  rms_norm_affine vs original on hipcc: 126/126 cases, worst ulp=3 (max abs 3.052e-05)  [accuracy vs original: equivalent=126, up to 2x closer to float64]
+PASS  rms_norm_affine vs original on hipcc: 126/126 cases, worst ulp=3 (max abs 3.052e-05)  [accuracy vs original: equivalent=126, up to 3x closer to float64]
 ```
 
 ```
