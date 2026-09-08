@@ -261,9 +261,11 @@ RMS_NORM = Suite(
 )
 
 
-def _layer_norm_affine_oracle(t: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor):
+def _layer_norm_affine_oracle(
+    t: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor, eps: float = DEFAULT_EPS
+):
     """float64 affine LayerNorm. Weights arrive as float64 too, from the harness."""
-    return _layer_norm_oracle(t) * gamma.double() + beta.double()
+    return _layer_norm_oracle(t, eps=eps) * gamma.double() + beta.double()
 
 
 def _torch_layer_norm_affine(

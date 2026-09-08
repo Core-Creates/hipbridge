@@ -169,3 +169,38 @@ def test_a_correct_kernel_is_no_longer_scored_worse_than_the_substitute():
         theirs = x * torch.rsqrt((x * x).mean(dim=-1, keepdim=True) + 1e-6)
         arb = compare.arbitrate(candidate(x), theirs, oracle(x.double()))
         assert arb.verdict == "equivalent", (distribution, arb)
+
+
+@needs_verify
+def test_every_epsilon_suite_can_actually_be_bound():
+    """The test that was missing when a metered run found the gap instead.
+
+    `oracle_for` binds eps with functools.partial, so an oracle that does not
+    take the argument raises TypeError at call time rather than at bind time.
+    Only `port` calls it, `_cmd_port` has no tests, and `verify` uses the
+    unbound oracle, so four of the five suites were exercised and the fifth was
+    not: `_layer_norm_affine_oracle` reached an MI300X without an eps parameter
+    and failed there with a raw traceback, 17 minutes into a paid run.
+
+    This calls every eps-carrying suite the way port does, on CPU, for free.
+    """
+    import torch
+
+    from hipbridge.verify import suites
+
+    bound = [s for s in suites.BUILTIN if s.uses_epsilon]
+    assert len(bound) == 5, [s.name for s in bound]
+
+    for suite in bound:
+        ins = suites.make_inputs(suite, suites.InputSpec((4, 8)))
+        doubles = tuple(t.double() for t in ins)
+
+        loose = suites.oracle_for(suite, 1e-5)(*doubles)
+        tight = suites.oracle_for(suite, 1e-9)(*doubles)
+        assert loose.shape == ins[0].shape, suite.name
+        # eps has to reach the arithmetic, not merely be accepted by the call.
+        assert not torch.equal(loose, tight), f"{suite.name}: oracle ignored eps"
+
+        candidate, described = suites.candidate_for(suite, 1e-6)
+        assert "eps=1e-06" in described, described
+        assert candidate(*ins).shape == ins[0].shape, suite.name
