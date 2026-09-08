@@ -241,6 +241,7 @@ def _cmd_bench(args) -> int:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     failed = False
     report_sections: list[str] = []
+    measurements: list[dict] = []
     if device != "cuda":
         print("WARNING: no GPU visible to torch, so the candidate runs on the host")
         print("         while the original runs on device. Ratios are suppressed as")
@@ -366,6 +367,18 @@ def _cmd_bench(args) -> int:
                     )
                 )
 
+            measurements.append(
+                {
+                    "suite": suite.name,
+                    "precision": precision,
+                    "candidate": described,
+                    "device": device,
+                    "reps": args.reps,
+                    "runs": args.runs,
+                    "rows": [r.as_dict() for r in rows],
+                }
+            )
+
             table = bench.render(rows)
             print(f"  dtype: {precision}")
             print(table)
@@ -400,6 +413,14 @@ def _cmd_bench(args) -> int:
         )
         print(f"\nreport written to {written}")
 
+    _record(
+        args,
+        toolchain=args.toolchain,
+        arch=args.arch or None,
+        device=device,
+        shapes=[list(sh) for sh in shapes],
+        measurements=measurements,
+    )
     return EXIT_REJECTED if failed else EXIT_OK
 
 
@@ -777,6 +798,11 @@ def main(argv: list[str] | None = None) -> int:
         help="write a markdown report; bare flag saves under results/",
     )
     ben.add_argument("--require", action="store_true")
+    ben.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the result as JSON on stdout, in place of the prose tables",
+    )
     ben.set_defaults(fn=_cmd_bench)
 
     prt = sub.add_parser("port", help="recognize, substitute and prove, in one step")

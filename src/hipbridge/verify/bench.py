@@ -99,6 +99,22 @@ class Measurement:
     stat: Stat
     device: str = "unknown"
 
+    def as_dict(self) -> dict:
+        """Microseconds, which is what the table prints and what a reader compares.
+
+        The spread travels with the median rather than being summarised away: a
+        median that sits outside a wide min-max band is a measurement someone
+        should look at again before quoting it.
+        """
+        return {
+            "name": self.name,
+            "device": self.device,
+            "median_us": self.stat.median * 1000.0,
+            "min_us": self.stat.lo * 1000.0,
+            "max_us": self.stat.hi * 1000.0,
+            "runs": len(self.stat.runs),
+        }
+
 
 @dataclass
 class ShapeRow:
@@ -110,6 +126,27 @@ class ShapeRow:
     verified: bool = False
     latency_bound: bool = False
     notes: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict:
+        """A row of the printed table, with the ratios it computes for itself.
+
+        `verified` and `comparable` are the two facts that decide whether any of
+        these numbers may be quoted, so they are fields rather than something a
+        consumer has to reconstruct: a shape that failed verification is timed
+        but not a result, and a candidate that ran on the host is not comparable
+        to a baseline that ran on device.
+        """
+        return {
+            "shape": list(self.shape),
+            "elements": self.elements,
+            "verified": self.verified,
+            "comparable": self.comparable,
+            "latency_bound": self.latency_bound,
+            "notes": list(self.notes),
+            "candidate": self.candidate.as_dict(),
+            "baselines": [b.as_dict() for b in self.baselines],
+            "speedup": {b.name: self.speedup(b.name) for b in self.baselines},
+        }
 
     @property
     def comparable(self) -> bool:

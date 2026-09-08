@@ -176,3 +176,49 @@ def test_the_document_is_strict_json(capsys):
     assert cli._json_safe(float("nan")) is None
     assert cli._json_safe({"a": [1.0, float("-inf")]}) == {"a": [1.0, None]}
     assert cli._json_safe(2.5) == 2.5
+
+
+@needs_verify
+def test_bench_json_carries_the_envelope_even_with_nothing_to_time(capsys):
+    """A run that timed nothing still has to say what it was asked to do."""
+    code, payload = _run_json(capsys, ["bench", "--shapes", "4x64"])
+
+    assert code in (cli.EXIT_OK, cli.EXIT_REJECTED)
+    assert payload["shapes"] == [[4, 64]]
+    assert payload["toolchain"]
+    assert isinstance(payload["measurements"], list)
+
+
+@needs_verify
+def test_a_bench_row_reports_the_two_facts_that_gate_quoting_it():
+    """verified and comparable decide whether any of these numbers may be used.
+
+    A shape that failed verification was timed but is not a result. A candidate
+    that ran on the host is not comparable to a baseline that ran on device, and
+    the first version of this command cheerfully reported 3.6x for exactly that
+    mismatch. Both are fields rather than something a consumer reconstructs.
+    """
+    from hipbridge.verify import bench
+
+    fast = bench.Stat(runs=(0.002, 0.002, 0.002))
+    slow = bench.Stat(runs=(0.010, 0.010, 0.010))
+
+    on_device = bench.ShapeRow(
+        shape=(4, 64),
+        candidate=bench.Measurement("candidate", fast, "cuda"),
+        baselines=(bench.Measurement("original", slow, "cuda"),),
+        verified=True,
+    ).as_dict()
+    assert on_device["comparable"] is True
+    assert on_device["verified"] is True
+    assert on_device["speedup"]["original"] == pytest.approx(5.0)
+    assert on_device["candidate"]["median_us"] == pytest.approx(2.0)
+
+    on_host = bench.ShapeRow(
+        shape=(4, 64),
+        candidate=bench.Measurement("candidate", fast, "cpu"),
+        baselines=(bench.Measurement("original", slow, "cuda"),),
+        verified=True,
+    ).as_dict()
+    assert on_host["comparable"] is False
+    assert on_host["speedup"]["original"] is None, "a CPU-vs-GPU ratio was reported"
