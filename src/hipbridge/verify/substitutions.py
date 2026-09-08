@@ -65,6 +65,9 @@ class Proposal:
 
     suite: Suite
     evidence: list[str]
+    # The epsilon both the substitute and the oracle get built with, read off
+    # the caller's kernel. None for the suites whose maths has no epsilon.
+    epsilon: float | None = None
 
     @property
     def name(self) -> str:
@@ -208,11 +211,17 @@ def propose(
     facts: KernelFacts,
     pattern: Pattern,
     notes: list[str] | None = None,
+    epsilon: float | None = None,
 ) -> Proposal | None:
     """The substitute to try for this kernel, or None to decline.
 
     Declining is a first-class outcome. `port` reports UNKNOWN and stops rather
     than reaching for the nearest kernel it happens to own.
+
+    Pass `epsilon` to declare the constant a normalisation adds when the kernel
+    does not spell it as a literal the parser can read. It overrides whatever
+    was parsed, because a caller who knows their own kernel is better evidence
+    than an AST walk.
 
     Pass `notes` to collect the reasons a near miss was declined. A kernel that
     matched every test but wired its weights in another order is the case worth
@@ -261,10 +270,36 @@ def propose(
                 notes.append(f"{suite.name}: {problem}")
             continue
 
+        # An epsilon nobody could read is not a detail to default. Both the
+        # substitute and the float64 oracle are built from it, so assuming this
+        # project's constant rebuilds the truth around the wrong number: a
+        # kernel correctly written with 1e-6 was scored the less accurate side
+        # on every case, while the substitution moved its output by 68% on tiny
+        # inputs and the report called that a 3.2e7x accuracy win.
+        eps = epsilon if epsilon is not None else facts.epsilon
+        if suite.uses_epsilon and eps is None:
+            if notes is not None:
+                notes.append(
+                    f"{suite.name}: normalises by rsqrt(scale + eps), but no epsilon "
+                    "literal could be read from the kernel, and substituting with an "
+                    "assumed one changes every element. Declare it with --eps."
+                )
+            continue
+
         if suite.extras:
             names = ", ".join(p.name for p in facts.inputs[1:])
             evidence = [*evidence, f"takes {len(suite.extras)} weight tensors ({names})"]
-        return Proposal(suite=suite, evidence=evidence)
+        if suite.uses_epsilon:
+            evidence = [
+                *evidence,
+                f"adds {eps:g} before the reciprocal square root, so the substitute "
+                f"and the oracle are both built with {eps:g}",
+            ]
+        return Proposal(
+            suite=suite,
+            evidence=evidence,
+            epsilon=eps if suite.uses_epsilon else None,
+        )
     return None
 
 

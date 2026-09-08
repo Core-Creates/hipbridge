@@ -166,6 +166,10 @@ def test_the_norms_are_separated_by_how_many_quantities_they_reduce():
                 Param("cols", "int", False, False),
             ],
             calls=["rsqrtf"],
+            # A kernel that normalises has an epsilon, and propose() now
+            # declines without one: the oracle would otherwise be built around
+            # this project's constant rather than around the caller's.
+            epsilon=1e-5,
             **kw,
         )
 

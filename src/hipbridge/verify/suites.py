@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -109,6 +110,10 @@ class Suite:
     # combination this project can produce.
     usage_import: str = ""
     usage_call: str = ""
+    # Does this suite's maths include an epsilon? The norms do, softmax and RoPE
+    # do not. Only the suites that do require the value to be read off the
+    # caller's kernel before anything may be substituted into it.
+    uses_epsilon: bool = False
 
     def source(self, examples_dir: Path) -> str:
         return (examples_dir / self.source_file).read_text(encoding="utf-8")
@@ -116,6 +121,13 @@ class Suite:
     def all_baselines(self) -> tuple[Baseline, ...]:
         """The original first, then any additional baselines."""
         return (Baseline("original", self.source_file, self.launch), *self.baselines)
+
+
+# The epsilon to use when nothing else says. torch's default, and what every
+# kernel in examples/ spells. It is a default for running the built-in suites
+# against their own sources, never a value to substitute into somebody else's
+# kernel: propose() declines rather than assuming it.
+DEFAULT_EPS = 1e-5
 
 
 def _row_shapes() -> Sequence[tuple[int, ...]]:
@@ -167,7 +179,7 @@ def _norm_launch(kernel: str, block: tuple[int, int, int]) -> LaunchSpec:
     )
 
 
-def _torch_layer_norm(t: torch.Tensor) -> torch.Tensor:
+def _torch_layer_norm(t: torch.Tensor, eps: float = DEFAULT_EPS) -> torch.Tensor:
     """What a user would call instead of substituting anything.
 
     F.layer_norm uses the biased variance and no affine terms when weight and
@@ -175,18 +187,18 @@ def _torch_layer_norm(t: torch.Tensor) -> torch.Tensor:
     timing the oracle would compare a float64 implementation against float32
     kernels and report a difference that is about precision, not about speed.
     """
-    return torch.nn.functional.layer_norm(t, (t.shape[-1],), eps=1e-5)
+    return torch.nn.functional.layer_norm(t, (t.shape[-1],), eps=eps)
 
 
-def _torch_rms_norm(t: torch.Tensor) -> torch.Tensor:
+def _torch_rms_norm(t: torch.Tensor, eps: float = DEFAULT_EPS) -> torch.Tensor:
     fn = getattr(torch.nn.functional, "rms_norm", None)
     if fn is not None:
-        return fn(t, (t.shape[-1],), eps=1e-5)
+        return fn(t, (t.shape[-1],), eps=eps)
     # Older torch: the same maths, still float32.
-    return t * torch.rsqrt((t * t).mean(dim=-1, keepdim=True) + 1e-5)
+    return t * torch.rsqrt((t * t).mean(dim=-1, keepdim=True) + eps)
 
 
-def _layer_norm_oracle(t: torch.Tensor) -> torch.Tensor:
+def _layer_norm_oracle(t: torch.Tensor, eps: float = DEFAULT_EPS) -> torch.Tensor:
     """float64 LayerNorm, biased variance, no affine terms.
 
     Biased because the kernels divide by n, not n-1. Matching the oracle to the
@@ -197,17 +209,18 @@ def _layer_norm_oracle(t: torch.Tensor) -> torch.Tensor:
     mean = d.mean(dim=-1, keepdim=True)
     centred = d - mean
     var = (centred * centred).mean(dim=-1, keepdim=True)
-    return centred * torch.rsqrt(var + 1e-5)
+    return centred * torch.rsqrt(var + eps)
 
 
-def _rms_norm_oracle(t: torch.Tensor) -> torch.Tensor:
+def _rms_norm_oracle(t: torch.Tensor, eps: float = DEFAULT_EPS) -> torch.Tensor:
     d = t.double()
     ms = (d * d).mean(dim=-1, keepdim=True)
-    return d * torch.rsqrt(ms + 1e-5)
+    return d * torch.rsqrt(ms + eps)
 
 
 LAYER_NORM = Suite(
     name="layer_norm",
+    uses_epsilon=True,
     source_file="layer_norm.cu",
     kernel="layer_norm",
     launch=_norm_launch("layer_norm", (1, 1, 1)),  # serial within the row
@@ -228,6 +241,7 @@ LAYER_NORM = Suite(
 
 RMS_NORM = Suite(
     name="rms_norm",
+    uses_epsilon=True,
     source_file="rms_norm.cu",
     kernel="rms_norm",
     launch=_norm_launch("rms_norm", (1, 1, 1)),
@@ -252,8 +266,10 @@ def _layer_norm_affine_oracle(t: torch.Tensor, gamma: torch.Tensor, beta: torch.
     return _layer_norm_oracle(t) * gamma.double() + beta.double()
 
 
-def _torch_layer_norm_affine(t: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor):
-    return torch.nn.functional.layer_norm(t, (t.shape[-1],), weight=gamma, bias=beta, eps=1e-5)
+def _torch_layer_norm_affine(
+    t: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor, eps: float = DEFAULT_EPS
+):
+    return torch.nn.functional.layer_norm(t, (t.shape[-1],), weight=gamma, bias=beta, eps=eps)
 
 
 def _per_column(name: str, seed_offset: int, aliases: tuple[str, ...] = ()) -> Operand:
@@ -276,6 +292,7 @@ def _per_column(name: str, seed_offset: int, aliases: tuple[str, ...] = ()) -> O
 
 LAYER_NORM_AFFINE = Suite(
     name="layer_norm_affine",
+    uses_epsilon=True,
     source_file="layer_norm_affine.cu",
     kernel="layer_norm_affine",
     launch=_norm_launch("layer_norm_affine", (1, 1, 1)),
@@ -310,15 +327,19 @@ def _even_row_shapes() -> Sequence[tuple[int, ...]]:
     return [s for s in shapes.sample(shapes.row_wise()) if s[1] % 2 == 0 and s[1] >= 2]
 
 
-def _torch_rms_norm_affine(t: torch.Tensor, gamma: torch.Tensor) -> torch.Tensor:
+def _torch_rms_norm_affine(
+    t: torch.Tensor, gamma: torch.Tensor, eps: float = DEFAULT_EPS
+) -> torch.Tensor:
     fn = getattr(torch.nn.functional, "rms_norm", None)
     if fn is not None:
-        return fn(t, (t.shape[-1],), weight=gamma, eps=1e-5)
-    return t * torch.rsqrt((t * t).mean(dim=-1, keepdim=True) + 1e-5) * gamma
+        return fn(t, (t.shape[-1],), weight=gamma, eps=eps)
+    return t * torch.rsqrt((t * t).mean(dim=-1, keepdim=True) + eps) * gamma
 
 
-def _rms_norm_affine_oracle(t: torch.Tensor, gamma: torch.Tensor) -> torch.Tensor:
-    return _rms_norm_oracle(t) * gamma.double()
+def _rms_norm_affine_oracle(
+    t: torch.Tensor, gamma: torch.Tensor, eps: float = DEFAULT_EPS
+) -> torch.Tensor:
+    return _rms_norm_oracle(t, eps=eps) * gamma.double()
 
 
 def _rope(x, cos_tab, sin_tab):
@@ -363,6 +384,7 @@ def _half_width(
 
 RMS_NORM_AFFINE = Suite(
     name="rms_norm_affine",
+    uses_epsilon=True,
     source_file="rms_norm_affine.cu",
     kernel="rms_norm_affine",
     launch=_norm_launch("rms_norm_affine", (1, 1, 1)),
@@ -407,13 +429,13 @@ ROPE = Suite(
 )
 
 
-def _rms_norm_rope_oracle(x, gamma, cos_tab, sin_tab):
+def _rms_norm_rope_oracle(x, gamma, cos_tab, sin_tab, eps: float = DEFAULT_EPS):
     """float64 RMSNorm with a learned scale, then a rotation of channel pairs."""
-    normed = _rms_norm_oracle(x) * gamma.double()
+    normed = _rms_norm_oracle(x, eps=eps) * gamma.double()
     return _rope(normed, cos_tab.double(), sin_tab.double())
 
 
-def _two_launches(x, gamma, cos_tab, sin_tab):
+def _two_launches(x, gamma, cos_tab, sin_tab, eps: float = DEFAULT_EPS):
     """The same maths as two separate operations, which is what a library gives you.
 
     This is the baseline the fused kernel has to beat, and it is deliberately
@@ -430,12 +452,13 @@ def _two_launches(x, gamma, cos_tab, sin_tab):
         from hipbridge.kernels.norm import rms_norm_affine_rowwise
         from hipbridge.kernels.rope import rope_rowwise
 
-        return rope_rowwise(rms_norm_affine_rowwise(x, gamma), cos_tab, sin_tab)
-    return _rope(_torch_rms_norm_affine(x, gamma), cos_tab, sin_tab)
+        return rope_rowwise(rms_norm_affine_rowwise(x, gamma, eps=eps), cos_tab, sin_tab)
+    return _rope(_torch_rms_norm_affine(x, gamma, eps=eps), cos_tab, sin_tab)
 
 
 RMS_NORM_ROPE = Suite(
     name="rms_norm_rope",
+    uses_epsilon=True,
     source_file="rms_norm_rope.cu",
     kernel="rms_norm_rope",
     launch=_norm_launch("rms_norm_rope", (1, 1, 1)),
@@ -487,7 +510,7 @@ def make_inputs(suite: Suite, spec: InputSpec, device: str = "cpu") -> tuple[tor
     )
 
 
-def candidate_for(suite: Suite) -> tuple[Callable[[torch.Tensor], torch.Tensor], str]:
+def _candidate_impl(suite: Suite) -> tuple[Callable[[torch.Tensor], torch.Tensor], str]:
     """The implementation being proposed in place of the original.
 
     Prefers the tuned AMD Triton kernel when the [kernels] extra is installed,
@@ -557,6 +580,37 @@ def candidate_for(suite: Suite) -> tuple[Callable[[torch.Tensor], torch.Tensor],
     raise KeyError(suite.name)
 
 
+def candidate_for(
+    suite: Suite, eps: float | None = None
+) -> tuple[Callable[[torch.Tensor], torch.Tensor], str]:
+    """The implementation being proposed, built with the caller's epsilon.
+
+    Every substitute in kernels/ already took an eps argument; what was missing
+    was anyone passing one. Left unbound, a substitution into a kernel written
+    with 1e-6 quietly computed something else, and the oracle agreed with the
+    substitute because it was hardcoded to the same default the substitute used.
+    """
+    fn, described = _candidate_impl(suite)
+    if suite.uses_epsilon and eps is not None:
+        fn = partial(fn, eps=eps)
+        described = f"{described}, eps={eps:g}"
+    return fn, described
+
+
+def oracle_for(suite: Suite, eps: float | None = None):
+    """The suite's float64 oracle, built with the caller's epsilon.
+
+    An oracle is only a truth about the program it describes. Built with this
+    project's default against a kernel written with another value it stops being
+    one: the caller's correct kernel becomes the outlier, and the substitution
+    that happens to match the oracle is scored the more accurate side while
+    changing what the caller computes.
+    """
+    if not suite.uses_epsilon or eps is None:
+        return suite.oracle
+    return partial(suite.oracle, eps=eps)
+
+
 __all__ = [
     "BUILTIN",
     "LAYER_NORM",
@@ -569,6 +623,8 @@ __all__ = [
     "Baseline",
     "Operand",
     "Suite",
+    "DEFAULT_EPS",
     "candidate_for",
     "make_inputs",
+    "oracle_for",
 ]
