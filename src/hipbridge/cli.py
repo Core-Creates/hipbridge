@@ -50,23 +50,59 @@ def _report_path(args, command: str) -> str:
     return args.report
 
 
+# Exit codes, which are the machine-readable half of this CLI's contract.
+#
+# A pipeline reads $?, not prose, and these used to conflate the two outcomes
+# that matter most. `port` returned 0 both when it proved a substitution and
+# when it could not prove one, so a job on a machine without hipcc read
+# "unproven" as success while the text on screen said the opposite. Its own
+# docstring had promised 5 for that since it was written.
+#
+# The distinction that matters is between a claim that failed and a claim that
+# was never tested. Both are "not proved" and they call for opposite responses:
+# one is a defect to go fix, the other a machine to go find.
+EXIT_OK = 0  # the claim held: proved, verified, or reported
+EXIT_USAGE = 1  # bad input: no such file, or no kernel definitions in it
+EXIT_REFUSED = 2  # refused to act: generated code without --allow-untrusted-code
+EXIT_NOTHING = 3  # nothing to claim: unrecognized, or no substitution proposed
+EXIT_REJECTED = 4  # the claim was tested and did not survive it
+EXIT_UNPROVABLE = 5  # the claim could not be tested: no toolchain, device or extra
+
+
+def _parse(path: str):
+    """Parse a .cu file, reporting an unreadable one rather than raising.
+
+    `hipbridge inspect typo.cu` exited with a FileNotFoundError traceback, which
+    is Python's exit 1 by accident rather than this CLI's EXIT_USAGE on purpose.
+    A traceback is not a diagnosis, and an exit code arrived at by accident is
+    not a contract.
+    """
+    try:
+        return parse_file(path), None
+    except OSError as exc:
+        print(f"cannot read {path}: {exc.strerror or exc}", file=sys.stderr)
+        return None, EXIT_USAGE
+
+
 def _cmd_inspect(args) -> int:
-    kernels = parse_file(args.file)
+    kernels, problem = _parse(args.file)
+    if problem:
+        return problem
     if not kernels:
         print(f"no kernel definitions found in {args.file}", file=sys.stderr)
-        return 1
+        return EXIT_USAGE
     for facts in kernels:
         result = recognize(facts)
         print(result.report())
         print()
-    return 0
+    return EXIT_OK
 
 
 def _cmd_analyze(args) -> int:
     print("occupancy:", occupancy(args.vgprs, args.arch))
     if args.flops and args.bytes:
         print("roofline: ", roofline(args.flops, args.bytes, args.arch))
-    return 0
+    return EXIT_OK
 
 
 def _cmd_verify(args) -> int:
@@ -80,7 +116,7 @@ def _cmd_verify(args) -> int:
 
     if not verify.available():
         print("SKIP: [verify] extra not installed (pip install 'hipbridge[verify]')")
-        return 1 if args.require else 0
+        return EXIT_UNPROVABLE if args.require else EXIT_OK
 
     from hipbridge.verify import suites
 
@@ -134,8 +170,8 @@ def _cmd_verify(args) -> int:
 
     if ran == 0:
         print("no suite ran (no device available)")
-        return 1 if args.require else 0
-    return 1 if failed else 0
+        return EXIT_UNPROVABLE if args.require else EXIT_OK
+    return EXIT_REJECTED if failed else EXIT_OK
 
 
 def _cmd_bench(args) -> int:
@@ -149,7 +185,7 @@ def _cmd_bench(args) -> int:
 
     if not verify.available():
         print("SKIP: [verify] extra not installed")
-        return 1 if args.require else 0
+        return EXIT_UNPROVABLE if args.require else EXIT_OK
 
     import torch
 
@@ -320,7 +356,7 @@ def _cmd_bench(args) -> int:
         )
         print(f"\nreport written to {written}")
 
-    return 1 if (failed and args.require) else 0
+    return EXIT_REJECTED if failed else EXIT_OK
 
 
 def _cmd_port(args) -> int:
@@ -333,10 +369,12 @@ def _cmd_port(args) -> int:
     nothing to propose, 4 proposed but the proof failed, 5 no device to prove it
     on. A substitution is never recommended on the strength of recognition alone.
     """
-    kernels = parse_file(args.file)
+    kernels, problem = _parse(args.file)
+    if problem:
+        return problem
     if not kernels:
         print(f"no kernel definitions found in {args.file}", file=sys.stderr)
-        return 1
+        return EXIT_USAGE
 
     facts = kernels[0]
     if args.kernel:
@@ -344,7 +382,7 @@ def _cmd_port(args) -> int:
         if not match:
             names = ", ".join(k.name for k in kernels)
             print(f"no kernel named {args.kernel} in {args.file} (found: {names})")
-            return 1
+            return EXIT_USAGE
         facts = match[0]
 
     result = recognize(facts)
@@ -355,7 +393,7 @@ def _cmd_port(args) -> int:
 
     if not verify.available():
         print("SKIP: [verify] extra not installed, so no substitution can be proved")
-        return 1 if args.require else 0
+        return EXIT_UNPROVABLE
 
     from hipbridge.verify import substitutions, suites
 
@@ -381,7 +419,7 @@ def _cmd_port(args) -> int:
             print("  no recognizer claimed this kernel, so there is nothing to propose.")
         print()
         print("  Translate it by hand, or extend hipbridge.verify.substitutions.")
-        return 3
+        return EXIT_NOTHING
 
     candidate, described = suites.candidate_for(proposal.suite, proposal.epsilon)
     print(f"proposing: {described}")
@@ -413,7 +451,7 @@ def _cmd_port(args) -> int:
         print()
         print("  The substitution is unproven, so it is not recommended. Re-run this")
         print("  on a machine with the toolchain and a device.")
-        return 5 if args.require else 0
+        return EXIT_UNPROVABLE
 
     print(f"proving against {args.file} compiled with {args.toolchain}")
     print(f"  launch: grid one block per row, block={launch.block}")
@@ -435,12 +473,12 @@ def _cmd_port(args) -> int:
         print(f"  Inferred block={launch.block}; override it with --block.")
         print("  No substitution is claimed, because being better than a broken")
         print("  reference is not evidence of anything.")
-        return 4
+        return EXIT_REJECTED
 
     if not summary.ok:
         print("SUBSTITUTION REJECTED. The proposal did not survive verification,")
         print("which is the system working: recognition proposes, the oracle decides.")
-        return 4
+        return EXIT_REJECTED
 
     print("SUBSTITUTION PROVED. Use it like this:")
     print()
@@ -476,7 +514,7 @@ def _cmd_port(args) -> int:
             body,
         )
         print(f"report written to {written}")
-    return 0
+    return EXIT_OK
 
 
 def _cmd_synth(args) -> int:
@@ -491,17 +529,19 @@ def _cmd_synth(args) -> int:
     that passes has matched the caller's compiled kernel across the same sweep
     every shipped kernel had to pass; one that fails is recorded and discarded.
     """
-    kernels = parse_file(args.file)
+    kernels, problem = _parse(args.file)
+    if problem:
+        return problem
     if not kernels:
         print(f"no kernel definitions found in {args.file}", file=sys.stderr)
-        return 1
+        return EXIT_USAGE
     facts = kernels[0]
 
     from hipbridge import synth, verify
 
     if not verify.available():
         print("SKIP: [verify] extra not installed, so nothing could be proved")
-        return 1 if args.require else 0
+        return EXIT_UNPROVABLE
 
     from hipbridge.verify import substitutions
 
@@ -511,7 +551,7 @@ def _cmd_synth(args) -> int:
     if proposal is None:
         print("no suite covers this kernel, so there is no oracle to judge against.")
         print("Generation without a proof is not something this tool will do.")
-        return 3
+        return EXIT_NOTHING
 
     suite = proposal.suite
     ref = verify.NativeReference(
@@ -525,7 +565,7 @@ def _cmd_synth(args) -> int:
     if not avail:
         print(f"CANNOT PROVE: {avail.reason}")
         print("Generated code is worth nothing unproved, so nothing is generated.")
-        return 5 if args.require else 0
+        return EXIT_UNPROVABLE
 
     def verify_one(fn):
         return verify.Harness(
@@ -567,19 +607,19 @@ def _cmd_synth(args) -> int:
         print("  Generated kernels execute in this process with its privileges.")
         print("  Pass --allow-untrusted-code once you are on a machine where that")
         print("  is acceptable, which is not one holding credentials you care about.")
-        return 2
+        return EXIT_REFUSED
 
     print(found)
     winner = found.winner
     if winner is None:
-        return 1 if args.require else 4
+        return EXIT_REJECTED
 
     print()
     print(winner.summary)
     if args.out:
         Path(args.out).write_text(winner.candidate.source, encoding="utf-8")
         print(f"kernel written to {args.out}")
-    return 0
+    return EXIT_OK
 
 
 def _cmd_info(args) -> int:
@@ -592,7 +632,7 @@ def _cmd_info(args) -> int:
 
     print(f"[kernels] extra: {'available' if kernels.available() else 'not installed'}")
     print(f"[verify]  extra: {'available' if verify.available() else 'not installed'}")
-    return 0
+    return EXIT_OK
 
 
 def main(argv: list[str] | None = None) -> int:
