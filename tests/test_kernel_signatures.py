@@ -126,3 +126,52 @@ def test_the_rotation_tables_do_not_share_a_stride():
         assert "tab_row_stride" not in source, f"{name} still shares one table stride"
         assert "sin_tab.stride(0)" in source, f"{name} never reads sin's own stride"
         assert "sin_tab.stride(1)" in source, f"{name} never reads sin's own element stride"
+
+
+TILED = {"softmax.py", "norm.py"}
+ROTATION = {"rope.py", "fused.py"}
+
+
+def test_the_reducing_kernels_hand_wide_rows_to_the_tiled_path():
+    """`BLOCK = next_power_of_2(n_cols)` has a ceiling, and rows do not.
+
+    num_warps saturates at 16, so at 65536 columns each lane holds 64 elements
+    plus temporaries and Triton either spills or fails to compile. A vocabulary
+    softmax is 32k to 128k columns, which made the most common wide-row kernel
+    in inference the one shape this package could not run.
+    """
+    for name in sorted(TILED):
+        source = (KERNELS / name).read_text(encoding="utf-8")
+        assert "wide.TILED_ABOVE" in source, f"{name} never checks the width ceiling"
+        assert "next_power_of_2" in source, f"{name} lost its single-tile fast path"
+
+
+def test_the_rotations_refuse_a_wide_row_rather_than_spilling():
+    """RoPE operates on a head dimension, tens to hundreds of channels.
+
+    A row wider than a block is a shape mistake there far more often than it is
+    a rotation, so it is refused with a sentence rather than tiled or spilled.
+    """
+    for name in sorted(ROTATION):
+        source = (KERNELS / name).read_text(encoding="utf-8")
+        assert "raise ValueError" in source, f"{name} does not refuse anything"
+        assert "wide.TILED_ABOVE" in source, f"{name} never checks the width"
+
+
+def test_an_empty_row_is_returned_rather_than_reduced():
+    """next_power_of_2(0) is 1, the mask is all false, and a reduction over an
+    all -inf vector propagates NaN."""
+    for name in sorted(TILED):
+        source = (KERNELS / name).read_text(encoding="utf-8")
+        assert "x.numel() == 0" in source, f"{name} still launches on an empty tensor"
+
+
+def test_the_tiled_module_tiles_below_the_threshold_it_takes_over_at():
+    """A tile larger than the ceiling would mean the tiled path never loops."""
+    source = (KERNELS / "wide.py").read_text(encoding="utf-8")
+    ns = {}
+    for line in source.splitlines():
+        if line.startswith(("TILE =", "TILED_ABOVE =")):
+            exec(line, ns)  # noqa: S102 - two integer literals from our own source
+    assert ns["TILE"] < ns["TILED_ABOVE"], ns
+    assert ns["TILED_ABOVE"] >= 4096, "taking over below a shape with a measurement history"

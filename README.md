@@ -301,10 +301,10 @@ regrows a `triton` dependency.
 | AMD, timed with weights | **measured**, in the same run |
 
 **What 84 cases covers.** Four shapes, seven input distributions, three
-precisions. The four shapes are `(1,1)`, `(2,4096)`, `(64,65)` and `(1000,128)`,
-which is a deliberate spread: a degenerate case, a row wider than any block, a
-wavefront of rows one column past a wavefront, and a thousand rows so that the
-row stride has to hold for all of them.
+precisions. The four shapes are `(1,1)`, `(2,32768)`, `(64,65)` and `(1000,128)`,
+which is a deliberate spread: a degenerate case, a row too wide for one block so
+the tiled path is exercised, a wavefront of rows one column past a wavefront,
+and a thousand rows so that the row stride has to hold for all of them.
 
 Until the sweep was reordered those four were `(1,1)`, `(1,2)`, `(1,31)` and
 `(1,32)`. Every case ever measured had exactly one row, so `row` was always 0

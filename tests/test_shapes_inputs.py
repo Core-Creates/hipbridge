@@ -131,3 +131,18 @@ def test_the_first_pass_is_drawn_from_the_declared_axes():
     for r, c in sh._FIRST_PASS:
         assert r in sh._ROWS, r
         assert c in sh._COLS, c
+
+
+def test_the_sweep_reaches_past_what_one_block_can_hold():
+    """A vocabulary softmax is 32k to 128k columns and the sweep stopped at 4096.
+
+    The kernels could not run those shapes and the sweep would never have asked,
+    so the gap was invisible from both sides at once.
+    """
+    widths = {c for _, c in sh.row_wise()}
+    assert max(widths) >= 32768, sorted(widths)
+
+    first4 = sh.sample(sh.row_wise(), limit=4)
+    assert max(c for _, c in first4) > 8192, (
+        "a truncated run never crosses the tiling threshold: " + str(first4)
+    )

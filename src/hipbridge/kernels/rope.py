@@ -18,6 +18,8 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
+from hipbridge.kernels import wide
+
 
 @triton.jit
 def _rope_kernel(
@@ -87,6 +89,16 @@ def rope_rowwise(x, cos_tab, sin_tab):
     # layout, so a transposed input produced a transposed output and the
     # store was wrong in the same way the load was.
     out = torch.empty((n_rows, n_cols), dtype=x.dtype, device=x.device)
+    if n_cols > wide.TILED_ABOVE:
+        # Refused rather than tiled. A rotation operates on a head dimension,
+        # which is tens to hundreds of channels; a row this wide is a shape
+        # mistake far more often than it is a rotation, and silently spilling
+        # is a worse answer than saying so.
+        raise ValueError(
+            f"head dimension {n_cols} exceeds {wide.TILED_ABOVE}; a rotation "
+            "operates on a head dimension, so this is more likely a shape mistake"
+        )
+
     block = max(16, triton.next_power_of_2(half))
 
     _rope_kernel[(n_rows,)](

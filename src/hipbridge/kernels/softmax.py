@@ -11,6 +11,8 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
+from hipbridge.kernels import wide
+
 
 @triton.jit
 def _softmax_rowwise_kernel(
@@ -71,6 +73,16 @@ def softmax_rowwise(x):
     # layout, so a transposed input produced a transposed output and the
     # store was wrong in the same way the load was.
     out = torch.empty((n_rows, n_cols), dtype=x.dtype, device=x.device)
+
+    if x.numel() == 0:
+        # next_power_of_2(0) is 1, the mask is all false, and a reduction over
+        # an all -inf vector propagates NaN. There is nothing to compute.
+        return out
+    if n_cols > wide.TILED_ABOVE:
+        # A vocabulary softmax is 32k to 128k columns. One block per row
+        # cannot hold that, so the row is walked in tiles instead.
+        wide.softmax(x, out)
+        return out
 
     block = triton.next_power_of_2(n_cols)
     # 64-wide wavefronts: scale warps with the row so small rows do not

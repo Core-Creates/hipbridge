@@ -19,8 +19,12 @@ WAVEFRONT = 64
 # Row counts: one, small, exactly a wavefront, and either side of it.
 _ROWS = (1, 2, 63, 64, 65, 127, 128, 1000)
 
-# Column widths: degenerate, sub-wavefront, boundary, prime, and wide.
-_COLS = (1, 2, 31, 32, 63, 64, 65, 127, 128, 257, 1024, 4096)
+# Column widths: degenerate, sub-wavefront, boundary, prime, wide, and wider
+# than one block can hold. The last two exist because the kernels size a block
+# as next_power_of_2(n_cols) and stopped there: a vocabulary softmax is 32k to
+# 128k columns, so the most common wide-row kernel in inference sat outside
+# both what the kernels supported and what the sweep would ever ask for.
+_COLS = (1, 2, 31, 32, 63, 64, 65, 127, 128, 257, 1024, 4096, 8192, 32768)
 
 _CAP = 8_000_000  # keep the sweep runnable on CPU
 
@@ -42,7 +46,7 @@ _CAP = 8_000_000  # keep the sweep runnable on CPU
 # run is the same bug in a different place.
 _FIRST_PASS = (
     (1, 1),  # degenerate: one element, no reduction to speak of
-    (2, 4096),  # the widest row in the sweep, at the cheapest row count
+    (2, 32768),  # past the tiling threshold, at the cheapest row count
     (64, 65),  # a wavefront of rows, one column past a wavefront
     (1000, 128),  # many rows: row * stride has to hold for all of them
     (127, 63),  # one under a wavefront on both axes
