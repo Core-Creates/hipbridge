@@ -361,7 +361,7 @@ def _cmd_port(args) -> int:
 
     source = Path(args.file).read_text(encoding="utf-8")
     notes: list[str] = []
-    proposal = substitutions.propose(facts, result.pattern, notes)
+    proposal = substitutions.propose(facts, result.pattern, notes, epsilon=args.eps)
     if proposal is None:
         print("no substitution proposed.")
         print()
@@ -383,7 +383,7 @@ def _cmd_port(args) -> int:
         print("  Translate it by hand, or extend hipbridge.verify.substitutions.")
         return 3
 
-    candidate, described = suites.candidate_for(proposal.suite)
+    candidate, described = suites.candidate_for(proposal.suite, proposal.epsilon)
     print(f"proposing: {described}")
     # The structural read that got us here, restated beside the evidence rather
     # than left twenty lines up. It is advisory: a "likely" match is proposed
@@ -447,7 +447,7 @@ def _cmd_port(args) -> int:
     summary = verify.Harness(
         candidate=candidate,
         reference=ref,
-        oracle=proposal.suite.oracle,
+        oracle=suites.oracle_for(proposal.suite, proposal.epsilon),
         extras=tuple(o.build for o in proposal.suite.extras),
         name=f"{facts.name} vs {described}",
     ).run(list(proposal.suite.shapes())[: args.limit])
@@ -693,6 +693,12 @@ def main(argv: list[str] | None = None) -> int:
     prt.add_argument("--toolchain", default="hipcc", choices=["hipcc", "nvcc"])
     prt.add_argument("--arch", default="", help="offload arch, e.g. gfx942 for MI300X")
     prt.add_argument("--limit", type=int, default=12, help="max shapes to prove over")
+    prt.add_argument(
+        "--eps",
+        type=float,
+        default=None,
+        help="the epsilon this kernel normalises with, when it is not a readable literal",
+    )
     prt.add_argument(
         "--block",
         type=int,

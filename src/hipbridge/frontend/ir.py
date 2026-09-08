@@ -76,6 +76,18 @@ class KernelFacts:
     atomics: list[str] = field(default_factory=list)
     uses_block_index: bool = False
     uses_thread_index: bool = False
+    # The constant a normalisation adds before its reciprocal square root, read
+    # off the AST when the kernel spells it as a literal. None when there is no
+    # such call, or when the addend cannot be told apart from other constants
+    # inside it.
+    #
+    # Load bearing, not decorative. The substitute and the float64 oracle are
+    # both built from this value, and building them from a different one stops
+    # the oracle describing the caller's program. Measured: a correct kernel at
+    # 1e-6 was scored the less accurate side against a substitute at 1e-5 on
+    # every case, and on tiny inputs the substitution moved the output by 68%
+    # while the report called it a 3.2e7x accuracy win.
+    epsilon: float | None = None
     parse_errors: int = 0
 
     @property

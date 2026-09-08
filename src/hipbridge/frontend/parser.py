@@ -54,6 +54,50 @@ def _to_param(cursor) -> Param:
     return Param(name=cursor.spelling, type=spelling, is_pointer=is_ptr, is_const=is_const)
 
 
+# Where a normalisation keeps its epsilon: the reciprocal-square-root family.
+_NORMALISING = {"rsqrt", "rsqrtf", "sqrt", "sqrtf", "hrsqrt", "__frsqrt_rn"}
+
+
+def _float_literal(node) -> float | None:
+    toks = _tokens(node)
+    if len(toks) != 1:
+        return None
+    try:
+        return float(toks[0].rstrip("fFlL"))
+    except ValueError:
+        return None
+
+
+def _epsilon(nodes) -> float | None:
+    """The constant added inside a reciprocal square root, when it is a literal.
+
+    LayerNorm and RMSNorm both compute `rsqrt(scale + eps)`, and eps is the one
+    quantity in them that structure cannot reveal: 1e-5 and 1e-6 produce the
+    same AST. torch defaults to 1e-5 and Llama-family models use 1e-6, so
+    assuming either is a coin toss on the caller's numbers.
+
+    Deliberately narrow. Only literals lexically inside the call count, and only
+    when the call adds something, so a lookup table elsewhere in the kernel
+    cannot be mistaken for an epsilon. Two distinct literals inside one call
+    means the addend cannot be identified, and an unidentified epsilon is
+    reported absent rather than guessed. Declining to propose is the outcome
+    design rule 1 asks for; guessing is how a substitution changes maths.
+    """
+    found: set[float] = set()
+    for call in nodes:
+        if call.kind != ci.CursorKind.CALL_EXPR or call.spelling not in _NORMALISING:
+            continue
+        if "+" not in _tokens(call):
+            continue
+        for n in _walk(call):
+            if n.kind != ci.CursorKind.FLOATING_LITERAL:
+                continue
+            value = _float_literal(n)
+            if value is not None:
+                found.add(value)
+    return found.pop() if len(found) == 1 else None
+
+
 def _kernel_facts(fn) -> KernelFacts:
     nodes = list(_walk(fn))
 
@@ -125,6 +169,7 @@ def _kernel_facts(fn) -> KernelFacts:
         calls=called,
         shuffle_intrinsics=shuffles,
         atomics=atomics,
+        epsilon=_epsilon(nodes),
         uses_block_index="blockIdx" in refs,
         uses_thread_index="threadIdx" in refs,
     )
