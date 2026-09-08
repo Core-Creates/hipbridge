@@ -9,9 +9,9 @@ WSL2, and hipcc on an MI300X (gfx942).
 
 Performance is measured by CI on a self-hosted MI300X across all six kernels
 and three precisions. At large shapes the substitutions beat a **competently
-written HIP kernel by 1.3x to 1.7x** and torch by 1.3x to 1.4x, except RoPE
-which loses to hand-written HIP; below roughly 16M elements every substitution
-is a 3x to 5x regression. See
+written HIP kernel by 1.3x to 1.9x**, and half precision is about 1.7x faster
+than float32, except RoPE which loses to hand-written HIP in every precision;
+below roughly 16M elements every substitution is a 3x to 5x regression. See
 [the status table](#status-of-what-has-actually-been-run) for exactly which
 paths those are. Claims in this README are limited to what has actually been
 run, never to what should follow from it.
@@ -535,6 +535,47 @@ driver with device events and never pay Python dispatch, while the candidate and
 torch are timed through Python and do. That flatters the native side by roughly
 5 us. It does not change the conclusions, because the small-shape gaps are 12 us
 and more and the large-shape ones run the other way.
+
+### Half precision, which is what inference runs in
+
+All six kernels are verified and timed in float16 and bfloat16 as well as
+float32, by CI on the MI300X. At 4096x4096, candidate microseconds and the
+ratio against a competently written HIP kernel:
+
+| Kernel | fp32 | vs HIP | fp16 | vs HIP | bf16 | vs HIP |
+|---|---|---|---|---|---|---|
+| `row_softmax` | 31.3 | 1.7x | **24.0** | 1.9x | **25.5** | 1.8x |
+| `layer_norm` | 30.7 | 1.5x | **17.9** | 1.7x | **18.5** | 1.7x |
+| `layer_norm_affine` | 32.8 | 1.4x | **19.5** | 1.7x | **20.5** | 1.7x |
+| `rms_norm` | 30.8 | 1.3x | **16.8** | 1.4x | **17.7** | 1.4x |
+| `rms_norm_affine` | 31.8 | 1.3x | **18.0** | 1.4x | **18.2** | 1.5x |
+| `rope` | 52.9 | 0.9x | **26.7** | 0.9x | **26.9** | 0.9x |
+
+Half precision is roughly **1.7x faster than float32** across the substitutions,
+which is what you would expect from kernels that are memory bound: half the
+bytes, most of the time back. The advantage over a hand-written HIP kernel also
+widens slightly, from 1.3x-1.7x to 1.4x-1.9x, because the tuned baselines gain
+less: they load and store in half but compute in float, so the conversion work
+they add scales with the data while the reduction does not.
+
+**RoPE stays at 0.9x in every precision.** It has no reduction, so there is
+nothing for a tuned implementation to recover, and hand-written HIP wins
+whatever the type. That number has not moved across three precisions and two
+rewrites, which is about as clear as this project gets about when not to
+substitute.
+
+Two figures worth reading twice. The naive originals get *slower* in half for
+softmax (2425 us to 2736 us) because a single thread converting each element
+pays for the conversion without the bandwidth saving, which is why the vs
+original column climbs to 113x and means even less than it did before. And
+`torch` beats the candidate outright at fp16 softmax (24.2 against 24.0, a tie
+within noise), so at that shape and precision the substitution buys nothing over
+the library call.
+
+Correctness in half is proved the same way as in float32, against the caller's
+own compiled kernel: the generated driver is templated on the element type, so
+`__half` and `__hip_bfloat16` kernels are compiled and run rather than emulated.
+See [the status table](#status-of-what-has-actually-been-run).
 
 Conditions, because a ratio without them is not a measurement:
 
