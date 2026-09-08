@@ -22,6 +22,11 @@ needs_verify = pytest.mark.skipif(not verify.available(), reason="[verify] extra
 
 EXAMPLES = pathlib.Path(__file__).resolve().parents[1] / "examples"
 
+# Spelled here rather than imported: this half of the file must run on a core
+# install, and hipbridge.verify.suites imports torch. The tie back to
+# DEFAULT_EPS is asserted under the extra, below.
+EXPECTED_DEFAULT_EPS = 1e-5
+
 RMS_NORM = """
 __global__ void rms_norm(const float *in, float *out, int rows, int cols) {
     int row = blockIdx.x;
@@ -53,10 +58,20 @@ def test_epsilon_is_read_off_the_kernel():
 
 
 def test_an_epsilon_that_is_not_a_literal_reads_as_absent():
-    """Absent, not assumed. A guessed epsilon is a silent change of maths."""
-    facts = _rms_norm(decl="float e = 1e-6f;", scale="rsqrtf(acc / (float)cols + e)")
-    assert facts.parse_errors == 0
-    assert facts.epsilon is None
+    """Absent, not assumed. A guessed epsilon is a silent change of maths.
+
+    The control matters: the two sources differ only in where the literal sits,
+    so a None here cannot be a parse that fell over. Asserting `parse_errors ==
+    0` instead was environment-dependent, passing on one libclang and reporting
+    2 on CI's.
+    """
+    hidden = _rms_norm(decl="float e = 1e-6f;", scale="rsqrtf(acc / (float)cols + e)")
+    inline = _rms_norm(scale="rsqrtf(acc / (float)cols + 1e-6f)")
+
+    assert hidden.epsilon is None
+    assert inline.epsilon == pytest.approx(1e-6)
+    assert hidden.name == inline.name == "rms_norm"
+    assert hidden.scalar_accumulations == inline.scalar_accumulations
 
 
 def test_two_constants_in_one_call_cannot_be_told_apart():
@@ -77,13 +92,11 @@ def test_every_shipped_example_normalises_with_the_default():
     these literals would put the oracle and the kernel on different constants
     with nothing to say so. This is that alarm, and it costs no GPU time.
     """
-    from hipbridge.verify.suites import DEFAULT_EPS
-
     normalising = sorted(p for p in EXAMPLES.glob("*norm*.cu"))
     assert normalising, "no normalising examples found"
     for path in normalising:
         for facts in parse_file(path):
-            assert facts.epsilon == pytest.approx(DEFAULT_EPS), path.name
+            assert facts.epsilon == pytest.approx(EXPECTED_DEFAULT_EPS), path.name
 
 
 # --- needs the extra -------------------------------------------------------
@@ -204,3 +217,11 @@ def test_every_epsilon_suite_can_actually_be_bound():
         candidate, described = suites.candidate_for(suite, 1e-6)
         assert "eps=1e-06" in described, described
         assert candidate(*ins).shape == ins[0].shape, suite.name
+
+
+@needs_verify
+def test_the_default_matches_what_the_examples_spell():
+    """Ties the torch-free example check above to the constant the suites use."""
+    from hipbridge.verify.suites import DEFAULT_EPS
+
+    assert DEFAULT_EPS == pytest.approx(EXPECTED_DEFAULT_EPS)
