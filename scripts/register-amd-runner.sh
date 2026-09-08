@@ -104,6 +104,36 @@ if [ ! -f "$HOME/.ssh/hipbridge_deploy" ]; then
     echo
 fi
 
+say "Two things this script does not do, and should"
+# Recorded here because the running box has both and the next one will not
+# unless someone does them deliberately.
+#
+# 1. Run as a user that is not root. A runner executes workflow code, and
+#    doing that as root on a machine with a GPU and any credential is a
+#    poor trade. The working arrangement is a `ci` user in the render and
+#    video groups, with a shared interpreter it can read:
+#
+#      cp -a ~/hipbridge/.venv /opt/hipbridge-venv
+#      chmod -R a+rX /opt/hipbridge-venv
+#      useradd -m ci && usermod -aG render,video ci
+#      echo HIPBRIDGE_PYTHON=/opt/hipbridge-venv/bin/python > .env
+#
+#    The groups are what give /dev/kfd and /dev/dri/renderD* access; without
+#    them torch.cuda.is_available() is False and every suite silently
+#    reports SKIP.
+#
+# 2. Install as a service, so it survives a reboot:
+#
+#      ./svc.sh install ci && ./svc.sh start
+#
+#    Running under nohup means the runner dies with the login session, and
+#    a rented GPU box reboots more often than it should.
+#
+# Configure from a FRESH download rather than copying an existing runner
+# directory. A copy carries state that makes config.sh believe it is
+# already configured while no .runner file exists, and the service then
+# restarts forever against a runner that cannot accept a job.
+
 say "Running"
 echo "Ctrl-C stops it. The runner appears under Settings -> Actions -> Runners."
 echo "Then: Actions -> AMD verify -> Run workflow -> runner: self-hosted"
