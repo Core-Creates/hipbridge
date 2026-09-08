@@ -22,7 +22,13 @@ from typing import Any
 
 import torch
 
-from hipbridge.verify.compare import Arbitration, arbitrate, check, is_identity
+from hipbridge.verify.compare import (
+    Arbitration,
+    arbitrate,
+    check,
+    is_identity,
+    nonfinite_where_finite,
+)
 from hipbridge.verify.inputs import DEFAULT_SWEEP, Distribution, InputSpec, generate
 from hipbridge.verify.reference import Reference, TorchReference
 
@@ -238,14 +244,18 @@ class Harness:
 
         # Oracle mode: ULP drift from the reference is expected and fine as long
         # as the candidate is not further from the truth than the reference is.
-        arb = arbitrate(
-            got,
-            want,
-            self.oracle(*(t.double() for t in ins)),
-            slack=self.oracle_slack,
-        )
+        truth = self.oracle(*(t.double() for t in ins))
+        arb = arbitrate(got, want, truth, slack=self.oracle_slack)
         failures = [f for f in report.failures if "exceeds tolerance" not in f]
         failures = [f for f in failures if "IDENTITY" not in f] + extra
+
+        # Ranking is relative, so it cannot fail a case both sides get wrong the
+        # same way. This can. A candidate that returns NaN or an infinity where
+        # the oracle returns a number is not a less accurate implementation, it
+        # is a broken one, and it stays broken when the reference agrees.
+        broken = nonfinite_where_finite(got, truth)
+        if broken:
+            failures.append(f"NOT FINITE: {broken} position(s) where the oracle is a number")
         if arb.verdict == "worse":
             failures.append(f"LESS ACCURATE than the reference: {arb}")
         return CaseResult(label, not failures, report.max_ulp, failures, arb, report.max_abs)

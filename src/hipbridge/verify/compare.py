@@ -123,6 +123,53 @@ def check(
     return Report(name, not failures, worst, abs_err, rel_err, failures)
 
 
+def _classify(x: torch.Tensor) -> torch.Tensor:
+    """Each element as 0 finite, 1 +inf, 2 -inf, 3 NaN.
+
+    Elementwise and never reduced. The whole NaN defect below came from reducing
+    first and asking afterwards.
+    """
+    out = torch.zeros(x.shape, dtype=torch.int8, device=x.device)
+    out[x == float("inf")] = 1
+    out[x == float("-inf")] = 2
+    out[torch.isnan(x)] = 3
+    return out
+
+
+def _distance(x: torch.Tensor, t: torch.Tensor, finite: torch.Tensor) -> float:
+    """Largest |x - truth| over the positions where the truth is a number.
+
+    A NaN or an infinity from x at one of those positions is not a distance, it
+    is a failure, so it counts as infinite rather than dissolving the maximum it
+    is taken through.
+    """
+    if not bool(finite.any()):
+        return 0.0
+    d = (x - t).abs()
+    d = torch.where(torch.isfinite(x), d, torch.full_like(d, float("inf")))
+    return float(d[finite].max())
+
+
+def _structure_mismatches(x: torch.Tensor, t: torch.Tensor) -> int:
+    """How many positions disagree with the oracle about being a number at all."""
+    return int((_classify(x) != _classify(t)).sum())
+
+
+def nonfinite_where_finite(x: torch.Tensor, truth: torch.Tensor) -> int:
+    """Positions where the oracle is a number and x is not.
+
+    The gate the NaN defect left open. Arbitration ranks two implementations
+    against each other, so by construction it cannot fail a case where both are
+    broken identically: two kernels that both return NaN for every element rank
+    as equivalent, which is true and useless. Something has to say that
+    returning NaN where the truth is a number is wrong however unanimously it is
+    done, and in oracle mode, where the ULP and identity checks are dropped,
+    nothing did.
+    """
+    finite = torch.isfinite(truth.double())
+    return int((finite & ~torch.isfinite(x.double())).sum())
+
+
 @dataclass
 class Arbitration:
     """Accuracy of two implementations judged against a high-precision oracle."""
@@ -170,22 +217,51 @@ def arbitrate(
         truth = truth.to(dev)
 
     t = truth.double()
-    e_cand = float((candidate.double() - t).abs().max())
-    e_ref = float((reference.double() - t).abs().max())
+    cand = candidate.double()
+    ref = reference.double()
+
+    # Magnitudes are measured only where the oracle is a number, and the
+    # oracle's non-finite positions are judged separately as structure.
+    #
+    # The bug this replaces: both errors were a max over the whole tensor, so a
+    # single NaN anywhere in the truth made both of them NaN, and the branch
+    # that caught "NaN on both sides" returned "equivalent" for the entire case.
+    # Reproduced with a candidate that was garbage on every finite element:
+    #
+    #     truth [nan, 1, 2, 3]  cand [nan, 999, -42, 0]  ->  equivalent
+    #     truth [  0, 1, 2, 3]  cand [  0, 999, -42, 0]  ->  worse
+    #
+    # Identical garbage, opposite verdicts, decided by one element nobody was
+    # comparing. In oracle mode the harness has already dropped the ULP and
+    # identity checks, so this was the only gate left and it was open. A row
+    # that masks to all -inf, an overflow, a WITH_INF input: any of them buys a
+    # free pass for everything else in the tensor.
+    finite = torch.isfinite(t)
+    e_cand = _distance(cand, t, finite)
+    e_ref = _distance(ref, t, finite)
 
     if e_ref == 0.0:
         ratio = 1.0 if e_cand == 0.0 else float("inf")
+    elif math.isinf(e_ref) and math.isinf(e_cand):
+        # Both sides broken in the same way. inf/inf is NaN, which fails every
+        # comparison below and lands on "worse", blaming the candidate for a
+        # failure it shares with the reference. Ranking cannot separate them, so
+        # it says so; nonfinite_where_finite is what fails the case.
+        ratio = 1.0
     else:
         ratio = e_cand / e_ref
 
-    # NaN is not a magnitude and cannot be ordered. Every comparison against it
-    # answers False, so falling through would land on "worse" and blame the
-    # candidate for a NaN the reference produced identically. Decide it here.
-    cand_nan, ref_nan = math.isnan(e_cand), math.isnan(e_ref)
-    if cand_nan or ref_nan:
-        if cand_nan and ref_nan:
-            return Arbitration(e_cand, e_ref, "equivalent", ratio)
-        return Arbitration(e_cand, e_ref, "worse" if cand_nan else "better", ratio)
+    # Structure before magnitude. Producing a number where the oracle produces
+    # NaN is not accuracy, it is answering a different question, and the side
+    # that reproduces the oracle's non-finite pattern more faithfully wins
+    # regardless of what the finite elements say. Equal mismatch counts fall
+    # through to the magnitude comparison, which is the ordinary case: zero
+    # against zero.
+    m_cand = _structure_mismatches(cand, t)
+    m_ref = _structure_mismatches(ref, t)
+    if m_cand != m_ref:
+        verdict = "worse" if m_cand > m_ref else "better"
+        return Arbitration(e_cand, e_ref, verdict, ratio)
 
     # Ratios between sub-epsilon errors are noise. Two implementations both
     # accurate to a few float32 ULP of the output scale can differ by 3x purely
@@ -204,7 +280,10 @@ def arbitrate(
     # precision is roughly 8000x too tight: it would rank two implementations
     # that are both exact to the last representable bit, on rounding noise that
     # neither could have avoided.
-    scale = float(t.abs().max()) or 1.0
+    # Over the finite part, for the same reason the errors are: a NaN anywhere in
+    # the truth made this NaN, which made every comparison against the floor
+    # answer False and quietly disabled the noise floor as well.
+    scale = (float(t[finite].abs().max()) if bool(finite.any()) else 0.0) or 1.0
     floor = 8.0 * torch.finfo(candidate.dtype).eps * scale
     if e_cand <= floor and e_ref <= floor:
         return Arbitration(e_cand, e_ref, "equivalent", ratio)
@@ -229,5 +308,6 @@ __all__ = [
     "check",
     "is_identity",
     "is_unwritten",
+    "nonfinite_where_finite",
     "ulp_diff",
 ]
