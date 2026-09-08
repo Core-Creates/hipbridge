@@ -84,3 +84,95 @@ def test_a_skip_stays_a_success_unless_absence_is_declared_fatal(capsys):
     assert (
         main(["verify", "--toolchain", "hipcc", "--limit", "1", "--require"]) == cli.EXIT_UNPROVABLE
     )
+
+
+# --- the other half of the machine-readable surface -----------------------
+
+
+def _run_json(capsys, argv):
+    import json
+
+    code = main([*argv, "--json"])
+    out = capsys.readouterr().out
+    return code, json.loads(out)
+
+
+def test_inspect_json_needs_no_extra(capsys):
+    """It has to work on a core install, so nothing in its path may reach torch.
+
+    An earlier test of mine imported verify.suites from the torch-free half of a
+    file and took the whole core matrix down with it. This is the same trap one
+    layer out: `inspect` is a core command and its serializer lives in
+    frontend/ir.py for that reason.
+    """
+    code, payload = _run_json(capsys, ["inspect", str(EXAMPLES / "row_softmax.cu")])
+
+    assert code == cli.EXIT_OK
+    assert payload["command"] == "inspect"
+    assert payload["exit_code"] == cli.EXIT_OK
+    kernel = payload["kernels"][0]
+    assert kernel["kernel"] == "row_softmax"
+    assert kernel["pattern"] == "reduce_serial"
+    assert kernel["recognized"] is True
+    assert kernel["facts"]["calls"], "the structural read should travel with the verdict"
+
+
+def test_json_replaces_the_prose_rather_than_joining_it(capsys):
+    """A caller parsing stdout should not have to skip a report first."""
+    code, payload = _run_json(capsys, ["inspect", str(EXAMPLES / "tiled_transpose.cu")])
+
+    assert code == cli.EXIT_OK
+    assert payload["kernels"][0]["recognized"] is False
+    assert payload["kernels"][0]["confidence"] is None
+
+
+def test_the_exit_code_travels_inside_the_document(capsys):
+    """So a consumer that captured stdout alone still knows what happened."""
+    code, payload = _run_json(capsys, ["inspect", str(EXAMPLES / "row_softmax.cu")])
+    assert payload["exit_code"] == code
+
+
+@needs_verify
+def test_port_json_says_unproven_rather_than_merely_omitting_proof(capsys):
+    """The JSON has to be as explicit as the exit code, or it repeats the defect."""
+    code, payload = _run_json(capsys, ["port", str(EXAMPLES / "layer_norm.cu")])
+
+    assert code == cli.EXIT_UNPROVABLE
+    assert payload["proved"] is False
+    assert payload["unprovable"], "no reason given for an unprovable claim"
+    # The proposal is still reported: what was going to be tried is useful even
+    # when it could not be tried.
+    assert payload["proposal"]["suite"] == "layer_norm"
+    assert payload["proposal"]["epsilon"] == pytest.approx(1e-5)
+
+
+@needs_verify
+def test_port_json_reports_a_declined_proposal(capsys):
+    code, payload = _run_json(capsys, ["port", str(EXAMPLES / "tiled_transpose.cu")])
+
+    assert code == cli.EXIT_NOTHING
+    assert payload["proposal"] is None
+    assert payload["proved"] is False
+
+
+@needs_verify
+def test_verify_json_lists_every_suite_including_the_skipped(capsys):
+    """A suite that did not run is a fact about the run, not an absence."""
+    code, payload = _run_json(capsys, ["verify", "--limit", "1"])
+
+    assert code == cli.EXIT_OK
+    assert len(payload["suites"]) == 7
+    assert all(s["skipped_reason"] for s in payload["suites"]), payload["suites"]
+
+
+def test_the_document_is_strict_json(capsys):
+    """No NaN or Infinity tokens, which json.dumps emits by default and parsers reject.
+
+    An error of `inf` is a real outcome: it is what a candidate scores when it
+    returns NaN where the oracle returns a number. It serializes as null, and
+    the verdict beside it says what happened.
+    """
+    assert cli._json_safe(float("inf")) is None
+    assert cli._json_safe(float("nan")) is None
+    assert cli._json_safe({"a": [1.0, float("-inf")]}) == {"a": [1.0, None]}
+    assert cli._json_safe(2.5) == 2.5

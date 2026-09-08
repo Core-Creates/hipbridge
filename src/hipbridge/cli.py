@@ -8,6 +8,10 @@ tests/test_layering.py enforces this.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
+import json
+import math
 import sys
 from pathlib import Path
 
@@ -69,6 +73,38 @@ EXIT_REJECTED = 4  # the claim was tested and did not survive it
 EXIT_UNPROVABLE = 5  # the claim could not be tested: no toolchain, device or extra
 
 
+def _record(args, **fields) -> None:
+    """Accumulate the machine-readable result for --json.
+
+    Commands build this as they go rather than returning it, because they
+    already return an exit code and the two answer different questions: the code
+    says what happened, this says what was measured.
+    """
+    payload = getattr(args, "_payload", None)
+    if payload is None:
+        payload = {}
+        args._payload = payload
+    payload.update(fields)
+
+
+def _json_safe(value):
+    """Replace non-finite floats with null, recursively.
+
+    An error of `inf` is a real outcome here: it is what a candidate scores when
+    it returns NaN where the oracle returns a number. But `Infinity` and `NaN`
+    are not JSON, only a Python convention that json.dumps emits by default and
+    strict parsers reject. Emitting null keeps the document parseable; the
+    verdict beside it already says what happened.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 def _parse(path: str):
     """Parse a .cu file, reporting an unreadable one rather than raising.
 
@@ -91,10 +127,13 @@ def _cmd_inspect(args) -> int:
     if not kernels:
         print(f"no kernel definitions found in {args.file}", file=sys.stderr)
         return EXIT_USAGE
+    seen = []
     for facts in kernels:
         result = recognize(facts)
+        seen.append(result.as_dict())
         print(result.report())
         print()
+    _record(args, file=args.file, kernels=seen)
     return EXIT_OK
 
 
@@ -123,6 +162,7 @@ def _cmd_verify(args) -> int:
     examples = Path(args.examples)
     prefix = verify.wsl(args.wsl) if args.wsl else []
     lines: list[str] = []
+    reports: list[dict] = []
     failed = False
     ran = 0
 
@@ -139,6 +179,7 @@ def _cmd_verify(args) -> int:
             msg = f"SKIP  {suite.name}: {avail.reason}"
             print(msg)
             lines.append(msg)
+            reports.append({"name": suite.name, "ok": False, "skipped_reason": avail.reason})
             continue
 
         candidate, described = suites.candidate_for(suite)
@@ -157,6 +198,7 @@ def _cmd_verify(args) -> int:
         ran += 1
         print(summary)
         lines.append(str(summary))
+        reports.append(summary.as_dict())
         failed |= not summary.ok
 
     if args.report:
@@ -167,6 +209,8 @@ def _cmd_verify(args) -> int:
             _report_path(args, "verify"), "hipbridge verification", args.toolchain, args.arch, body
         )
         print(f"\nreport written to {written}")
+
+    _record(args, toolchain=args.toolchain, arch=args.arch or None, suites=reports, ran=ran)
 
     if ran == 0:
         print("no suite ran (no device available)")
@@ -386,6 +430,7 @@ def _cmd_port(args) -> int:
         facts = match[0]
 
     result = recognize(facts)
+    _record(args, file=args.file, recognition=result.as_dict())
     print(result.report())
     print()
 
@@ -419,9 +464,21 @@ def _cmd_port(args) -> int:
             print("  no recognizer claimed this kernel, so there is nothing to propose.")
         print()
         print("  Translate it by hand, or extend hipbridge.verify.substitutions.")
+        _record(args, proposal=None, declined=notes, proved=False)
         return EXIT_NOTHING
 
     candidate, described = suites.candidate_for(proposal.suite, proposal.epsilon)
+    _record(
+        args,
+        proposal={
+            "suite": proposal.suite.name,
+            "substitute": described,
+            "epsilon": proposal.epsilon,
+            "evidence": list(proposal.evidence),
+            "usage_import": proposal.suite.usage_import,
+            "usage_call": proposal.suite.usage_call,
+        },
+    )
     print(f"proposing: {described}")
     # The structural read that got us here, restated beside the evidence rather
     # than left twenty lines up. It is advisory: a "likely" match is proposed
@@ -451,6 +508,7 @@ def _cmd_port(args) -> int:
         print()
         print("  The substitution is unproven, so it is not recommended. Re-run this")
         print("  on a machine with the toolchain and a device.")
+        _record(args, proved=False, unprovable=avail.reason)
         return EXIT_UNPROVABLE
 
     print(f"proving against {args.file} compiled with {args.toolchain}")
@@ -465,6 +523,7 @@ def _cmd_port(args) -> int:
     ).run(list(proposal.suite.shapes())[: args.limit])
     print(summary)
     print()
+    _record(args, summary=summary.as_dict(), proved=bool(summary.ok), launch=list(launch.block))
 
     # The probe now lives in Harness, so verify, bench and synth get it too.
     # What stays here is the advice only port can give: it is the command that
@@ -642,6 +701,11 @@ def main(argv: list[str] | None = None) -> int:
 
     insp = sub.add_parser("inspect", help="parse a .cu file and report recognized kernels")
     insp.add_argument("file")
+    insp.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the result as JSON on stdout, in place of the prose report",
+    )
     insp.set_defaults(fn=_cmd_inspect)
 
     ana = sub.add_parser("analyze", help="occupancy and roofline against datasheet ceilings")
@@ -676,6 +740,11 @@ def main(argv: list[str] | None = None) -> int:
         "--require",
         action="store_true",
         help="fail instead of skipping when no device is available",
+    )
+    ver.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the result as JSON on stdout, in place of the prose report",
     )
     ver.set_defaults(fn=_cmd_verify)
 
@@ -742,6 +811,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="fail instead of skipping when nothing can be proved",
     )
+    prt.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the result as JSON on stdout, in place of the prose report",
+    )
     prt.set_defaults(fn=_cmd_port)
 
     syn = sub.add_parser("synth", help="generate candidate kernels and prove them on device")
@@ -778,7 +852,20 @@ def main(argv: list[str] | None = None) -> int:
     info.set_defaults(fn=_cmd_info)
 
     args = p.parse_args(argv)
-    return args.fn(args)
+    if not getattr(args, "json", False):
+        return args.fn(args)
+
+    # The prose and the JSON are alternatives, not companions: a caller parsing
+    # stdout should not have to skip past a report first. Diagnostics still go
+    # to stderr, where they were already going.
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        code = args.fn(args)
+
+    payload = getattr(args, "_payload", None) or {}
+    payload = {"command": args.cmd, **payload, "exit_code": code}
+    print(json.dumps(_json_safe(payload), indent=2, allow_nan=False))
+    return code
 
 
 if __name__ == "__main__":
