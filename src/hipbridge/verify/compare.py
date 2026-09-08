@@ -123,6 +123,32 @@ def check(
     return Report(name, not failures, worst, abs_err, rel_err, failures)
 
 
+def _rows(x: torch.Tensor) -> torch.Tensor:
+    """The tensor as (rows, width), which is the shape every kernel here works in.
+
+    A row is the unit these kernels reduce over, so it is the unit accuracy has
+    to be judged in. 1D input is one row; anything wider than 2D folds its
+    leading dimensions, because a batch of rows is still rows.
+    """
+    if x.ndim == 0:
+        return x.reshape(1, 1)
+    return x.reshape(-1, x.shape[-1])
+
+
+def _row_distances(x: torch.Tensor, t: torch.Tensor, finite: torch.Tensor) -> torch.Tensor:
+    """Largest |x - truth| within each row, over the positions the truth is a number."""
+    d = (x - t).abs()
+    d = torch.where(torch.isfinite(x), d, torch.full_like(d, float("inf")))
+    d = torch.where(finite, d, torch.zeros_like(d))
+    return _rows(d).amax(dim=-1)
+
+
+def _row_scales(t: torch.Tensor, finite: torch.Tensor, tiny: float) -> torch.Tensor:
+    """Each row's own output magnitude, which is what its noise floor follows."""
+    magnitudes = torch.where(finite, t.abs(), torch.zeros_like(t))
+    return _rows(magnitudes).amax(dim=-1).clamp_min(tiny)
+
+
 def _classify(x: torch.Tensor) -> torch.Tensor:
     """Each element as 0 finite, 1 +inf, 2 -inf, 3 NaN.
 
@@ -275,18 +301,49 @@ def arbitrate(
     # sits at the floor on every finite distribution while the serial original
     # does not, so the ratio never got consulted and the verdict never said
     # "better" for a kernel that always was.
+    #
     # The floor follows the working precision, not float32. fp16 resolves about
     # 1e-3 where float32 resolves 1e-7, so a float32 floor applied to half
     # precision is roughly 8000x too tight: it would rank two implementations
     # that are both exact to the last representable bit, on rounding noise that
     # neither could have avoided.
-    # Over the finite part, for the same reason the errors are: a NaN anywhere in
-    # the truth made this NaN, which made every comparison against the floor
-    # answer False and quietly disabled the noise floor as well.
-    scale = (float(t[finite].abs().max()) if bool(finite.any()) else 0.0) or 1.0
-    floor = 8.0 * torch.finfo(candidate.dtype).eps * scale
-    if e_cand <= floor and e_ref <= floor:
+    #
+    # And it follows each row's own magnitude, not the tensor's. Taken globally
+    # in bfloat16 the floor is 6.25% of the largest output anywhere, so a row of
+    # magnitude 1 sitting beside a row of magnitude 100 could be wrong in every
+    # element and still pass:
+    #
+    #     truth [[100, 100], [1, 1]]  candidate [[100, 100], [-5, 7]]
+    #     global floor 6.25, row error 6.0            ->  equivalent
+    #
+    # Row-wise kernels are exactly where magnitudes differ between rows, and an
+    # attention row that masks to almost nothing beside a row that does not is
+    # the ordinary case rather than a contrived one.
+    finfo = torch.finfo(candidate.dtype)
+    rows_cand = _row_distances(cand, t, finite)
+    rows_ref = _row_distances(ref, t, finite)
+    rows_floor = 8.0 * finfo.eps * _row_scales(t, finite, finfo.tiny)
+
+    noise = (rows_cand <= rows_floor) & (rows_ref <= rows_floor)
+    if bool(noise.all()):
         return Arbitration(e_cand, e_ref, "equivalent", ratio)
+
+    # No row may be materially worse than the reference on that row, whatever
+    # the tensor as a whole says. This is the guard the global comparison could
+    # not offer: a small row that is entirely wrong contributes nothing to a
+    # maximum set by a larger row, so averaging it away was automatic.
+    ranked_cand, ranked_ref = rows_cand[~noise], rows_ref[~noise]
+    row_ratio = torch.where(
+        ranked_ref > 0,
+        ranked_cand / ranked_ref.clamp_min(finfo.tiny),
+        torch.where(
+            ranked_cand > 0,
+            torch.full_like(ranked_cand, float("inf")),
+            torch.ones_like(ranked_cand),
+        ),
+    )
+    if float(row_ratio.max()) > slack:
+        return Arbitration(e_cand, e_ref, "worse", ratio)
 
     # Strictly closer, not merely as close. A tie gives a ratio of exactly 1.0,
     # and calling that "better" inflated every count: the RoPE run reported

@@ -297,3 +297,43 @@ def test_a_correct_candidate_still_passes_the_finiteness_gate(torch_):
 
     assert summary.ok, str(summary)
     assert "NOT FINITE" not in str(summary), str(summary)
+
+
+def test_a_wrong_row_cannot_hide_behind_a_larger_one(torch_):
+    """The floor followed the tensor's largest output, not each row's own.
+
+    In bfloat16 that floor is 6.25% of the largest value anywhere, so a row of
+    magnitude 1 beside a row of magnitude 100 could be wrong in every element
+    and still sit under it. Row-wise kernels are precisely where magnitudes
+    differ between rows: an attention row that masks to almost nothing beside
+    one that does not is the ordinary case.
+    """
+    truth = torch_.tensor([[100.0, 100.0], [1.0, 1.0]], dtype=torch_.float64)
+    reference = truth.to(torch_.bfloat16)
+    candidate = torch_.tensor([[100.0, 100.0], [-5.0, 7.0]], dtype=torch_.bfloat16)
+
+    assert verify.arbitrate(candidate, reference, truth).verdict == "worse"
+    # The same tensor without the large row was never in doubt; it is the
+    # neighbour that used to buy the wrong row its pass.
+    alone = verify.arbitrate(candidate[1:], reference[1:], truth[1:])
+    assert alone.verdict == "worse", str(alone)
+
+
+def test_matching_rows_are_still_noise_in_every_precision(torch_):
+    """The per-row floor must not start failing implementations that agree."""
+    truth = torch_.tensor([[100.0, 100.0], [1.0, 1.0], [0.0, 0.0]], dtype=torch_.float64)
+    for dtype in (torch_.float32, torch_.float16, torch_.bfloat16):
+        a = truth.to(dtype)
+        arb = verify.arbitrate(a.clone(), a, truth)
+        assert arb.verdict == "equivalent", (dtype, str(arb))
+
+
+def test_a_row_wise_win_is_still_reported_as_one(torch_):
+    """Per-row strictness must not suppress a candidate that is better everywhere."""
+    truth = torch_.tensor([[1.0, 2.0], [10.0, 20.0]], dtype=torch_.float64)
+    close = torch_.tensor([[1.001, 2.001], [10.01, 20.01]])
+    far = torch_.tensor([[1.1, 2.1], [11.0, 21.0]])
+
+    arb = verify.arbitrate(close, far, truth)
+    assert arb.verdict == "better", str(arb)
+    assert arb.ratio < 1.0
