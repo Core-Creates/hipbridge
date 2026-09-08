@@ -192,10 +192,8 @@ def _cmd_bench(args) -> int:
             continue
 
         candidate, described = suites.candidate_for(suite)
-        precision = ", ".join(str(d).removeprefix("torch.") for d in _dtypes(args)) or "float32"
         print(
-            f"{suite.name} on {args.toolchain}, device={device}, "
-            f"reps={args.reps}, runs={args.runs}, dtype={precision}"
+            f"{suite.name} on {args.toolchain}, device={device}, reps={args.reps}, runs={args.runs}"
         )
         print(f"  candidate: {described}")
         for base, _ in refs:
@@ -204,109 +202,111 @@ def _cmd_bench(args) -> int:
             print(f"  {suite.portable_name:<9}: library call, timed like the candidate")
         print()
 
-        rows = []
-        for shape in shapes:
-            # Time in the precision being verified. Passing --dtype and then
-            # timing float32 anyway would report numbers for a different program
-            # from the one that just passed.
-            sweep = _dtypes(args)
-            primary = (
-                verify.InputSpec(shape=shape, dtype=sweep[0])
-                if sweep
-                else (verify.InputSpec(shape=shape))
-            )
-            # Weight tensors for kernels that take them, built the same way the
-            # harness builds them so the timed call and the proved call agree.
-            ins = suites.make_inputs(suite, primary, device=device)
-            x = ins[0]
+        for dtype in _dtypes(args) or (torch.float32,):
+            precision = str(dtype).removeprefix("torch.")
+            rows = []
+            for shape in shapes:
+                # Time in the precision being verified. Passing --dtype and then
+                # timing float32 anyway would report numbers for a different program
+                # from the one that just passed.
+                primary = verify.InputSpec(shape=shape, dtype=dtype)
+                # Weight tensors for kernels that take them, built the same way the
+                # harness builds them so the timed call and the proved call agree.
+                ins = suites.make_inputs(suite, primary, device=device)
+                x = ins[0]
 
-            # Verify at this exact shape before timing it. The candidate is
-            # checked against the original; each additional baseline is checked
-            # against the float64 oracle, because a fast baseline that computes
-            # the wrong thing would silently flatter the candidate.
-            summary = verify.Harness(
-                candidate=candidate,
-                reference=refs[0][1],
-                oracle=suite.oracle,
-                extras=tuple(o.build for o in suite.extras),
-                dtypes=_dtypes(args),
-                name=f"{suite.name}@{shape}",
-                distributions=(verify.Distribution.NORMAL,),
-            ).run([shape])
-            ok = summary.ok
-            failed |= not ok
+                # Verify at this exact shape before timing it. The candidate is
+                # checked against the original; each additional baseline is checked
+                # against the float64 oracle, because a fast baseline that computes
+                # the wrong thing would silently flatter the candidate.
+                summary = verify.Harness(
+                    candidate=candidate,
+                    reference=refs[0][1],
+                    oracle=suite.oracle,
+                    extras=tuple(o.build for o in suite.extras),
+                    # The precision being timed, not the whole sweep: a shape is
+                    # timed only after it verified, and it has to have verified
+                    # in the precision the timing will report.
+                    dtypes=(dtype,),
+                    name=f"{suite.name}@{shape}/{precision}",
+                    distributions=(verify.Distribution.NORMAL,),
+                ).run([shape])
+                ok = summary.ok
+                failed |= not ok
 
-            notes = []
-            try:
-                measured = []
-                for base, r in refs:
-                    if base.name != "original":
-                        arb = verify.arbitrate(
-                            r(*ins),
-                            refs[0][1](*ins),
-                            suite.oracle(*(t.double() for t in ins)),
+                notes = []
+                try:
+                    measured = []
+                    for base, r in refs:
+                        if base.name != "original":
+                            arb = verify.arbitrate(
+                                r(*ins),
+                                refs[0][1](*ins),
+                                suite.oracle(*(t.double() for t in ins)),
+                            )
+                            if arb.verdict == "worse":
+                                notes.append(f"{base.name} is LESS ACCURATE than the original")
+                                failed = True
+                        measured.append(
+                            bench.Measurement(
+                                base.name,
+                                bench.stat_reference(r, ins, reps=args.reps, runs=args.runs),
+                                "cuda",
+                            )
                         )
-                        if arb.verdict == "worse":
-                            notes.append(f"{base.name} is LESS ACCURATE than the original")
-                            failed = True
-                    measured.append(
-                        bench.Measurement(
-                            base.name,
-                            bench.stat_reference(r, ins, reps=args.reps, runs=args.runs),
-                            "cuda",
+                    if suite.portable is not None:
+                        # Same timing path as the candidate, so both carry the same
+                        # host-side dispatch cost and the ratio between them is fair.
+                        measured.append(
+                            bench.Measurement(
+                                suite.portable_name,
+                                bench.stat_candidate(
+                                    suite.portable, ins, reps=args.reps, runs=args.runs
+                                ),
+                                device,
+                            )
                         )
+                    cand = bench.Measurement(
+                        "candidate",
+                        bench.stat_candidate(candidate, ins, reps=args.reps, runs=args.runs),
+                        device,
                     )
-                if suite.portable is not None:
-                    # Same timing path as the candidate, so both carry the same
-                    # host-side dispatch cost and the ratio between them is fair.
-                    measured.append(
-                        bench.Measurement(
-                            suite.portable_name,
-                            bench.stat_candidate(
-                                suite.portable, ins, reps=args.reps, runs=args.runs
-                            ),
-                            device,
-                        )
-                    )
-                cand = bench.Measurement(
-                    "candidate",
-                    bench.stat_candidate(candidate, ins, reps=args.reps, runs=args.runs),
-                    device,
-                )
-            except RuntimeError as exc:
-                print(f"  timing unavailable at {shape}: {exc}")
-                failed = True
-                continue
+                except RuntimeError as exc:
+                    print(f"  timing unavailable at {shape}: {exc}")
+                    failed = True
+                    continue
 
-            rows.append(
-                bench.ShapeRow(
-                    shape=tuple(x.shape),
-                    candidate=cand,
-                    baselines=tuple(measured),
-                    verified=ok,
-                    notes=notes,
+                rows.append(
+                    bench.ShapeRow(
+                        shape=tuple(x.shape),
+                        candidate=cand,
+                        baselines=tuple(measured),
+                        verified=ok,
+                        notes=notes,
+                    )
+                )
+
+            table = bench.render(rows)
+            print(f"  dtype: {precision}")
+            print(table)
+            print()
+            report_sections.append(
+                "\n".join(
+                    [
+                        f"## {suite.name} ({precision})",
+                        "",
+                        f"candidate: {described}",
+                        f"reps: {args.reps}, runs: {args.runs}, device: `{device}`",
+                        "",
+                        "```",
+                        table,
+                        "```",
+                    ]
                 )
             )
 
-        table = bench.render(rows)
-        print(table)
-        print()
         print("median of runs, [min-max] beside it. latency-bound marks shapes where")
         print("the candidate never reaches the throughput it shows at larger sizes.")
-        report_sections.append(
-            "\n".join(
-                [
-                    f"## {suite.name}",
-                    "",
-                    f"candidate: {described}",
-                    f"reps: {args.reps}, runs: {args.runs}, device: `{device}`",
-                    "",
-                    "```",
-                    table,
-                    "```",
-                ]
-            )
-        )
 
     if args.report and report_sections:
         from hipbridge.verify import provenance
