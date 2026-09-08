@@ -23,6 +23,8 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
+from hipbridge.kernels import wide
+
 
 def _warps_for(block: int) -> int:
     """64-wide wavefronts: scale with the row so small rows do not under-occupy."""
@@ -156,6 +158,14 @@ def layer_norm_affine_rowwise(x, gamma, beta, eps: float = 1e-5):
     # layout, so a transposed input produced a transposed output and the
     # store was wrong in the same way the load was.
     out = torch.empty((n_rows, n_cols), dtype=x.dtype, device=x.device)
+    if x.numel() == 0:
+        # next_power_of_2(0) is 1, the mask is all false, and a reduction over
+        # an all -inf vector propagates NaN. There is nothing to compute.
+        return out
+    if n_cols > wide.TILED_ABOVE:
+        wide.layer_norm(x, out, eps, gamma=gamma, beta=beta)
+        return out
+
     block = triton.next_power_of_2(n_cols)
 
     _layer_norm_affine_kernel[(n_rows,)](
@@ -177,7 +187,7 @@ def layer_norm_affine_rowwise(x, gamma, beta, eps: float = 1e-5):
     return out
 
 
-def _launch(kernel, x, eps):
+def _launch(kernel, x, eps, wide_fn):
     if x.ndim != 2:
         raise ValueError(f"expected a 2D tensor, got shape {tuple(x.shape)}")
 
@@ -188,6 +198,14 @@ def _launch(kernel, x, eps):
     # layout, so a transposed input produced a transposed output and the
     # store was wrong in the same way the load was.
     out = torch.empty((n_rows, n_cols), dtype=x.dtype, device=x.device)
+    if x.numel() == 0:
+        # next_power_of_2(0) is 1, the mask is all false, and a reduction over
+        # an all -inf vector propagates NaN. There is nothing to compute.
+        return out
+    if n_cols > wide.TILED_ABOVE:
+        wide_fn(x, out, eps)
+        return out
+
     block = triton.next_power_of_2(n_cols)
 
     kernel[(n_rows,)](
@@ -207,12 +225,12 @@ def _launch(kernel, x, eps):
 
 def layer_norm_rowwise(x, eps: float = 1e-5):
     """LayerNorm over the last dimension of a 2D tensor, without affine terms."""
-    return _launch(_layer_norm_kernel, x, eps)
+    return _launch(_layer_norm_kernel, x, eps, wide.layer_norm)
 
 
 def rms_norm_rowwise(x, eps: float = 1e-5):
     """RMSNorm over the last dimension of a 2D tensor, without affine terms."""
-    return _launch(_rms_norm_kernel, x, eps)
+    return _launch(_rms_norm_kernel, x, eps, wide.rms_norm)
 
 
 __all__ = [
@@ -271,6 +289,14 @@ def rms_norm_affine_rowwise(x, gamma, eps: float = 1e-5):
     # layout, so a transposed input produced a transposed output and the
     # store was wrong in the same way the load was.
     out = torch.empty((n_rows, n_cols), dtype=x.dtype, device=x.device)
+    if x.numel() == 0:
+        # next_power_of_2(0) is 1, the mask is all false, and a reduction over
+        # an all -inf vector propagates NaN. There is nothing to compute.
+        return out
+    if n_cols > wide.TILED_ABOVE:
+        wide.rms_norm(x, out, eps, gamma=gamma)
+        return out
+
     block = triton.next_power_of_2(n_cols)
 
     _rms_norm_affine_kernel[(n_rows,)](
