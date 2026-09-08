@@ -221,6 +221,13 @@ class Harness:
     # comparison with it. Zero disables the probe, for a caller that has already
     # established its reference or is deliberately measuring a broken one.
     probe_cases: int = 6
+    # Memory layouts to check beyond contiguous. Empty by default so bench and
+    # any caller timing a single shape are unaffected; verify and port opt in.
+    # Every kernel indexes as `row * row_stride + col * col_stride`, and until
+    # those strides were passed the second factor was assumed to be 1, which
+    # nothing could catch because generate() only ever built contiguous
+    # tensors: the assumption and the test data agreed with each other.
+    layouts: Sequence[Any] = ()
 
     def extra_inputs(self, spec: InputSpec) -> list[Any]:
         """Build every extra operand for this case, on the sweep's device."""
@@ -399,22 +406,40 @@ class Harness:
             if summary.probe_failure:
                 return summary
 
-        for shape in shapes:
-            for dist in self.distributions:
-                for dtype in sweep:
-                    if limit is not None and n >= limit:
-                        return summary
-                    summary.results.append(
-                        self._one(
-                            InputSpec(
-                                shape=tuple(shape),
-                                dtype=dtype,
-                                distribution=dist,
-                                seed=n,
-                            )
-                        )
-                    )
-                    n += 1
+        specs = [
+            InputSpec(shape=shape, dtype=dtype, distribution=dist, seed=i)
+            for i, (shape, dist, dtype) in enumerate(
+                (sh, di, dt) for sh in shapes for di in self.distributions for dt in sweep
+            )
+        ]
+        if limit is not None:
+            specs = specs[:limit]
+
+        # A short layout pass, appended rather than crossed with everything.
+        # Crossing four layouts with seven distributions and three precisions
+        # would quadruple a metered run; this adds one case per layout per
+        # precision, at the widest shape, which is where a stride mistake shows.
+        #
+        # It sits after the truncation on purpose. --limit is a cost control,
+        # and letting it silently drop the only cases that exercise strides
+        # would repeat the defect the multi-row sweep fix was written for.
+        if self.layouts and shapes:
+            widest = max(shapes, key=lambda sh: sh[-1])
+            base = self.distributions[0] if self.distributions else Distribution.NORMAL
+            specs += [
+                InputSpec(
+                    shape=widest,
+                    dtype=dtype,
+                    distribution=base,
+                    seed=len(specs) + i,
+                    layout=layout,
+                )
+                for i, (layout, dtype) in enumerate((la, dt) for la in self.layouts for dt in sweep)
+            ]
+
+        for spec in specs:
+            summary.results.append(self._one(spec))
+            n += 1
         return summary
 
 

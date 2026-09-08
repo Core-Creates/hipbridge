@@ -36,8 +36,14 @@ def _rms_norm_rope_kernel(
     sin_ptr,
     out_ptr,
     in_row_stride,
+    in_col_stride,
     out_row_stride,
-    tab_row_stride,
+    out_col_stride,
+    gamma_stride,
+    cos_row_stride,
+    cos_col_stride,
+    sin_row_stride,
+    sin_col_stride,
     n_cols,
     half,
     eps,
@@ -48,23 +54,32 @@ def _rms_norm_rope_kernel(
     mask = i < half
 
     # Pairs up front: the same loads feed the reduction and the rotation.
-    x0 = tl.load(in_ptr + row * in_row_stride + 2 * i, mask=mask, other=0.0).to(tl.float32)
-    x1 = tl.load(in_ptr + row * in_row_stride + 2 * i + 1, mask=mask, other=0.0).to(tl.float32)
+    base = in_ptr + row * in_row_stride
+    x0 = tl.load(base + (2 * i) * in_col_stride, mask=mask, other=0.0).to(tl.float32)
+    x1 = tl.load(base + (2 * i + 1) * in_col_stride, mask=mask, other=0.0).to(tl.float32)
 
     ms = (tl.sum(x0 * x0, axis=0) + tl.sum(x1 * x1, axis=0)) / n_cols
     inv = tl.rsqrt(ms + eps)
 
-    g0 = tl.load(gamma_ptr + 2 * i, mask=mask, other=0.0).to(tl.float32)
-    g1 = tl.load(gamma_ptr + 2 * i + 1, mask=mask, other=0.0).to(tl.float32)
+    g0 = tl.load(gamma_ptr + (2 * i) * gamma_stride, mask=mask, other=0.0).to(tl.float32)
+    g1 = tl.load(gamma_ptr + (2 * i + 1) * gamma_stride, mask=mask, other=0.0).to(tl.float32)
     y0 = x0 * inv * g0
     y1 = x1 * inv * g1
 
-    c = tl.load(cos_ptr + row * tab_row_stride + i, mask=mask, other=1.0).to(tl.float32)
-    s = tl.load(sin_ptr + row * tab_row_stride + i, mask=mask, other=0.0).to(tl.float32)
+    # Each table carries its own strides. Passing cos_tab.stride(0) for both
+    # read correct cosines and garbage sines whenever the two were built by
+    # different paths, which produces a plausible non-rotation.
+    c = tl.load(cos_ptr + row * cos_row_stride + i * cos_col_stride, mask=mask, other=1.0).to(
+        tl.float32
+    )
+    s = tl.load(sin_ptr + row * sin_row_stride + i * sin_col_stride, mask=mask, other=0.0).to(
+        tl.float32
+    )
 
     out_ty = out_ptr.dtype.element_ty
-    tl.store(out_ptr + row * out_row_stride + 2 * i, (y0 * c - y1 * s).to(out_ty), mask=mask)
-    tl.store(out_ptr + row * out_row_stride + 2 * i + 1, (y0 * s + y1 * c).to(out_ty), mask=mask)
+    dst = out_ptr + row * out_row_stride
+    tl.store(dst + (2 * i) * out_col_stride, (y0 * c - y1 * s).to(out_ty), mask=mask)
+    tl.store(dst + (2 * i + 1) * out_col_stride, (y0 * s + y1 * c).to(out_ty), mask=mask)
 
 
 def rms_norm_rope_rowwise(x, gamma, cos_tab, sin_tab, eps: float = 1e-5):
@@ -86,7 +101,10 @@ def rms_norm_rope_rowwise(x, gamma, cos_tab, sin_tab, eps: float = 1e-5):
 
     import torch
 
-    out = torch.empty_like(x)
+    # Contiguous regardless of what came in. empty_like inherits the input's
+    # layout, so a transposed input produced a transposed output and the
+    # store was wrong in the same way the load was.
+    out = torch.empty((n_rows, n_cols), dtype=x.dtype, device=x.device)
     block = max(16, triton.next_power_of_2(half))
 
     _rms_norm_rope_kernel[(n_rows,)](
@@ -96,8 +114,14 @@ def rms_norm_rope_rowwise(x, gamma, cos_tab, sin_tab, eps: float = 1e-5):
         sin_tab,
         out,
         x.stride(0),
+        x.stride(1),
         out.stride(0),
+        out.stride(1),
+        gamma.stride(0),
         cos_tab.stride(0),
+        cos_tab.stride(1),
+        sin_tab.stride(0),
+        sin_tab.stride(1),
         n_cols,
         half,
         eps,

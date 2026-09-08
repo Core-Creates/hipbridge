@@ -34,7 +34,9 @@ def _layer_norm_kernel(
     in_ptr,
     out_ptr,
     in_row_stride,
+    in_col_stride,
     out_row_stride,
+    out_col_stride,
     n_cols,
     eps,
     BLOCK: tl.constexpr,
@@ -44,7 +46,9 @@ def _layer_norm_kernel(
     mask = cols < n_cols
 
     # Zero-fill rather than -inf: these values enter a sum, not a maximum.
-    x = tl.load(in_ptr + row * in_row_stride + cols, mask=mask, other=0.0).to(tl.float32)
+    x = tl.load(in_ptr + row * in_row_stride + cols * in_col_stride, mask=mask, other=0.0).to(
+        tl.float32
+    )
     n = tl.sum(mask.to(tl.float32), axis=0)
 
     mean = tl.sum(x, axis=0) / n
@@ -52,7 +56,11 @@ def _layer_norm_kernel(
     var = tl.sum(centred * centred, axis=0) / n
 
     y = centred * tl.rsqrt(var + eps)
-    tl.store(out_ptr + row * out_row_stride + cols, y.to(out_ptr.dtype.element_ty), mask=mask)
+    tl.store(
+        out_ptr + row * out_row_stride + cols * out_col_stride,
+        y.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
 
 
 @triton.jit
@@ -60,7 +68,9 @@ def _rms_norm_kernel(
     in_ptr,
     out_ptr,
     in_row_stride,
+    in_col_stride,
     out_row_stride,
+    out_col_stride,
     n_cols,
     eps,
     BLOCK: tl.constexpr,
@@ -69,12 +79,18 @@ def _rms_norm_kernel(
     cols = tl.arange(0, BLOCK)
     mask = cols < n_cols
 
-    x = tl.load(in_ptr + row * in_row_stride + cols, mask=mask, other=0.0).to(tl.float32)
+    x = tl.load(in_ptr + row * in_row_stride + cols * in_col_stride, mask=mask, other=0.0).to(
+        tl.float32
+    )
     n = tl.sum(mask.to(tl.float32), axis=0)
 
     ms = tl.sum(x * x, axis=0) / n
     y = x * tl.rsqrt(ms + eps)
-    tl.store(out_ptr + row * out_row_stride + cols, y.to(out_ptr.dtype.element_ty), mask=mask)
+    tl.store(
+        out_ptr + row * out_row_stride + cols * out_col_stride,
+        y.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
 
 
 @triton.jit
@@ -84,7 +100,11 @@ def _layer_norm_affine_kernel(
     beta_ptr,
     out_ptr,
     in_row_stride,
+    in_col_stride,
     out_row_stride,
+    out_col_stride,
+    gamma_stride,
+    beta_stride,
     n_cols,
     eps,
     BLOCK: tl.constexpr,
@@ -93,18 +113,24 @@ def _layer_norm_affine_kernel(
     cols = tl.arange(0, BLOCK)
     mask = cols < n_cols
 
-    x = tl.load(in_ptr + row * in_row_stride + cols, mask=mask, other=0.0).to(tl.float32)
+    x = tl.load(in_ptr + row * in_row_stride + cols * in_col_stride, mask=mask, other=0.0).to(
+        tl.float32
+    )
     n = tl.sum(mask.to(tl.float32), axis=0)
 
     mean = tl.sum(x, axis=0) / n
     centred = tl.where(mask, x - mean, 0.0)
     var = tl.sum(centred * centred, axis=0) / n
 
-    g = tl.load(gamma_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    b = tl.load(beta_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    g = tl.load(gamma_ptr + cols * gamma_stride, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(beta_ptr + cols * beta_stride, mask=mask, other=0.0).to(tl.float32)
     y = centred * tl.rsqrt(var + eps) * g + b
 
-    tl.store(out_ptr + row * out_row_stride + cols, y.to(out_ptr.dtype.element_ty), mask=mask)
+    tl.store(
+        out_ptr + row * out_row_stride + cols * out_col_stride,
+        y.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
 
 
 def layer_norm_affine_rowwise(x, gamma, beta, eps: float = 1e-5):
@@ -126,7 +152,10 @@ def layer_norm_affine_rowwise(x, gamma, beta, eps: float = 1e-5):
     import torch
 
     n_rows, n_cols = x.shape
-    out = torch.empty_like(x)
+    # Contiguous regardless of what came in. empty_like inherits the input's
+    # layout, so a transposed input produced a transposed output and the
+    # store was wrong in the same way the load was.
+    out = torch.empty((n_rows, n_cols), dtype=x.dtype, device=x.device)
     block = triton.next_power_of_2(n_cols)
 
     _layer_norm_affine_kernel[(n_rows,)](
@@ -135,7 +164,11 @@ def layer_norm_affine_rowwise(x, gamma, beta, eps: float = 1e-5):
         beta,
         out,
         x.stride(0),
+        x.stride(1),
         out.stride(0),
+        out.stride(1),
+        gamma.stride(0),
+        beta.stride(0),
         n_cols,
         eps,
         BLOCK=block,
@@ -151,14 +184,19 @@ def _launch(kernel, x, eps):
     import torch
 
     n_rows, n_cols = x.shape
-    out = torch.empty_like(x)
+    # Contiguous regardless of what came in. empty_like inherits the input's
+    # layout, so a transposed input produced a transposed output and the
+    # store was wrong in the same way the load was.
+    out = torch.empty((n_rows, n_cols), dtype=x.dtype, device=x.device)
     block = triton.next_power_of_2(n_cols)
 
     kernel[(n_rows,)](
         x,
         out,
         x.stride(0),
+        x.stride(1),
         out.stride(0),
+        out.stride(1),
         n_cols,
         eps,
         BLOCK=block,
@@ -191,7 +229,10 @@ def _rms_norm_affine_kernel(
     gamma_ptr,
     out_ptr,
     in_row_stride,
+    in_col_stride,
     out_row_stride,
+    out_col_stride,
+    gamma_stride,
     n_cols,
     eps,
     BLOCK: tl.constexpr,
@@ -200,14 +241,20 @@ def _rms_norm_affine_kernel(
     cols = tl.arange(0, BLOCK)
     mask = cols < n_cols
 
-    x = tl.load(in_ptr + row * in_row_stride + cols, mask=mask, other=0.0).to(tl.float32)
+    x = tl.load(in_ptr + row * in_row_stride + cols * in_col_stride, mask=mask, other=0.0).to(
+        tl.float32
+    )
     n = tl.sum(mask.to(tl.float32), axis=0)
 
     ms = tl.sum(x * x, axis=0) / n
-    g = tl.load(gamma_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    g = tl.load(gamma_ptr + cols * gamma_stride, mask=mask, other=0.0).to(tl.float32)
     y = x * tl.rsqrt(ms + eps) * g
 
-    tl.store(out_ptr + row * out_row_stride + cols, y.to(out_ptr.dtype.element_ty), mask=mask)
+    tl.store(
+        out_ptr + row * out_row_stride + cols * out_col_stride,
+        y.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
 
 
 def rms_norm_affine_rowwise(x, gamma, eps: float = 1e-5):
@@ -220,7 +267,10 @@ def rms_norm_affine_rowwise(x, gamma, eps: float = 1e-5):
     import torch
 
     n_rows, n_cols = x.shape
-    out = torch.empty_like(x)
+    # Contiguous regardless of what came in. empty_like inherits the input's
+    # layout, so a transposed input produced a transposed output and the
+    # store was wrong in the same way the load was.
+    out = torch.empty((n_rows, n_cols), dtype=x.dtype, device=x.device)
     block = triton.next_power_of_2(n_cols)
 
     _rms_norm_affine_kernel[(n_rows,)](
@@ -228,7 +278,10 @@ def rms_norm_affine_rowwise(x, gamma, eps: float = 1e-5):
         gamma,
         out,
         x.stride(0),
+        x.stride(1),
         out.stride(0),
+        out.stride(1),
+        gamma.stride(0),
         n_cols,
         eps,
         BLOCK=block,

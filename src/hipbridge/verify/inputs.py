@@ -43,16 +43,78 @@ DEFAULT_SWEEP: tuple[Distribution, ...] = (
 )
 
 
+class Layout(str, Enum):
+    """How a tensor is laid out in memory, as distinct from what is in it.
+
+    Every kernel here indexes as `row * row_stride + col * col_stride`, and
+    until those strides were passed the second factor was assumed to be 1.
+    Nothing could catch that, because generate() only ever produced fresh
+    contiguous tensors: the assumption and the test data made the same
+    assumption.
+
+    PADDED is the one that matters most. A kernel written for rows padded to a
+    hardware boundary has `row_stride > n_cols`, and proving it against
+    unpacked data proves a different program from the one that runs.
+    """
+
+    CONTIGUOUS = "contiguous"
+    TRANSPOSED = "transposed"  # a view of its own transpose: col stride > 1
+    SLICED = "sliced"  # every other column: col stride == 2
+    PADDED = "padded"  # rows wider than n_cols: row stride > n_cols
+
+
+# Layouts worth sweeping beyond the contiguous case. Kept short because each one
+# multiplies cases, and the harness runs them as a small separate pass rather
+# than crossing them with distributions and precisions.
+NON_CONTIGUOUS: tuple[Layout, ...] = (Layout.PADDED, Layout.TRANSPOSED, Layout.SLICED)
+
+
+def relayout(t, layout: Layout):
+    """Return a tensor holding the same values in a different memory layout.
+
+    The values are identical by construction, so a kernel that reads its strides
+    correctly cannot tell these apart, and one that does not fails on the very
+    first case.
+    """
+    import torch
+
+    if layout is Layout.CONTIGUOUS:
+        return t
+    if t.ndim < 2 and layout is Layout.TRANSPOSED:
+        # A vector has no transpose. SLICED is what gives a 1-D weight a stride
+        # other than 1, which is what exercises gamma_stride.
+        return t
+    if layout is Layout.TRANSPOSED:
+        out = torch.empty(tuple(reversed(t.shape)), dtype=t.dtype, device=t.device).t()
+        out.copy_(t)
+        return out
+    if layout is Layout.SLICED:
+        wide = torch.empty((*t.shape[:-1], t.shape[-1] * 2), dtype=t.dtype, device=t.device)
+        view = wide[..., ::2]
+        view.copy_(t)
+        return view
+    if layout is Layout.PADDED:
+        wide = torch.empty((*t.shape[:-1], t.shape[-1] + 8), dtype=t.dtype, device=t.device)
+        view = wide[..., : t.shape[-1]]
+        view.copy_(t)
+        return view
+    raise ValueError(f"unknown layout {layout}")
+
+
 @dataclass(frozen=True)
 class InputSpec:
     shape: tuple[int, ...]
     dtype: torch.dtype = torch.float32
     distribution: Distribution = Distribution.NORMAL
     seed: int = 0
+    layout: Layout = Layout.CONTIGUOUS
 
     def describe(self) -> str:
         dims = "x".join(str(d) for d in self.shape)
-        return f"{dims}/{str(self.dtype).removeprefix('torch.')}/{self.distribution.value}"
+        described = f"{dims}/{str(self.dtype).removeprefix('torch.')}/{self.distribution.value}"
+        if self.layout is not Layout.CONTIGUOUS:
+            described += f"/{self.layout.value}"
+        return described
 
 
 def generate(spec: InputSpec, device: str = "cpu") -> torch.Tensor:
@@ -101,7 +163,9 @@ def generate(spec: InputSpec, device: str = "cpu") -> torch.Tensor:
     else:  # pragma: no cover - Distribution is exhaustive
         raise ValueError(f"unhandled distribution {d}")
 
-    return t.to(dtype=spec.dtype, device=device)
+    # Layout last, so the values are decided by the distribution and the memory
+    # arrangement by the layout, and the two cannot interfere.
+    return relayout(t.to(dtype=spec.dtype, device=device), spec.layout)
 
 
 # How an operand's distribution follows the primary case's.

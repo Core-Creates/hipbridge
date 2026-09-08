@@ -17,7 +17,9 @@ def _softmax_rowwise_kernel(
     in_ptr,
     out_ptr,
     in_row_stride,
+    in_col_stride,
     out_row_stride,
+    out_col_stride,
     n_cols,
     BLOCK: tl.constexpr,
 ):
@@ -28,7 +30,11 @@ def _softmax_rowwise_kernel(
     # Load in whatever precision the caller used, reduce in float32. A half
     # precision sum of 4096 exponentials loses most of its mantissa, and the
     # kernel this replaces would not have made that mistake in fp32.
-    x = tl.load(in_ptr + row * in_row_stride + cols, mask=mask, other=-float("inf"))
+    x = tl.load(
+        in_ptr + row * in_row_stride + cols * in_col_stride,
+        mask=mask,
+        other=-float("inf"),
+    )
     x = x.to(tl.float32)
 
     # Max subtraction for numerical stability. Dropping this is the single most
@@ -38,18 +44,33 @@ def _softmax_rowwise_kernel(
     den = tl.sum(num, axis=0)
     y = num / den
 
-    tl.store(out_ptr + row * out_row_stride + cols, y.to(out_ptr.dtype.element_ty), mask=mask)
+    tl.store(
+        out_ptr + row * out_row_stride + cols * out_col_stride,
+        y.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
 
 
 def softmax_rowwise(x):
-    """Softmax over the last dimension of a 2D tensor."""
+    """Softmax over the last dimension of a 2D tensor.
+
+    Element strides are passed rather than assumed. Indexing as
+    `row * row_stride + col` silently requires `stride(-1) == 1`, which
+    nothing asserted and nothing tested, because inputs.py only ever built
+    fresh contiguous tensors: `softmax_rowwise(x.t())` returned wrong
+    numbers with no error. Triton specialises on arguments equal to 1, so
+    the contiguous path is unchanged.
+    """
     if x.ndim != 2:
         raise ValueError(f"expected a 2D tensor, got shape {tuple(x.shape)}")
 
     import torch
 
     n_rows, n_cols = x.shape
-    out = torch.empty_like(x)
+    # Contiguous regardless of what came in. empty_like inherits the input's
+    # layout, so a transposed input produced a transposed output and the
+    # store was wrong in the same way the load was.
+    out = torch.empty((n_rows, n_cols), dtype=x.dtype, device=x.device)
 
     block = triton.next_power_of_2(n_cols)
     # 64-wide wavefronts: scale warps with the row so small rows do not
@@ -60,7 +81,9 @@ def softmax_rowwise(x):
         x,
         out,
         x.stride(0),
+        x.stride(1),
         out.stride(0),
+        out.stride(1),
         n_cols,
         BLOCK=block,
         num_warps=num_warps,
