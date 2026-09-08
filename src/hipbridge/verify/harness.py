@@ -60,6 +60,16 @@ class CaseResult:
     # showing only ULP would read as a catastrophe. Carry the absolute error too.
     max_abs: float | None = None
 
+    def as_dict(self) -> dict:
+        return {
+            "case": self.label,
+            "passed": self.passed,
+            "max_ulp": self.max_ulp,
+            "max_abs": self.max_abs,
+            "failures": list(self.failures),
+            "arbitration": self.arbitration.as_dict() if self.arbitration else None,
+        }
+
     def __str__(self) -> str:
         mark = "pass" if self.passed else "FAIL"
         ulp = f" ulp={self.max_ulp}" if self.max_ulp is not None else ""
@@ -130,6 +140,26 @@ class Summary:
         """Largest absolute divergence from the reference, in output units."""
         errs = [r.max_abs for r in self.results if r.max_abs is not None]
         return max(errs) if errs else None
+
+    def as_dict(self) -> dict:
+        """Everything the printed line says, and the per-case detail it elides.
+
+        `__str__` shows at most the first eight failures because a broken kernel
+        fails everything; this shows all of them, which is what a machine wants.
+        """
+        return {
+            "name": self.name,
+            "ok": self.ok,
+            "skipped_reason": self.skipped_reason,
+            "probe_failure": self.probe_failure,
+            "cases": len(self.results),
+            "passed": len(self.results) - len(self.failures),
+            "verdicts": self.verdicts,
+            "accuracy_gain": self.accuracy_gain,
+            "worst_ulp": self.worst_ulp if self.results else None,
+            "worst_abs": self.worst_abs,
+            "results": [r.as_dict() for r in self.results],
+        }
 
     def __str__(self) -> str:
         if self.skipped_reason:

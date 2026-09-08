@@ -211,6 +211,14 @@ class Arbitration:
             f"({self.ratio:.1f}x, {self.verdict})"
         )
 
+    def as_dict(self) -> dict:
+        return {
+            "verdict": self.verdict,
+            "candidate_err": self.candidate_err,
+            "reference_err": self.reference_err,
+            "ratio": self.ratio,
+        }
+
 
 def arbitrate(
     candidate: torch.Tensor,

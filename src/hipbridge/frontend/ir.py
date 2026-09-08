@@ -90,6 +90,16 @@ class KernelFacts:
     epsilon: float | None = None
     parse_errors: int = 0
 
+    def as_dict(self) -> dict:
+        """The structural read, as data rather than as prose.
+
+        Core-only on purpose: `inspect --json` has to work on an install with
+        neither extra, so nothing here may reach for torch.
+        """
+        from dataclasses import asdict
+
+        return asdict(self)
+
     @property
     def pointer_params(self) -> list[Param]:
         return [p for p in self.params if p.is_pointer]
@@ -128,6 +138,18 @@ class Recognition:
     @property
     def recognized(self) -> bool:
         return self.pattern is not Pattern.UNKNOWN
+
+    def as_dict(self) -> dict:
+        return {
+            "kernel": self.facts.name,
+            "pattern": self.pattern.value,
+            "recognized": self.recognized,
+            # Advisory, and it stays advisory in JSON too. Nothing should branch
+            # on it; the proof is what decides.
+            "confidence": self.confidence if self.recognized else None,
+            "rationale": list(self.rationale),
+            "facts": self.facts.as_dict(),
+        }
 
     def report(self) -> str:
         lines = [f"kernel:  {self.facts.name}", f"pattern: {self.pattern.value}"]
