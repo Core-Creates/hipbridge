@@ -8,9 +8,13 @@ committed result checkable later.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from hipbridge.verify import available
+
+REPO = Path(__file__).resolve().parents[1]
 
 pytestmark = pytest.mark.skipif(not available(), reason="[verify] extra not installed")
 
@@ -105,3 +109,93 @@ def test_results_do_not_count_against_their_own_provenance(tmp_path, monkeypatch
 
     monkeypatch.setattr(provenance, "_run", fake_run_real_change)
     assert provenance.commit() == "abc1234-dirty", "a real source change must still show"
+
+
+# --- what the digest is allowed to notice ---------------------------------
+
+
+def _tree(tmp_path):
+    import shutil
+
+    for name in ("src", "examples"):
+        shutil.copytree(REPO / name, tmp_path / name)
+    return tmp_path
+
+
+def test_prose_does_not_invalidate_a_measurement(tmp_path):
+    """Comments and docstrings never execute, so they cannot move a number.
+
+    They were 42% of verify/ by volume, and hashing them meant every
+    explanatory comment cost a metered GPU run to restore green: a tax on the
+    habit this project most wants to keep.
+    """
+    from hipbridge.verify import provenance
+
+    tree = _tree(tmp_path)
+    before = provenance.code_digest(tree)
+
+    target = tree / "src" / "hipbridge" / "verify" / "harness.py"
+    source = target.read_text(encoding="utf-8")
+    target.write_text(
+        "# an explanatory comment nobody will ever execute\n"
+        + source.replace(
+            "Run a candidate against a reference", "Run a CANDIDATE against a REFERENCE"
+        ),
+        encoding="utf-8",
+    )
+
+    assert provenance.code_digest(tree) == before
+
+
+def test_a_change_that_can_move_a_number_still_invalidates(tmp_path):
+    """The point is to narrow what counts, not to stop counting."""
+    from hipbridge.verify import provenance
+
+    tree = _tree(tmp_path)
+    before = provenance.code_digest(tree)
+
+    target = tree / "src" / "hipbridge" / "verify" / "harness.py"
+    target.write_text(
+        target.read_text(encoding="utf-8").replace("probe_cases: int = 6", "probe_cases: int = 12"),
+        encoding="utf-8",
+    )
+
+    assert provenance.code_digest(tree) != before
+
+
+def test_a_cu_comment_does_not_invalidate_but_the_kernel_does(tmp_path):
+    """rms_norm.cu carries ten lines explaining why it is deliberately naive."""
+    from hipbridge.verify import provenance
+
+    tree = _tree(tmp_path)
+    before = provenance.code_digest(tree)
+
+    target = tree / "examples" / "rms_norm.cu"
+    source = target.read_text(encoding="utf-8")
+    target.write_text("// a note about why this is the naive form\n" + source, encoding="utf-8")
+    assert provenance.code_digest(tree) == before
+
+    target.write_text(source.replace("1e-5f", "1e-6f"), encoding="utf-8")
+    assert provenance.code_digest(tree) != before
+
+
+def test_nothing_measured_reads_its_own_docstring():
+    """The assumption the digest now rests on, asserted rather than assumed.
+
+    Stripping docstrings is only safe while none of them is load-bearing: a
+    __doc__ read at runtime would let a docstring edit change behaviour without
+    changing the digest.
+
+    Checked against the executable text, using the same stripper the digest
+    uses, because a file that merely mentions __doc__ in a comment is fine and
+    this file's own explanation of the rule would otherwise trip it. pytest is
+    configured without --doctest-modules, so a docstring cannot execute either.
+    """
+    from hipbridge.verify import provenance
+
+    for rel in provenance.CODE_PATHS:
+        for path in sorted((REPO / rel).rglob("*.py")):
+            if path.name in provenance.DIGEST_EXCLUDE:
+                continue
+            executable = provenance._executable_python(path.read_text(encoding="utf-8"))
+            assert "__doc__" not in executable, f"{path} reads a docstring at runtime"

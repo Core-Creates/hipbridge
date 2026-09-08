@@ -431,3 +431,36 @@ def test_the_amd_workflow_still_has_no_schedule():
     # the file and failed on the comment explaining why there is no schedule,
     # which is the same mistake the substitution evidence made when a comment
     # mentioning "mean" caused a refusal. Read the structure, not the prose.
+
+
+def test_the_nightly_is_scheduled_small_and_verify_only():
+    """A smoke alarm, not an audit. The audit is amd-verify.yml, on demand.
+
+    amd-verify.yml stays dispatch-only because a full run on a metered device
+    bills whether or not anything changed. This one exists because
+    src/hipbridge/kernels/ is executed by nothing automatic: hosted CI cannot
+    run Triton, and the manual workflow runs when a human remembers. Its whole
+    value is being cheap enough that nobody has to think about it.
+    """
+    wf = _workflow("amd-nightly.yml")
+    triggers = wf.get("on") or wf.get(True)
+
+    assert "schedule" in triggers, "the point of this file is that it runs by itself"
+    job = wf["jobs"]["smoke"]
+    assert "self-hosted" in str(job["runs-on"]), "a GPU job must not land on a paid runner"
+    assert job["timeout-minutes"] <= 10, "a smoke run that can bill for hours is not a smoke run"
+
+    script = "\n".join(str(step.get("run", "")) for step in job["steps"])
+    assert "cli verify" in script
+    assert "cli bench" not in script, "benchmarking belongs in the run someone asked for"
+    assert "cli port" not in script, "proving every kernel end to end is not a smoke test"
+    assert "--limit 2" in script
+    assert "--require" in script, "a nightly that passes when the box is off says nothing"
+    assert "git commit" not in script, "nightly numbers must not compete with the record"
+
+
+def test_the_manual_workflow_stays_the_one_that_costs_money():
+    """Adding the nightly must not have loosened the rule it lives beside."""
+    wf = _workflow("amd-verify.yml")
+    triggers = wf.get("on") or wf.get(True)
+    assert set(triggers) == {"workflow_dispatch"}

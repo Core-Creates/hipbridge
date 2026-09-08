@@ -16,10 +16,12 @@ write because the GPU name could not be read would be a poor trade.
 from __future__ import annotations
 
 import hashlib
+import io
 import platform
 import re
 import shutil
 import subprocess
+import tokenize
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -137,6 +139,94 @@ CODE_PATHS = (
 DIGEST_EXCLUDE = frozenset({"provenance.py"})
 
 
+def _executable_python(source: str) -> str:
+    """Python source with comments and docstrings removed.
+
+    Neither executes, so neither can move a number, and in this codebase they
+    are 42% of verify/ by volume. Hashing them meant every explanatory comment
+    cost a metered GPU run to restore green, which is a tax on the habit this
+    project most wants to keep.
+
+    Textual rather than AST-based on purpose. `ast.dump` output shifts between
+    Python versions, and this digest has to agree between a Windows working tree
+    and a Linux runner; making it disagree by interpreter would reintroduce the
+    exact bug the line-ending normalisation below was written to fix.
+
+    Safe here because nothing in the digested paths reads `__doc__` at runtime,
+    which a test asserts.
+    """
+    out: list[str] = []
+    # A string is a docstring when it stands alone as a statement, which is to
+    # say the last thing that mattered was a newline, an indent, or nothing.
+    at_statement_start = True
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+            if tok.type == tokenize.COMMENT:
+                continue
+            if tok.type == tokenize.STRING and at_statement_start:
+                continue
+            if tok.type in (tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT):
+                at_statement_start = True
+                continue
+            if tok.type == tokenize.ENDMARKER:
+                continue
+            at_statement_start = False
+            out.append(tok.string)
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        # An unparseable file still has to hash to something stable. Falling
+        # back to the raw text is stricter than skipping it, which is the
+        # direction to fail in.
+        return source
+    return "\n".join(out)
+
+
+def _executable_c(source: str) -> str:
+    """CUDA/HIP source with comments removed and whitespace collapsed.
+
+    The same argument as the Python side. `rms_norm.cu` carries a ten-line
+    comment explaining why it is deliberately the naive form; editing it should
+    not invalidate a measurement of the kernel below it.
+    """
+    out: list[str] = []
+    i, n = 0, len(source)
+    while i < n:
+        two = source[i : i + 2]
+        if two == "/*":
+            end = source.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            out.append(" ")
+        elif two == "//":
+            end = source.find("\n", i)
+            i = n if end < 0 else end
+            out.append(" ")
+        elif source[i] in "\"'":
+            # Skip string and char literals whole, so a // inside one is not
+            # mistaken for a comment.
+            quote = source[i]
+            j = i + 1
+            while j < n and source[j] != quote:
+                j += 2 if source[j] == "\\" else 1
+            out.append(source[i : j + 1])
+            i = j + 1
+        else:
+            out.append(source[i])
+            i += 1
+    return " ".join("".join(out).split())
+
+
+def _canonical(path, raw: bytes) -> bytes:
+    """What of this file can actually change a measurement."""
+    # Line endings are normalised, or the digest answers a question about
+    # checkouts rather than about code. A Windows working tree stores CRLF where
+    # git and a Linux runner store LF, so the same commit hashed differently on
+    # the two machines and every CI result read as stale the moment it was
+    # checked locally.
+    text = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n").decode("utf-8", errors="replace")
+    if path.suffix == ".py":
+        return _executable_python(text).encode()
+    return _executable_c(text).encode()
+
+
 def code_digest(root: Path | None = None) -> str:
     """A hash of the code a measurement depends on, read off disk.
 
@@ -161,14 +251,7 @@ def code_digest(root: Path | None = None) -> str:
                 continue
             if f.is_file() and f.suffix in {".py", ".cu", ".hip", ".cpp"}:
                 h.update(str(f.relative_to(base)).replace("\\", "/").encode())
-                # Line endings are normalised, or the digest answers a question
-                # about checkouts rather than about code. A Windows working tree
-                # stores CRLF where git and a Linux runner store LF, so the same
-                # commit hashed differently on the two machines and every CI
-                # result read as stale the moment it was checked locally.
-                raw = f.read_bytes()
-                raw = raw.replace(bytes([13, 10]), bytes([10]))
-                h.update(raw.replace(bytes([13]), bytes([10])))
+                h.update(_canonical(f, f.read_bytes()))
     return h.hexdigest()[:16]
 
 
