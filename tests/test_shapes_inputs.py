@@ -99,3 +99,35 @@ def test_native_reference_reports_unavailable_without_a_toolchain():
     assert isinstance(a.ok, bool)
     if not a:
         assert a.reason
+
+
+def test_a_truncated_sweep_still_spans_row_counts():
+    """Regression: the sweep was rows-outer, so every prefix had exactly one row.
+
+    A kernel that ignores its row stride, or is launched with the wrong grid, is
+    correct on a single row and wrong on every other one. The metered hardware
+    runs truncate at --limit 4, so that prefix is the one that has to carry real
+    row coverage, and a wide row, and still be cheap enough to be worth running.
+    """
+    first4 = sh.sample(sh.row_wise(), limit=4)
+    assert len({r for r, _ in first4}) == 4, first4
+    assert max(c for _, c in first4) >= 1024, first4
+    assert max(r * c for r, c in first4) <= 200_000, first4
+
+    first8 = sh.sample(sh.row_wise(), limit=8)
+    assert {r for r, _ in first8} == set(sh._ROWS), first8
+
+
+def test_reordering_did_not_drop_any_shape():
+    """The order changed; the sweep did not. Anything else would be a quiet loss."""
+    pairs = list(sh.row_wise())
+    expected = {(r, c) for r in sh._ROWS for c in sh._COLS if r * c <= sh._CAP}
+    assert set(pairs) == expected
+    assert len(pairs) == len(set(pairs)), "row_wise yielded a duplicate"
+
+
+def test_the_first_pass_is_drawn_from_the_declared_axes():
+    """A hand-picked prefix can drift from the axes it claims to sample."""
+    for r, c in sh._FIRST_PASS:
+        assert r in sh._ROWS, r
+        assert c in sh._COLS, c
