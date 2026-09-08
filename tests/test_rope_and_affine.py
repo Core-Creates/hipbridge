@@ -147,3 +147,59 @@ def test_a_halving_loop_alone_is_not_a_tree_reduction(examples):
 
     assert not facts.shared_in_halving_loop
     assert recognize(facts).pattern is Pattern.ROW_MAP
+
+
+def test_the_fused_pair_is_told_apart_by_its_operands(examples):
+    """RMSNorm, affine RMSNorm and the fused pair share their evidence.
+
+    All three normalise by a root mean square and reduce one quantity, so the
+    signature is what separates them: one operand is a scale, three are a scale
+    and two position tables. The rotation leaves no structural trace, so arity
+    carries the discrimination and the oracle carries the proof.
+    """
+    from hipbridge.verify import substitutions
+
+    for name, expected, extras in (
+        ("rms_norm.cu", "rms_norm", 0),
+        ("rms_norm_affine.cu", "rms_norm_affine", 1),
+        ("rms_norm_rope.cu", "rms_norm_rope", 3),
+        ("rms_norm_rope_tuned.cu", "rms_norm_rope", 3),
+    ):
+        facts = _facts(examples, name)
+        proposal = substitutions.propose(facts, recognize(facts).pattern)
+
+        assert proposal is not None, f"{name} should propose {expected}"
+        assert proposal.name == expected
+        assert len(proposal.suite.extras) == extras
+
+
+def test_the_fused_baseline_is_two_of_our_own_launches():
+    """Fusion has to be measured against the same kernels, unfused.
+
+    Comparing one fused launch with two torch calls would confound what fusion
+    buys with what the kernels buy. The baseline is deliberately this project's
+    own rms_norm and rope run back to back, so the difference is the dispatch.
+    """
+    from hipbridge.verify.suites import RMS_NORM_ROPE
+
+    assert RMS_NORM_ROPE.portable_name == "2 launches"
+    assert [o.name for o in RMS_NORM_ROPE.extras] == ["gamma", "cos_tab", "sin_tab"]
+
+
+def test_the_fused_maths_matches_the_composition(torch_):
+    """One kernel must compute exactly what the two kernels compute."""
+    from hipbridge.verify.inputs import InputSpec
+    from hipbridge.verify.suites import RMS_NORM_ROPE, make_inputs
+
+    ins = make_inputs(RMS_NORM_ROPE, InputSpec(shape=(4, 64)), device="cpu")
+    composed = RMS_NORM_ROPE.portable(*ins)
+    truth = RMS_NORM_ROPE.oracle(*[t.double() for t in ins])
+
+    assert float((composed.double() - truth).abs().max()) < 1e-5
+
+
+@pytest.fixture(scope="module")
+def torch_():
+    import torch
+
+    return torch
