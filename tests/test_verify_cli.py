@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from hipbridge import verify
+from hipbridge import cli, verify
 from hipbridge.cli import main
 
 REPO = Path(__file__).resolve().parents[1]
@@ -33,7 +33,10 @@ def test_verify_skips_cleanly_without_a_device(capsys):
 
 def test_require_turns_absence_into_failure(capsys):
     rc = main(["verify", "--toolchain", "hipcc", "--limit", "1", "--require"])
-    assert rc == 1, capsys.readouterr().out
+    # 5, not 1: the claim could not be tested, which is a different thing from
+    # bad input and from a claim that was tested and failed. See the exit code
+    # contract at the top of cli.py.
+    assert rc == cli.EXIT_UNPROVABLE, capsys.readouterr().out
 
 
 @needs_verify

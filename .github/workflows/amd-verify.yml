@@ -181,13 +181,23 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}/src
         run: |
+          # port now exits 5 when it cannot prove, instead of 0. That is the
+          # point of the change: a pipeline reading $? used to read "unproven"
+          # as success. The hosted dry run has no device, so 5 is the expected
+          # answer there, and only there.
+          dry_run=${{ inputs.runner == 'ubuntu-latest' && 'true' || 'false' }}
           for k in row_softmax layer_norm layer_norm_affine rms_norm rms_norm_affine rope; do
             echo "== $k"
-            ${{ steps.py.outputs.python }} -m hipbridge.cli port "examples/$k.cu" \
-              --toolchain hipcc \
-              --arch "${{ inputs.arch }}" \
-              --limit "${{ inputs.limit }}" \
-              --report
+            set +e
+            ${{ steps.py.outputs.python }} -m hipbridge.cli port "examples/$k.cu"               --toolchain hipcc               --arch "${{ inputs.arch }}"               --limit "${{ inputs.limit }}"               --report
+            rc=$?
+            set -e
+            if [ "$rc" -eq 0 ]; then continue; fi
+            if [ "$rc" -eq 5 ] && [ "$dry_run" = "true" ]; then
+              echo "   exit 5, unprovable without a device, which is what a dry run is"
+              continue
+            fi
+            exit $rc
           done
 
       # The reports carry the commit, host, device, toolchain and torch build
