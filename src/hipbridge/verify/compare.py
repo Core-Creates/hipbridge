@@ -322,27 +322,40 @@ def arbitrate(
     finfo = torch.finfo(candidate.dtype)
     rows_cand = _row_distances(cand, t, finite)
     rows_ref = _row_distances(ref, t, finite)
-    rows_floor = 8.0 * finfo.eps * _row_scales(t, finite, finfo.tiny)
+    rows_scale = _row_scales(t, finite, finfo.tiny)
+    rows_floor = 8.0 * finfo.eps * rows_scale
 
     noise = (rows_cand <= rows_floor) & (rows_ref <= rows_floor)
     if bool(noise.all()):
         return Arbitration(e_cand, e_ref, "equivalent", ratio)
 
-    # No row may be materially worse than the reference on that row, whatever
-    # the tensor as a whole says. This is the guard the global comparison could
-    # not offer: a small row that is entirely wrong contributes nothing to a
-    # maximum set by a larger row, so averaging it away was automatic.
-    ranked_cand, ranked_ref = rows_cand[~noise], rows_ref[~noise]
-    row_ratio = torch.where(
-        ranked_ref > 0,
-        ranked_cand / ranked_ref.clamp_min(finfo.tiny),
-        torch.where(
-            ranked_cand > 0,
-            torch.full_like(ranked_cand, float("inf")),
-            torch.ones_like(ranked_cand),
-        ),
-    )
-    if float(row_ratio.max()) > slack:
+    # No row may be materially wrong, whatever the tensor as a whole says. This
+    # is the guard the global comparison could not offer: a small row that is
+    # entirely wrong contributes nothing to a maximum set by a larger row, so
+    # averaging it away was automatic.
+    #
+    # Materially is the load-bearing word, and the first attempt left it out. A
+    # row was failed merely for being worse than the reference on that row,
+    # which on an MI300X failed layer_norm at 64x65 and 1000x128 on monotonic
+    # input:
+    #
+    #     row 8: candidate 8.779e-06, reference 2.399e-07, row magnitude 1.397
+    #
+    # The naive kernel lands nearly exact on 17 of those 64 rows, so the ratio
+    # between them is 36x while the candidate is off by six millionths of a
+    # percent of the row. Globally that candidate was 12x closer to the truth
+    # and it was reported worse, which is exactly the match-the-original's-
+    # rounding test this project exists to argue against.
+    #
+    # So a row has to be wrong on its own terms before it can fail a case: off
+    # by more than a hundredth of its own magnitude, or past the working
+    # precision's resolution when that is coarser, and only then is it weighed
+    # against the reference. A row that is entirely wrong sits at 100% of its
+    # magnitude or beyond, four orders above this line, while the layer_norm
+    # rows above sit 1600x below it.
+    material = torch.maximum(rows_floor, 0.01 * rows_scale)
+    beaten = rows_cand > slack * torch.maximum(rows_ref, rows_floor)
+    if bool(((rows_cand > material) & beaten).any()):
         return Arbitration(e_cand, e_ref, "worse", ratio)
 
     # Strictly closer, not merely as close. A tie gives a ratio of exactly 1.0,
