@@ -1,0 +1,101 @@
+name: AMD nightly
+
+# A small scheduled run, deliberately unlike amd-verify.yml.
+#
+# That workflow is dispatch-only and says why: a weekly run on a metered device
+# bills whether or not anything changed. That was written when the device was a
+# rented droplet charging by the hour. The runner is now a box you own, so the
+# marginal cost of a short run is electricity, and the argument that ruled out a
+# schedule no longer applies to a job this size.
+#
+# What it exists to catch: src/hipbridge/kernels/ is executed by nothing
+# automatic. ci.yml runs on hosted CPU runners where Triton cannot run at all,
+# and amd-verify.yml runs when a human remembers. Between those, a kernel can
+# break and nobody finds out until the next release, or until somebody spends
+# 20 minutes of GPU time discovering it by hand.
+#
+# Kept cheap on purpose: verify only, no bench, no port, one precision, two
+# shapes. That is 2 shapes x 7 distributions = 14 cases per suite, roughly a
+# sixth of the verify step in a full run, so a couple of minutes rather than
+# twenty. It is a smoke alarm, not an audit; the audit is amd-verify.yml.
+#
+# It does NOT commit results. Nightly numbers competing with the committed
+# record would fight the freshness digest and create a new problem in place of
+# the one this solves. A non-zero exit is the whole signal, and since the exit
+# codes became a contract those distinguish what to do about it: 4 means a suite
+# regressed and something needs fixing, 5 means the box is unreachable and
+# somebody needs to go turn it on.
+
+on:
+  schedule:
+    # 09:00 UTC, which is early morning in San Antonio: a failure is waiting
+    # when the day starts rather than arriving in the middle of it.
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: self-hosted
+    # Far below the full run's ceiling. If verify at limit 2 has not finished in
+    # ten minutes, something is wrong in a way that more minutes will not fix.
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Choose the interpreter
+        id: py
+        run: |
+          PY="${HIPBRIDGE_PYTHON:-}"
+          if [ -z "$PY" ] && [ -x "$HOME/hipbridge/.venv/bin/python" ]; then
+            PY="$HOME/hipbridge/.venv/bin/python"
+          fi
+          if [ -z "$PY" ]; then PY="$(command -v python3 || command -v python)"; fi
+          echo "using $PY"
+          echo "python=$PY" >> "$GITHUB_OUTPUT"
+
+      # Same guard as the full run, for the same reason: without Triton every
+      # suite falls back to torch and the run reports a pass for a substitution
+      # it never attempted.
+      - name: Refuse to measure the fallback
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
+        run: |
+          ${{ steps.py.outputs.python }} -c "
+          import sys
+          from hipbridge import kernels
+          if not kernels.available():
+              sys.exit('[kernels] extra unavailable, so every candidate would be the '
+                       'torch fallback, and a pass would mean nothing.')
+          print('tuned Triton kernels are available')
+          "
+
+      - name: Verify against device
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
+        run: |
+          ${{ steps.py.outputs.python }} -m hipbridge.cli verify \
+            --toolchain hipcc \
+            --arch gfx942 \
+            --limit 2 \
+            --dtype float32 \
+            --require \
+            --json > nightly.json
+          ${{ steps.py.outputs.python }} -c "
+          import json
+          d = json.load(open('nightly.json'))
+          for s in d['suites']:
+              state = 'ok' if s['ok'] else (s.get('skipped_reason') or 'FAILED')
+              print(f\"{s['name']:>18}: {state}\")
+          "
+
+      - name: Keep the failing run's detail
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hipbridge-nightly-${{ github.run_id }}
+          path: nightly.json
+          if-no-files-found: warn
