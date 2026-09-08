@@ -295,10 +295,22 @@ regrows a `triton` dependency.
 |---|---|
 | CPU, torch oracle | verified |
 | NVIDIA, nvcc on RTX 4060 via WSL2 | verified, 56/56 cases, softmax only |
-| AMD, hipcc on MI300X (gfx942) | **verified**, all six suites, 84/84 cases each |
+| AMD, hipcc on MI300X (gfx942) | **verified**, all seven suites, 84/84 cases each |
 | AMD, kernels taking learned weights | **verified**, `layer_norm_affine` and `rms_norm_affine` |
-| AMD, timed on MI300X (gfx942) | **measured**, softmax and the plain norms |
-| AMD, timed with weights | not yet measured |
+| AMD, timed on MI300X (gfx942) | **measured**, all seven suites, three precisions |
+| AMD, timed with weights | **measured**, in the same run |
+
+**What 84 cases covers.** Four shapes, seven input distributions, three
+precisions. The four shapes are `(1,1)`, `(2,4096)`, `(64,65)` and `(1000,128)`,
+which is a deliberate spread: a degenerate case, a row wider than any block, a
+wavefront of rows one column past a wavefront, and a thousand rows so that the
+row stride has to hold for all of them.
+
+Until the sweep was reordered those four were `(1,1)`, `(1,2)`, `(1,31)` and
+`(1,32)`. Every case ever measured had exactly one row, so `row` was always 0
+and any kernel that ignored its row stride would have scored the same 84/84.
+The count was honest and the width was not, which is why the shapes are now
+named here rather than left to be inferred from a number.
 
 ## The result this project was built to get
 
