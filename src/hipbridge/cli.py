@@ -418,32 +418,6 @@ def _cmd_port(args) -> int:
     print(f"proving against {args.file} compiled with {args.toolchain}")
     print(f"  launch: grid one block per row, block={launch.block}")
 
-    # Sanity-check the reference itself before trusting any comparison with it.
-    #
-    # Oracle mode passes the candidate when it is closer to the truth than the
-    # reference is. That is the right rule, and it has a hole: if the reference
-    # is garbage, the candidate is trivially closer and the run reports a proof.
-    # Seen for real, with a tuned kernel launched at the wrong block size, which
-    # read uninitialised shared memory and scored the candidate 3.9e75x better.
-    # A reference that cannot reproduce its own maths is not a baseline.
-    spec = verify.InputSpec(shape=(4, 256))
-    probe = (
-        verify.generate(spec),
-        *(o.build(spec) for o in proposal.suite.extras),
-    )
-    truth = proposal.suite.oracle(*(t.double() for t in probe))
-    ref_err = float((ref(*probe).double() - truth.cpu()).abs().max())
-    if not (ref_err < 1e-3):
-        print()
-        print(f"REFERENCE IS NOT SANE: {facts.name} disagrees with the float64 oracle")
-        print(f"  by {ref_err:.3e}, which is far too much for it to be a baseline.")
-        print()
-        print("  Either the kernel does not compute what was proposed, or it was")
-        print(f"  launched wrongly. Inferred block={launch.block}; override with --block.")
-        print("  No substitution is claimed, because being better than a broken")
-        print("  reference is not evidence of anything.")
-        return 4
-
     summary = verify.Harness(
         candidate=candidate,
         reference=ref,
@@ -453,6 +427,15 @@ def _cmd_port(args) -> int:
     ).run(list(proposal.suite.shapes())[: args.limit])
     print(summary)
     print()
+
+    # The probe now lives in Harness, so verify, bench and synth get it too.
+    # What stays here is the advice only port can give: it is the command that
+    # inferred the launch geometry, so it is the one that can suggest --block.
+    if summary.probe_failure:
+        print(f"  Inferred block={launch.block}; override it with --block.")
+        print("  No substitution is claimed, because being better than a broken")
+        print("  reference is not evidence of anything.")
+        return 4
 
     if not summary.ok:
         print("SUBSTITUTION REJECTED. The proposal did not survive verification,")
