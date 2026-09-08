@@ -277,6 +277,11 @@ def test_nan_for_a_number_fails_even_when_the_reference_agrees(torch_):
         reference=broken,
         oracle=oracle,
         name="both broken",
+        # This case deliberately measures a broken reference, which is what the
+        # sanity probe exists to refuse. Opting out is why probe_cases is a
+        # field: the probe would reject this reference first and the gate under
+        # test would never be reached.
+        probe_cases=0,
     ).run([(4, 64)])
 
     assert not summary.ok, str(summary)

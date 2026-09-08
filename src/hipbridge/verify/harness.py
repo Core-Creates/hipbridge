@@ -73,11 +73,16 @@ class Summary:
     name: str
     results: list[CaseResult] = field(default_factory=list)
     skipped_reason: str | None = None
+    # Why the reference was refused as a baseline, when it was. Distinct from a
+    # skip, which means nothing ran and nothing is claimed, and from a case
+    # failure, which is a result. This says the comparison itself was void.
+    probe_failure: str | None = None
 
     @property
     def ok(self) -> bool:
         return (
             self.skipped_reason is None
+            and self.probe_failure is None
             and bool(self.results)
             and all(r.passed for r in self.results)
         )
@@ -129,6 +134,8 @@ class Summary:
     def __str__(self) -> str:
         if self.skipped_reason:
             return f"SKIP  {self.name}: {self.skipped_reason}"
+        if self.probe_failure:
+            return f"FAIL  {self.name}: REFERENCE IS NOT SANE, {self.probe_failure}"
         head = (
             f"{'PASS' if self.ok else 'FAIL'}  {self.name}: "
             f"{len(self.results) - len(self.failures)}/{len(self.results)} cases, "
@@ -180,6 +187,10 @@ class Harness:
     # Inference runs in half precision, so a candidate meant for it should be
     # swept in half precision, judged against the same float64 oracle.
     dtypes: Sequence[Any] = ()
+    # How many cases to spend sanity-checking the reference before trusting any
+    # comparison with it. Zero disables the probe, for a caller that has already
+    # established its reference or is deliberately measuring a broken one.
+    probe_cases: int = 6
 
     def extra_inputs(self, spec: InputSpec) -> list[Any]:
         """Build every extra operand for this case, on the sweep's device."""
@@ -266,15 +277,98 @@ class Harness:
             failures.append(f"LESS ACCURATE than the reference: {arb}")
         return CaseResult(label, not failures, report.max_ulp, failures, arb, report.max_abs)
 
+    def _probe_specs(self, shapes, sweep):
+        """A handful of cases spanning the sweep rather than one corner of it.
+
+        The probe this replaces ran one shape, (4, 256), one distribution, in
+        float32, which leaves three ways for a broken reference to pass it. A
+        kernel with a fixed-size `__shared__ float s[256]` is correct at 256
+        columns and garbage at 4096. A kernel that only misbehaves in half
+        precision is never asked. And the widest and tallest shapes, where block
+        and grid mistakes live, are not sampled at all.
+        """
+        picks: list[tuple[int, ...]] = []
+        for shape in (shapes[0], max(shapes, key=lambda s: s[-1]), max(shapes, key=lambda s: s[0])):
+            if tuple(shape) not in picks:
+                picks.append(tuple(shape))
+
+        dists = list(self.distributions) or [Distribution.NORMAL]
+        chosen = [dists[0]] if len(dists) == 1 else [dists[0], dists[-1]]
+
+        out = []
+        for shape in picks:
+            for dist in chosen:
+                for dtype in sweep:
+                    out.append(InputSpec(shape=shape, dtype=dtype, distribution=dist, seed=9973))
+        return out[: self.probe_cases]
+
+    def _probe_reference(self, shapes, sweep) -> str | None:
+        """Refuse a reference that cannot reproduce its own maths.
+
+        Oracle mode passes the candidate when it is closer to the truth than the
+        reference is. That is the right rule and it has a hole: if the reference
+        is garbage, the candidate is trivially closer and the run reports a
+        proof. Seen for real, with a tuned kernel launched at the wrong block
+        size, which read uninitialised shared memory and scored the candidate
+        3.9e75x better.
+
+        This lived in `port` alone, so `verify`, `bench` and `synth` ran without
+        it. `synth` is the one that executes unreviewed generated code and whose
+        docstring calls the gate its entire value.
+
+        The threshold is relative and follows the precision. An absolute 1e-3
+        was meaningless for a 256-wide softmax whose outputs are around 4e-3,
+        where a reference 20% wrong still read as sane, and it would fail
+        bfloat16 for being bfloat16. Sanity is a loose question: what this
+        catches is orders of magnitude out, not fractions of a ULP.
+        """
+        for spec in self._probe_specs(shapes, sweep):
+            ins = [generate(spec, device=self.device), *self.extra_inputs(spec)]
+            try:
+                got = self.reference(*ins)
+            except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+                # A compile error, a launch fault, a kernel selected that is not
+                # __global__: every one of them arrived as a raw traceback
+                # before, out of a call nobody had wrapped.
+                return (
+                    f"the reference could not be run on {spec.describe()}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+            truth = self.oracle(*(t.double() for t in ins))
+            err = float((got.double().cpu() - truth.cpu()).abs().max())
+            scale = float(truth.abs().max())
+            tolerance = max(1e-3, 32.0 * torch.finfo(spec.dtype).eps)
+            relative = err / scale if scale > 0 else err
+            if not (relative <= tolerance):
+                return (
+                    f"disagrees with the float64 oracle by {relative:.3e} relative "
+                    f"on {spec.describe()}, tolerance {tolerance:.3e}. It does not "
+                    f"compute what was proposed, or it was launched wrongly, and "
+                    f"being closer to the truth than a broken baseline is not "
+                    f"evidence of anything."
+                )
+        return None
+
     def run(self, shapes: Iterable[tuple[int, ...]], limit: int | None = None) -> Summary:
         if isinstance(self.reference, Reference):
             avail = self.reference.availability()
             if not avail:
                 return Summary(self.name, skipped_reason=avail.reason)
 
+        shapes = [tuple(s) for s in shapes]
         summary = Summary(self.name)
         n = 0
         sweep = self.dtypes or (torch.float32,)
+
+        # Before anything is ranked against the reference, establish that the
+        # reference is worth ranking against. Only meaningful in oracle mode:
+        # with no truth to check it against there is nothing to check.
+        if self.oracle is not None and self.probe_cases and shapes:
+            summary.probe_failure = self._probe_reference(shapes, sweep)
+            if summary.probe_failure:
+                return summary
+
         for shape in shapes:
             for dist in self.distributions:
                 for dtype in sweep:
