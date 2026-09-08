@@ -47,6 +47,7 @@ from hipbridge.verify.suites import (
     LAYER_NORM_AFFINE,
     RMS_NORM,
     RMS_NORM_AFFINE,
+    RMS_NORM_ROPE,
     ROPE,
     ROW_SOFTMAX,
     Suite,
@@ -230,6 +231,12 @@ def propose(
         (LAYER_NORM_AFFINE, _ROW_PATTERNS, _looks_like_layer_norm),
         (RMS_NORM, _ROW_PATTERNS, _looks_like_rms_norm),
         (RMS_NORM_AFFINE, _ROW_PATTERNS, _looks_like_rms_norm),
+        # Same evidence as RMSNorm, and the signature is what separates them: a
+        # scale plus two position tables is a normalisation fused with a
+        # rotation, and nothing else in this set takes three operands. The
+        # rotation itself leaves no structural trace, so the arity carries the
+        # discrimination and the oracle carries the proof.
+        (RMS_NORM_ROPE, _ROW_PATTERNS, _looks_like_rms_norm),
         (ROPE, _MAP_PATTERNS, _looks_like_rope),
     ):
         if pattern not in patterns:

@@ -406,6 +406,59 @@ ROPE = Suite(
     ),
 )
 
+
+def _rms_norm_rope_oracle(x, gamma, cos_tab, sin_tab):
+    """float64 RMSNorm with a learned scale, then a rotation of channel pairs."""
+    normed = _rms_norm_oracle(x) * gamma.double()
+    return _rope(normed, cos_tab.double(), sin_tab.double())
+
+
+def _two_launches(x, gamma, cos_tab, sin_tab):
+    """The same maths as two separate operations, which is what a library gives you.
+
+    This is the baseline the fused kernel has to beat, and it is deliberately
+    made of the project's own kernels rather than torch. Comparing one fused
+    launch against two of exactly the same launches isolates what fusion buys
+    from what the kernels buy, and a torch comparison would confound the two.
+
+    Falls back to torch when Triton is absent, so the suite still means something
+    on a machine without it.
+    """
+    from hipbridge import kernels
+
+    if kernels.available():
+        from hipbridge.kernels.norm import rms_norm_affine_rowwise
+        from hipbridge.kernels.rope import rope_rowwise
+
+        return rope_rowwise(rms_norm_affine_rowwise(x, gamma), cos_tab, sin_tab)
+    return _rope(_torch_rms_norm_affine(x, gamma), cos_tab, sin_tab)
+
+
+RMS_NORM_ROPE = Suite(
+    name="rms_norm_rope",
+    source_file="rms_norm_rope.cu",
+    kernel="rms_norm_rope",
+    launch=_norm_launch("rms_norm_rope", (1, 1, 1)),
+    oracle=_rms_norm_rope_oracle,
+    portable=_two_launches,
+    portable_name="2 launches",
+    usage_import="from hipbridge.kernels.fused import rms_norm_rope_rowwise",
+    usage_call="out = rms_norm_rope_rowwise(x, gamma, cos_tab, sin_tab)",
+    shapes=_even_row_shapes,
+    extras=(
+        _per_column("gamma", 6007, ("weight", "scale", "g", "w")),
+        _half_width("cos_tab", 4001, ("cos", "cos_cache", "freqs_cos", "c"), torch.cos),
+        _half_width("sin_tab", 4001, ("sin", "sin_cache", "freqs_sin", "s"), torch.sin),
+    ),
+    baselines=(
+        Baseline(
+            name="tuned HIP",
+            source_file="rms_norm_rope_tuned.cu",
+            launch=_norm_launch("rms_norm_rope_tuned", (256, 1, 1)),
+        ),
+    ),
+)
+
 BUILTIN: tuple[Suite, ...] = (
     ROW_SOFTMAX,
     LAYER_NORM,
@@ -413,6 +466,7 @@ BUILTIN: tuple[Suite, ...] = (
     RMS_NORM,
     RMS_NORM_AFFINE,
     ROPE,
+    RMS_NORM_ROPE,
 )
 
 
@@ -486,6 +540,13 @@ def candidate_for(suite: Suite) -> tuple[Callable[[torch.Tensor], torch.Tensor],
             )
         return _torch_rms_norm_affine, "torch rms_norm affine (Triton unavailable)"
 
+    if suite.name == "rms_norm_rope":
+        if have_triton:
+            from hipbridge.kernels.fused import rms_norm_rope_rowwise
+
+            return rms_norm_rope_rowwise, "hipbridge.kernels.fused.rms_norm_rope (Triton, fused)"
+        return _two_launches, "torch rms_norm then rope (Triton unavailable)"
+
     if suite.name == "rope":
         if have_triton:
             from hipbridge.kernels.rope import rope_rowwise
@@ -502,6 +563,7 @@ __all__ = [
     "LAYER_NORM_AFFINE",
     "RMS_NORM",
     "RMS_NORM_AFFINE",
+    "RMS_NORM_ROPE",
     "ROPE",
     "ROW_SOFTMAX",
     "Baseline",
