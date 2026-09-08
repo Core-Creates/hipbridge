@@ -204,3 +204,96 @@ def test_strictly_closer_is_still_better(torch_):
     arb = verify.arbitrate(good, sloppy, truth)
     assert arb.ratio < 1.0
     assert arb.verdict == "better", str(arb)
+
+
+def test_a_nan_in_the_oracle_does_not_excuse_the_finite_elements(torch_):
+    """The blind pass: one NaN used to decide the whole case.
+
+    Both errors were a max over the entire tensor, so a single NaN in the truth
+    made both of them NaN, and the branch catching "NaN on both sides" returned
+    equivalent for everything else in the tensor. In oracle mode the harness has
+    already dropped the ULP and identity checks, so nothing else was looking.
+
+    The two calls below differ in one element and in nothing else.
+    """
+    nan = float("nan")
+    garbage = torch_.tensor([[nan, 999.0, -42.0, 0.0]])
+    honest = torch_.tensor([[nan, 1.0, 2.0, 3.0]])
+    truth = torch_.tensor([[nan, 1.0, 2.0, 3.0]], dtype=torch_.float64)
+
+    with_nan = verify.arbitrate(garbage, honest, truth)
+    without_nan = verify.arbitrate(
+        torch_.tensor([[0.0, 999.0, -42.0, 0.0]]),
+        torch_.tensor([[0.0, 1.0, 2.0, 3.0]]),
+        torch_.tensor([[0.0, 1.0, 2.0, 3.0]], dtype=torch_.float64),
+    )
+
+    assert with_nan.verdict == "worse", str(with_nan)
+    assert with_nan.verdict == without_nan.verdict
+    assert with_nan.candidate_err == pytest.approx(without_nan.candidate_err)
+
+
+def test_the_non_finite_pattern_is_judged_before_the_magnitudes(torch_):
+    """Producing a number where the oracle produces NaN answers a different question."""
+    nan = float("nan")
+    truth = torch_.tensor([[nan, 1.0, 2.0, 3.0]], dtype=torch_.float64)
+    agrees = torch_.tensor([[nan, 1.0, 2.0, 3.0]])
+    invents = torch_.tensor([[5.0, 1.0, 2.0, 3.0]])
+
+    assert verify.arbitrate(invents, agrees, truth).verdict == "worse"
+    assert verify.arbitrate(agrees, invents, truth).verdict == "better"
+    assert verify.arbitrate(agrees, agrees, truth).verdict == "equivalent"
+
+
+def test_the_noise_floor_is_taken_over_the_finite_part(torch_):
+    """A NaN anywhere made the scale NaN, which disabled the floor as well.
+
+    Every `<=` against a NaN floor answers False, so two implementations that
+    were both essentially exact stopped being ranked as noise and fell through
+    to the ratio.
+    """
+    nan = float("nan")
+    truth = torch_.tensor([[nan, 1.0, 2.0, 3.0]], dtype=torch_.float64)
+    a = torch_.tensor([[nan, 1.0, 2.0, 3.0]])
+    b = a.clone()
+    b[0, 1] = float(torch_.nextafter(b[0, 1], torch_.tensor(2.0)))
+
+    assert verify.arbitrate(b, a, truth).verdict == "equivalent"
+
+
+def test_nan_for_a_number_fails_even_when_the_reference_agrees(torch_):
+    """Ranking is relative, so something else has to fail a shared failure.
+
+    Two implementations that both return NaN where the oracle returns a number
+    rank as equivalent, which is true and useless. nonfinite_where_finite is the
+    gate that fails the case, and it survives oracle mode where the ULP and
+    identity checks do not.
+    """
+    oracle = lambda t: torch_.softmax(t.double(), dim=-1)  # noqa: E731
+    broken = verify.TorchReference(lambda t: torch_.full_like(t, float("nan")))
+
+    summary = verify.Harness(
+        candidate=lambda t: torch_.full_like(t, float("nan")),
+        reference=broken,
+        oracle=oracle,
+        name="both broken",
+    ).run([(4, 64)])
+
+    assert not summary.ok, str(summary)
+    assert "NOT FINITE" in str(summary), str(summary)
+
+
+def test_a_correct_candidate_still_passes_the_finiteness_gate(torch_):
+    """The gate must not fire on the ordinary case it sits in front of."""
+    oracle = lambda t: torch_.softmax(t.double(), dim=-1)  # noqa: E731
+    ref = verify.TorchReference(lambda t: torch_.softmax(t, dim=-1))
+
+    summary = verify.Harness(
+        candidate=lambda t: torch_.softmax(t, dim=-1),
+        reference=ref,
+        oracle=oracle,
+        name="ordinary",
+    ).run([(4, 64), (1, 257)])
+
+    assert summary.ok, str(summary)
+    assert "NOT FINITE" not in str(summary), str(summary)
