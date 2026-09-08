@@ -337,3 +337,34 @@ def test_a_row_wise_win_is_still_reported_as_one(torch_):
     arb = verify.arbitrate(close, far, truth)
     assert arb.verdict == "better", str(arb)
     assert arb.ratio < 1.0
+
+
+def test_a_row_the_original_got_exactly_right_does_not_fail_the_case(torch_):
+    """The per-row guard's first version failed a candidate that was 12x closer.
+
+    Measured on an MI300X: layer_norm at 64x65 and 1000x128 on monotonic input.
+    The naive kernel lands nearly exact on 17 of those 64 rows, so the ratio
+    between the two implementations there is 36x, while the candidate's error is
+    six millionths of a percent of the row. Failing that is the
+    match-the-original's-rounding test this project exists to argue against.
+
+    A row now has to be wrong on its own terms, not merely worse than a
+    reference that happened to be exact.
+    """
+    truth = torch_.tensor(
+        [[1.4, -1.4], [1.4, -1.4], [1.4, -1.4], [1.4, -1.4]], dtype=torch_.float64
+    )
+    # Exact on the first two rows, badly off on the last two.
+    reference = truth.clone()
+    reference[2:] += 1.028e-4
+    # Slightly off everywhere, and far closer overall.
+    candidate = truth + 8.779e-6
+
+    arb = verify.arbitrate(candidate.float(), reference.float(), truth)
+    assert arb.verdict == "better", str(arb)
+    assert arb.ratio < 1.0
+
+    # The guard still fires when a row is wrong on its own terms.
+    broken = candidate.clone()
+    broken[0] = 0.0  # a whole row, 100% of its own magnitude
+    assert verify.arbitrate(broken.float(), reference.float(), truth).verdict == "worse"
