@@ -79,10 +79,16 @@ class Operand:
 
     def build(self, primary: InputSpec, device: str = "cpu") -> torch.Tensor:
         """The tensor this operand contributes for one case."""
-        from hipbridge.verify.inputs import generate
+        from hipbridge.verify.inputs import generate, relayout
 
-        t = generate(self.spec(primary), device=device)
-        return self.transform(t) if self.transform is not None else t
+        spec = self.spec(primary)
+        t = generate(spec, device=device)
+        if self.transform is None:
+            return t
+        # Re-laid out after the transform, not before. torch.cos allocates a
+        # fresh contiguous tensor, so a padded table came back packed and the
+        # table strides went untested while appearing to be swept.
+        return relayout(self.transform(t), spec.layout)
 
 
 @dataclass(frozen=True)
@@ -287,6 +293,10 @@ def _per_column(name: str, seed_offset: int, aliases: tuple[str, ...] = ()) -> O
             dtype=spec.dtype,
             distribution=weight_distribution(spec.distribution),
             seed=spec.seed + seed_offset,
+            # Inherited, so a strided weight is read with its own stride rather
+            # than assumed packed. The kernels take gamma_stride and the table
+            # strides for this reason.
+            layout=spec.layout,
         )
 
     return Operand(name=name, spec=make, aliases=aliases)
@@ -379,6 +389,10 @@ def _half_width(
             # and the hostile inputs keep hostile angles beside them.
             distribution=spec.distribution,
             seed=spec.seed + seed_offset,
+            # Inherited, so a strided weight is read with its own stride rather
+            # than assumed packed. The kernels take gamma_stride and the table
+            # strides for this reason.
+            layout=spec.layout,
         )
 
     return Operand(name=name, spec=make, aliases=aliases, transform=transform)

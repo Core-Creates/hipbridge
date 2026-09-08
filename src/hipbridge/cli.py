@@ -193,6 +193,7 @@ def _cmd_verify(args) -> int:
             oracle=suite.oracle,
             extras=tuple(o.build for o in suite.extras),
             dtypes=_dtypes(args),
+            layouts=verify.NON_CONTIGUOUS if args.layouts else (),
             name=f"{suite.name} vs original on {args.toolchain}",
         ).run(shape_list)
         ran += 1
@@ -540,6 +541,7 @@ def _cmd_port(args) -> int:
         reference=ref,
         oracle=suites.oracle_for(proposal.suite, proposal.epsilon),
         extras=tuple(o.build for o in proposal.suite.extras),
+        layouts=verify.NON_CONTIGUOUS if args.layouts else (),
         name=f"{facts.name} vs {described}",
     ).run(list(proposal.suite.shapes())[: args.limit])
     print(summary)
@@ -763,6 +765,12 @@ def main(argv: list[str] | None = None) -> int:
         help="fail instead of skipping when no device is available",
     )
     ver.add_argument(
+        "--no-layouts",
+        dest="layouts",
+        action="store_false",
+        help="skip the non-contiguous layout pass (transposed, sliced, padded inputs)",
+    )
+    ver.add_argument(
         "--json",
         action="store_true",
         help="emit the result as JSON on stdout, in place of the prose report",
@@ -836,6 +844,12 @@ def main(argv: list[str] | None = None) -> int:
         "--require",
         action="store_true",
         help="fail instead of skipping when nothing can be proved",
+    )
+    prt.add_argument(
+        "--no-layouts",
+        dest="layouts",
+        action="store_false",
+        help="skip the non-contiguous layout pass (transposed, sliced, padded inputs)",
     )
     prt.add_argument(
         "--json",

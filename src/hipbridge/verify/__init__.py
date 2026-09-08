@@ -38,6 +38,8 @@ _LAZY = {
     # inputs
     "DEFAULT_SWEEP": "inputs",
     "Distribution": "inputs",
+    "Layout": "inputs",
+    "NON_CONTIGUOUS": "inputs",
     "InputSpec": "inputs",
     "generate": "inputs",
     # reference
