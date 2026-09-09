@@ -186,7 +186,14 @@ jobs:
           # as success. The hosted dry run has no device, so 5 is the expected
           # answer there, and only there.
           dry_run=${{ inputs.runner == 'ubuntu-latest' && 'true' || 'false' }}
-          for k in row_softmax layer_norm layer_norm_affine rms_norm rms_norm_affine rope; do
+          # Asked for, not listed. This loop hardcoded six names and omitted
+          # rms_norm_rope, so the fused kernel was never proved end to end and
+          # results/ carried six port reports for seven suites. A hardcoded list
+          # goes stale the first time somebody adds a kernel and does not think
+          # to look in a YAML file.
+          kernels=$(${{ steps.py.outputs.python }} -c             "from hipbridge.verify.suites import BUILTIN; print(' '.join(s.name for s in BUILTIN))")
+          echo "proving: $kernels"
+          for k in $kernels; do
             echo "== $k"
             set +e
             ${{ steps.py.outputs.python }} -m hipbridge.cli port "examples/$k.cu"               --toolchain hipcc               --arch "${{ inputs.arch }}"               --limit "${{ inputs.limit }}"               --report

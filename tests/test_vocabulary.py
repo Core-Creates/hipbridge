@@ -46,12 +46,12 @@ def test_every_vocabulary_spelling_is_declared(name: str):
 def test_the_frontend_and_the_recognizer_share_one_definition():
     """Not two equal copies. One object, so they cannot drift apart."""
     from hipbridge.frontend import parser
-    from hipbridge.verify import substitutions
+    from hipbridge.verify import evidence
 
     assert parser.NORMALISING is prelude.NORMALISING
-    assert substitutions._RSQRT is prelude.NORMALISING
-    assert substitutions._EXP is prelude.EXP_NAMES
-    assert substitutions._MAX is prelude.MAX_NAMES
+    assert evidence.NORMALISING is prelude.NORMALISING
+    assert evidence.EXP_NAMES is prelude.EXP_NAMES
+    assert evidence.MAX_NAMES is prelude.MAX_NAMES
 
 
 SOFTMAX = """

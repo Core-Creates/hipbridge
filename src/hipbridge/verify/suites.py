@@ -23,6 +23,8 @@ from typing import Any
 
 import torch
 
+from hipbridge.frontend.ir import KernelFacts, Pattern
+from hipbridge.verify import evidence
 from hipbridge.verify.inputs import InputSpec, weight_distribution
 from hipbridge.verify.reference import LaunchSpec
 
@@ -109,12 +111,29 @@ class Suite:
     # case. LayerNorm's gamma and beta live here. Empty for the kernels that
     # take one tensor, which is most of them.
     extras: tuple[Operand, ...] = ()
+    # The tuned AMD implementation this suite proposes, as "module:function",
+    # and the fallback for a machine without the [kernels] extra.
+    #
+    # These used to be a 55-line `if suite.name == ...` chain in this file,
+    # dispatching on a string key to reproduce a fact the Suite already carried:
+    # the same import was written twice, once as `usage_import` prose printed to
+    # the user and once as an executed statement, with nothing asserting the two
+    # agreed. The chain ended in `raise KeyError(suite.name)`, so a suite added
+    # to BUILTIN but not to the chain passed every test and died at run time.
+    triton_impl: str = ""
+    triton_label: str = ""
+    fallback: Callable[..., torch.Tensor] | None = None
+    fallback_label: str = ""
+    # Which recognizer patterns may propose this suite, and the evidence test
+    # that has to corroborate before one is. Carried here so `propose` iterates
+    # BUILTIN instead of holding a second list of every suite.
+    patterns: tuple[Pattern, ...] = ()
+    evidence: Callable[[KernelFacts], list[str] | None] | None = None
     # How a caller actually uses the substitute once it is proved. Held per
     # suite because `port` printed a hardcoded softmax snippet for every kernel
     # it proved, so a proved LayerNorm came with instructions to call softmax on
     # it. The proof was right and the instruction was wrong, which is the worst
     # combination this project can produce.
-    usage_import: str = ""
     usage_call: str = ""
     # Does this suite's maths include an epsilon? The norms do, softmax and RoPE
     # do not. Only the suites that do require the value to be read off the
@@ -123,6 +142,26 @@ class Suite:
 
     def source(self, examples_dir: Path) -> str:
         return (examples_dir / self.source_file).read_text(encoding="utf-8")
+
+    @property
+    def usage_import(self) -> str:
+        """The import line to show a user, derived from the one that is executed.
+
+        Previously a hand-typed field sitting beside the branch that imported the
+        same thing. Deriving it means the instruction printed after a proof and
+        the code the proof actually ran cannot name different functions.
+        """
+        if not self.triton_impl:
+            return ""
+        module, _, function = self.triton_impl.partition(":")
+        return f"from {module} import {function}"
+
+    def resolve_triton(self) -> Callable[..., torch.Tensor]:
+        """Import the tuned implementation. Raises if it is not there."""
+        from importlib import import_module
+
+        module, _, function = self.triton_impl.partition(":")
+        return getattr(import_module(module), function)
 
     def all_baselines(self) -> tuple[Baseline, ...]:
         """The original first, then any additional baselines."""
@@ -142,6 +181,32 @@ def _row_shapes() -> Sequence[tuple[int, ...]]:
     return shapes.sample(shapes.row_wise())
 
 
+def _norm_launch(kernel: str, block: tuple[int, int, int]) -> LaunchSpec:
+    """Every kernel here shares softmax's launch shape: one block per row."""
+    return LaunchSpec(
+        kernel=kernel,
+        grid=lambda s: (s[0][0], 1, 1),
+        block=block,
+        scalar_args=lambda s: [s[0][0], s[0][1]],
+        out_shape=lambda s: s[0],
+    )
+
+
+def tuned_baseline(kernel: str, block: tuple[int, int, int] = (256, 1, 1)) -> Baseline:
+    """The competently written HIP version of `kernel`, by convention.
+
+    Seven byte-identical Baseline literals used to spell this out, differing
+    only in the kernel name: same display name, same `<k>_tuned.cu` file, same
+    256-thread block. A convention written seven times is a convention nobody
+    can change.
+    """
+    return Baseline(
+        name="tuned HIP",
+        source_file=f"{kernel}_tuned.cu",
+        launch=_norm_launch(f"{kernel}_tuned", block),
+    )
+
+
 ROW_SOFTMAX = Suite(
     name="row_softmax",
     source_file="row_softmax.cu",
@@ -155,34 +220,16 @@ ROW_SOFTMAX = Suite(
     ),
     oracle=lambda t: torch.softmax(t.double(), dim=-1),
     portable=lambda t: torch.softmax(t, dim=-1),
-    usage_import="from hipbridge.kernels.softmax import softmax_rowwise",
+    triton_impl="hipbridge.kernels.softmax:softmax_rowwise",
+    triton_label="hipbridge.kernels.softmax (Triton, AMD-tuned)",
+    fallback=lambda t: torch.softmax(t, dim=-1),
+    fallback_label="torch.softmax (Triton unavailable)",
+    patterns=evidence.ROW_PATTERNS,
+    evidence=evidence.looks_like_softmax,
     usage_call="out = softmax_rowwise(x)",
     shapes=_row_shapes,
-    baselines=(
-        Baseline(
-            name="tuned HIP",
-            source_file="row_softmax_tuned.cu",
-            launch=LaunchSpec(
-                kernel="row_softmax_tuned",
-                grid=lambda s: (s[0][0], 1, 1),  # one block per row
-                block=(256, 1, 1),  # four wavefronts, tree-reduced in LDS
-                scalar_args=lambda s: [s[0][0], s[0][1]],
-                out_shape=lambda s: s[0],
-            ),
-        ),
-    ),
+    baselines=(tuned_baseline("row_softmax"),),
 )
-
-
-def _norm_launch(kernel: str, block: tuple[int, int, int]) -> LaunchSpec:
-    """LayerNorm and RMSNorm share softmax's launch shape: one block per row."""
-    return LaunchSpec(
-        kernel=kernel,
-        grid=lambda s: (s[0][0], 1, 1),
-        block=block,
-        scalar_args=lambda s: [s[0][0], s[0][1]],
-        out_shape=lambda s: s[0],
-    )
 
 
 def _torch_layer_norm(t: torch.Tensor, eps: float = DEFAULT_EPS) -> torch.Tensor:
@@ -232,17 +279,16 @@ LAYER_NORM = Suite(
     launch=_norm_launch("layer_norm", (1, 1, 1)),  # serial within the row
     oracle=_layer_norm_oracle,
     portable=_torch_layer_norm,
-    usage_import="from hipbridge.kernels.norm import layer_norm_rowwise",
+    triton_impl="hipbridge.kernels.norm:layer_norm_rowwise",
+    triton_label="hipbridge.kernels.norm.layer_norm (Triton, AMD-tuned)",
+    fallback=_torch_layer_norm,
+    fallback_label="torch.nn.functional.layer_norm (Triton unavailable)",
+    patterns=evidence.ROW_PATTERNS,
+    evidence=evidence.looks_like_layer_norm,
     usage_call="out = layer_norm_rowwise(x)",
     portable_name="torch",
     shapes=_row_shapes,
-    baselines=(
-        Baseline(
-            name="tuned HIP",
-            source_file="layer_norm_tuned.cu",
-            launch=_norm_launch("layer_norm_tuned", (256, 1, 1)),
-        ),
-    ),
+    baselines=(tuned_baseline("layer_norm"),),
 )
 
 RMS_NORM = Suite(
@@ -253,17 +299,16 @@ RMS_NORM = Suite(
     launch=_norm_launch("rms_norm", (1, 1, 1)),
     oracle=_rms_norm_oracle,
     portable=_torch_rms_norm,
-    usage_import="from hipbridge.kernels.norm import rms_norm_rowwise",
+    triton_impl="hipbridge.kernels.norm:rms_norm_rowwise",
+    triton_label="hipbridge.kernels.norm.rms_norm (Triton, AMD-tuned)",
+    fallback=_torch_rms_norm,
+    fallback_label="torch rms_norm (Triton unavailable)",
+    patterns=evidence.ROW_PATTERNS,
+    evidence=evidence.looks_like_rms_norm,
     usage_call="out = rms_norm_rowwise(x)",
     portable_name="torch",
     shapes=_row_shapes,
-    baselines=(
-        Baseline(
-            name="tuned HIP",
-            source_file="rms_norm_tuned.cu",
-            launch=_norm_launch("rms_norm_tuned", (256, 1, 1)),
-        ),
-    ),
+    baselines=(tuned_baseline("rms_norm"),),
 )
 
 
@@ -310,20 +355,19 @@ LAYER_NORM_AFFINE = Suite(
     launch=_norm_launch("layer_norm_affine", (1, 1, 1)),
     oracle=_layer_norm_affine_oracle,
     portable=_torch_layer_norm_affine,
-    usage_import="from hipbridge.kernels.norm import layer_norm_affine_rowwise",
+    triton_impl="hipbridge.kernels.norm:layer_norm_affine_rowwise",
+    triton_label="hipbridge.kernels.norm.layer_norm_affine (Triton, AMD-tuned)",
+    fallback=_torch_layer_norm_affine,
+    fallback_label="torch layer_norm affine (Triton unavailable)",
+    patterns=evidence.ROW_PATTERNS,
+    evidence=evidence.looks_like_layer_norm,
     usage_call="out = layer_norm_affine_rowwise(x, gamma, beta)",
     shapes=_row_shapes,
     extras=(
         _per_column("gamma", 1009, ("weight", "scale", "g", "w")),
         _per_column("beta", 2003, ("bias", "shift", "b")),
     ),
-    baselines=(
-        Baseline(
-            name="tuned HIP",
-            source_file="layer_norm_affine_tuned.cu",
-            launch=_norm_launch("layer_norm_affine_tuned", (256, 1, 1)),
-        ),
-    ),
+    baselines=(tuned_baseline("layer_norm_affine"),),
 )
 
 
@@ -406,17 +450,16 @@ RMS_NORM_AFFINE = Suite(
     launch=_norm_launch("rms_norm_affine", (1, 1, 1)),
     oracle=_rms_norm_affine_oracle,
     portable=_torch_rms_norm_affine,
-    usage_import="from hipbridge.kernels.norm import rms_norm_affine_rowwise",
+    triton_impl="hipbridge.kernels.norm:rms_norm_affine_rowwise",
+    triton_label="hipbridge.kernels.norm.rms_norm_affine (Triton, AMD-tuned)",
+    fallback=_torch_rms_norm_affine,
+    fallback_label="torch rms_norm affine (Triton unavailable)",
+    patterns=evidence.ROW_PATTERNS,
+    evidence=evidence.looks_like_rms_norm,
     usage_call="out = rms_norm_affine_rowwise(x, gamma)",
     shapes=_row_shapes,
     extras=(_per_column("gamma", 3001, ("weight", "scale", "g", "w")),),
-    baselines=(
-        Baseline(
-            name="tuned HIP",
-            source_file="rms_norm_affine_tuned.cu",
-            launch=_norm_launch("rms_norm_affine_tuned", (256, 1, 1)),
-        ),
-    ),
+    baselines=(tuned_baseline("rms_norm_affine"),),
 )
 
 ROPE = Suite(
@@ -426,7 +469,12 @@ ROPE = Suite(
     launch=_norm_launch("rope", (1, 1, 1)),
     oracle=_rope_oracle,
     portable=_rope,
-    usage_import="from hipbridge.kernels.rope import rope_rowwise",
+    triton_impl="hipbridge.kernels.rope:rope_rowwise",
+    triton_label="hipbridge.kernels.rope (Triton, AMD-tuned)",
+    fallback=_rope,
+    fallback_label="torch rope (Triton unavailable)",
+    patterns=evidence.MAP_PATTERNS,
+    evidence=evidence.looks_like_rope,
     usage_call="out = rope_rowwise(x, cos_tab, sin_tab)",
     shapes=_even_row_shapes,
     extras=(
@@ -435,13 +483,7 @@ ROPE = Suite(
         # the pair is an actual rotation rather than two unrelated tables.
         _half_width("sin_tab", 4001, ("sin", "sin_cache", "freqs_sin", "s"), torch.sin),
     ),
-    baselines=(
-        Baseline(
-            name="tuned HIP",
-            source_file="rope_tuned.cu",
-            launch=_norm_launch("rope_tuned", (256, 1, 1)),
-        ),
-    ),
+    baselines=(tuned_baseline("rope"),),
 )
 
 
@@ -481,7 +523,12 @@ RMS_NORM_ROPE = Suite(
     oracle=_rms_norm_rope_oracle,
     portable=_two_launches,
     portable_name="2 launches",
-    usage_import="from hipbridge.kernels.fused import rms_norm_rope_rowwise",
+    triton_impl="hipbridge.kernels.fused:rms_norm_rope_rowwise",
+    triton_label="hipbridge.kernels.fused.rms_norm_rope (Triton, fused)",
+    fallback=_two_launches,
+    fallback_label="torch rms_norm then rope (Triton unavailable)",
+    patterns=evidence.ROW_PATTERNS,
+    evidence=evidence.looks_like_rms_norm,
     usage_call="out = rms_norm_rope_rowwise(x, gamma, cos_tab, sin_tab)",
     shapes=_even_row_shapes,
     extras=(
@@ -489,13 +536,7 @@ RMS_NORM_ROPE = Suite(
         _half_width("cos_tab", 4001, ("cos", "cos_cache", "freqs_cos", "c"), torch.cos),
         _half_width("sin_tab", 4001, ("sin", "sin_cache", "freqs_sin", "s"), torch.sin),
     ),
-    baselines=(
-        Baseline(
-            name="tuned HIP",
-            source_file="rms_norm_rope_tuned.cu",
-            launch=_norm_launch("rms_norm_rope_tuned", (256, 1, 1)),
-        ),
-    ),
+    baselines=(tuned_baseline("rms_norm_rope"),),
 )
 
 BUILTIN: tuple[Suite, ...] = (
@@ -526,74 +567,29 @@ def make_inputs(suite: Suite, spec: InputSpec, device: str = "cpu") -> tuple[tor
     )
 
 
-def _candidate_impl(suite: Suite) -> tuple[Callable[[torch.Tensor], torch.Tensor], str]:
+def _candidate_impl(suite: Suite) -> tuple[Callable[..., torch.Tensor], str]:
     """The implementation being proposed in place of the original.
 
     Prefers the tuned AMD Triton kernel when the [kernels] extra is installed,
     which is the substitution this project actually exists to make. Falls back to
     a torch implementation so the suite still runs and still means something on a
     machine without Triton.
+
+    Resolved from the suite rather than branched on its name. This was a 55-line
+    `if suite.name == ...` chain ending in `raise KeyError(suite.name)`, so a
+    suite added to BUILTIN and not to the chain was well-formed by every test in
+    the repo and raised the first time anyone tried to prove it.
     """
     from hipbridge import kernels
 
-    have_triton = kernels.available()
-
-    if suite.name == "row_softmax":
-        if have_triton:
-            from hipbridge.kernels.softmax import softmax_rowwise
-
-            return softmax_rowwise, "hipbridge.kernels.softmax (Triton, AMD-tuned)"
-        return (lambda t: torch.softmax(t, dim=-1)), "torch.softmax (Triton unavailable)"
-
-    if suite.name == "layer_norm":
-        if have_triton:
-            from hipbridge.kernels.norm import layer_norm_rowwise
-
-            return layer_norm_rowwise, "hipbridge.kernels.norm.layer_norm (Triton, AMD-tuned)"
-        return _torch_layer_norm, "torch.nn.functional.layer_norm (Triton unavailable)"
-
-    if suite.name == "layer_norm_affine":
-        if have_triton:
-            from hipbridge.kernels.norm import layer_norm_affine_rowwise
-
-            return (
-                layer_norm_affine_rowwise,
-                "hipbridge.kernels.norm.layer_norm_affine (Triton, AMD-tuned)",
-            )
-        return _torch_layer_norm_affine, "torch layer_norm affine (Triton unavailable)"
-
-    if suite.name == "rms_norm":
-        if have_triton:
-            from hipbridge.kernels.norm import rms_norm_rowwise
-
-            return rms_norm_rowwise, "hipbridge.kernels.norm.rms_norm (Triton, AMD-tuned)"
-        return _torch_rms_norm, "torch rms_norm (Triton unavailable)"
-
-    if suite.name == "rms_norm_affine":
-        if have_triton:
-            from hipbridge.kernels.norm import rms_norm_affine_rowwise
-
-            return (
-                rms_norm_affine_rowwise,
-                "hipbridge.kernels.norm.rms_norm_affine (Triton, AMD-tuned)",
-            )
-        return _torch_rms_norm_affine, "torch rms_norm affine (Triton unavailable)"
-
-    if suite.name == "rms_norm_rope":
-        if have_triton:
-            from hipbridge.kernels.fused import rms_norm_rope_rowwise
-
-            return rms_norm_rope_rowwise, "hipbridge.kernels.fused.rms_norm_rope (Triton, fused)"
-        return _two_launches, "torch rms_norm then rope (Triton unavailable)"
-
-    if suite.name == "rope":
-        if have_triton:
-            from hipbridge.kernels.rope import rope_rowwise
-
-            return rope_rowwise, "hipbridge.kernels.rope (Triton, AMD-tuned)"
-        return _rope, "torch rope (Triton unavailable)"
-
-    raise KeyError(suite.name)
+    if kernels.available():
+        return suite.resolve_triton(), suite.triton_label
+    if suite.fallback is None:
+        raise LookupError(
+            f"{suite.name} declares no fallback, so it cannot be verified without "
+            "the [kernels] extra"
+        )
+    return suite.fallback, suite.fallback_label
 
 
 def candidate_for(
