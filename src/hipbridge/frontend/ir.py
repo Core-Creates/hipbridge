@@ -148,6 +148,9 @@ class Recognition:
             # on it; the proof is what decides.
             "confidence": self.confidence if self.recognized else None,
             "rationale": list(self.rationale),
+            # How much of the file clang could not resolve. Reported rather than
+            # acted on, for the same reason as `confidence`.
+            "parse_errors": self.facts.parse_errors,
             "facts": self.facts.as_dict(),
         }
 
@@ -157,9 +160,37 @@ class Recognition:
             lines.append(f"confidence: {self.confidence}")
         for r in self.rationale:
             lines.append(f"  - {r}")
+        lines += self.parse_warning()
         if not self.recognized:
             lines.append(
                 "  No substitution will be attempted. "
                 "Translate this kernel by hand or extend the recognizers."
             )
         return "\n".join(lines)
+
+    def parse_warning(self) -> list[str]:
+        """Say so when the read was taken over a file clang stumbled on.
+
+        The frontend parses with `-ferror-limit=0`, which is deliberate: a CUDA
+        translation unit parsed as C++ always has some unresolved corner, and
+        stopping at the first one would recognise nothing. The cost is that an
+        unresolved call leaves no CALL_EXPR at all, so it goes missing from
+        `facts.calls` rather than being flagged in them, and every rule keying
+        on a call silently sees a smaller kernel than the one on disk.
+
+        This count was computed and stored from the beginning and shown to
+        nobody, so a half-parsed file failed as "no recognizer claimed this
+        kernel" with no hint that most of it had not resolved. Advisory, like
+        `confidence`: nothing branches on it, because a float64 oracle is a
+        better judge of a substitution than a parser's opinion of a header.
+        """
+        n = self.facts.parse_errors
+        if not n:
+            return []
+        return [
+            f"  ! {n} construct(s) in this file did not resolve, so the structural",
+            "    read above covers less than the whole kernel. Unresolved calls are",
+            "    absent from the facts rather than flagged in them. Including CUDA",
+            "    headers, or using types the frontend does not model, is the usual",
+            "    cause.",
+        ]

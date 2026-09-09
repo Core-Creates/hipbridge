@@ -319,8 +319,7 @@ def code_digest(root: Path | None = None) -> str:
     # typo'd into root=. Each of those hashed to sha256("") before this.
     if not counted:
         raise DigestUnavailable(
-            f"{base} contains none of {', '.join(CODE_PATHS)}, so there is no "
-            "measured code to hash"
+            f"{base} contains none of {', '.join(CODE_PATHS)}, so there is no measured code to hash"
         )
     return h.hexdigest()[:16]
 
