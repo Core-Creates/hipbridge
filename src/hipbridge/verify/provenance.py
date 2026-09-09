@@ -91,6 +91,19 @@ def torch_version() -> str:
         return "not installed"
 
 
+def _digest_field() -> str:
+    """The digest cell for a report header, or a stamp saying it is unanswerable.
+
+    A report should still be written from a tree this cannot read. What it must
+    not do is claim a digest, because the claim is what every freshness check
+    downstream believes.
+    """
+    try:
+        return f"`{code_digest()}`"
+    except DigestUnavailable as exc:
+        return f"{DIGEST_UNAVAILABLE} ({exc})"
+
+
 def header(title: str, toolchain: str, arch: str) -> str:
     """A markdown provenance block for the top of a report."""
     rows = [
@@ -101,7 +114,7 @@ def header(title: str, toolchain: str, arch: str) -> str:
         ("toolchain", f"{toolchain}, {toolchain_version(toolchain)}"),
         ("arch", arch or "default"),
         ("torch", torch_version()),
-        ("measured code", f"`{code_digest()}`"),
+        ("measured code", _digest_field()),
     ]
     lines = [f"# {title}", "", "| field | value |", "|---|---|"]
     lines += [f"| {k} | {v} |" for k, v in rows]
@@ -137,6 +150,42 @@ CODE_PATHS = (
 # invalidated every report, even though not one measured number had moved, and
 # each round cost a 40-minute metered GPU run to restore green.
 DIGEST_EXCLUDE = frozenset({"provenance.py"})
+
+# What `header` stamps when the measured code cannot be read. A distinct literal
+# rather than a hash, so `staleness` can tell "I could not check" apart from
+# "I checked and it matched", which a plausible-looking hex cannot express.
+DIGEST_UNAVAILABLE = "unavailable"
+
+
+class DigestUnavailable(RuntimeError):
+    """The code a measurement depends on could not be found on disk.
+
+    Raised rather than returned, because everything a caller could do with a
+    digest it failed to compute is wrong. This is the one field in this module
+    that must not degrade to "unknown" in place. The others describe the run, and
+    a missing GPU name costs a reader some context; this one is the check that
+    decides whether every committed number still describes this code, so a value
+    that merely looks like an answer is worse than no report at all.
+    """
+
+
+def _discover_root() -> Path | None:
+    """The repo root, found by walking up from this file, or None off a checkout.
+
+    This used to be `parents[3]`, which is right for `src/hipbridge/verify/` in a
+    source tree and lands in `lib/` for an installed wheel. There it found none
+    of CODE_PATHS, hashed the empty set, and returned sha256("")[:16]: a
+    perfectly plausible digest of nothing, stamped into every report written from
+    an installed copy and compared against every committed one.
+
+    Both conditions are required. A `pyproject.toml` alone matches any project
+    that happens to sit above site-packages, and a CODE_PATHS entry alone matches
+    any directory that happens to contain an `examples/`.
+    """
+    for base in Path(__file__).resolve().parents:
+        if (base / "pyproject.toml").is_file() and any((base / rel).is_dir() for rel in CODE_PATHS):
+            return base
+    return None
 
 
 def _executable_python(source: str) -> str:
@@ -239,9 +288,20 @@ def code_digest(root: Path | None = None) -> str:
 
     Content answers all three: it survives a rebase, needs no history, and
     changes exactly when the measured files change.
+
+    Raises DigestUnavailable rather than hashing whatever it finds. A digest is
+    only worth having if it cannot be produced by accident, and the empty set
+    hashes to a valid-looking sha256 like anything else.
     """
-    base = root or Path(__file__).resolve().parents[3]
+    base = Path(root) if root is not None else _discover_root()
+    if base is None:
+        raise DigestUnavailable(
+            "no source tree found above "
+            f"{Path(__file__).resolve().parent}; pass root= to digest a tree explicitly"
+        )
+
     h = hashlib.sha256()
+    counted = 0
     for rel in CODE_PATHS:
         target = base / rel
         if not target.exists():
@@ -252,6 +312,16 @@ def code_digest(root: Path | None = None) -> str:
             if f.is_file() and f.suffix in {".py", ".cu", ".hip", ".cpp"}:
                 h.update(str(f.relative_to(base)).replace("\\", "/").encode())
                 h.update(_canonical(f, f.read_bytes()))
+                counted += 1
+
+    # Not a redundant check on the one above. A root can exist and still hold
+    # none of the measured code: a wheel layout, a partial checkout, a path
+    # typo'd into root=. Each of those hashed to sha256("") before this.
+    if not counted:
+        raise DigestUnavailable(
+            f"{base} contains none of {', '.join(CODE_PATHS)}, so there is no "
+            "measured code to hash"
+        )
     return h.hexdigest()[:16]
 
 
@@ -307,11 +377,24 @@ def staleness(report: str) -> tuple[str, str]:
     if parse_commit(report) is None:
         return "unknown", "the report does not name the commit it was produced at"
 
+    if re.search(rf"\|\s*measured code\s*\|\s*{DIGEST_UNAVAILABLE}", report):
+        return (
+            "unknown",
+            "the report was written where the measured code could not be read, so it "
+            "recorded no digest to check against",
+        )
+
     stamped = parse_code_digest(report)
     if stamped is None:
         return "unknown", "the report predates code digests, so it cannot be checked"
 
-    current = code_digest()
+    try:
+        current = code_digest()
+    except DigestUnavailable as exc:
+        # Unanswerable here, which is not the same as stale there. Answering
+        # "stale" from an installed copy would condemn every correct report in
+        # the repo; answering "fresh" would bless every wrong one.
+        return "unknown", f"the measured code cannot be read from here: {exc}"
     if stamped == current:
         return "fresh", f"measured code is unchanged since this run ({current})"
     return (
@@ -324,6 +407,8 @@ def staleness(report: str) -> tuple[str, str]:
 __all__ = [
     "CODE_PATHS",
     "DIGEST_EXCLUDE",
+    "DIGEST_UNAVAILABLE",
+    "DigestUnavailable",
     "RESULTS_DIR",
     "code_digest",
     "commit",

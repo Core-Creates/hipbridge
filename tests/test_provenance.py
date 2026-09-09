@@ -199,3 +199,82 @@ def test_nothing_measured_reads_its_own_docstring():
                 continue
             executable = provenance._executable_python(path.read_text(encoding="utf-8"))
             assert "__doc__" not in executable, f"{path} reads a docstring at runtime"
+
+
+# --- the digest must fail closed -------------------------------------------
+
+
+def test_a_tree_with_no_measured_code_raises_rather_than_hashing_nothing(tmp_path):
+    """The bug this replaced: sha256 of the empty set is a valid-looking digest.
+
+    `code_digest` resolved its root as `Path(__file__).parents[3]`, which is the
+    repo root for `src/hipbridge/verify/provenance.py` and `lib/` for the same
+    file installed in site-packages. There it matched none of CODE_PATHS, hashed
+    nothing, and returned e3b0c44298fc1c14 - stamped into every report written
+    from an installed copy, and compared against every committed one.
+    """
+    from hipbridge.verify import provenance
+
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+    (tmp_path / "docs").mkdir()
+
+    with pytest.raises(provenance.DigestUnavailable) as excinfo:
+        provenance.code_digest(root=tmp_path)
+
+    assert "no measured code" in str(excinfo.value)
+
+
+def test_the_empty_digest_is_never_returned(tmp_path):
+    """Stated as the property rather than the mechanism, so a rewrite keeps it."""
+    import hashlib
+
+    from hipbridge.verify import provenance
+
+    empty = hashlib.sha256(b"").hexdigest()[:16]
+    with pytest.raises(provenance.DigestUnavailable):
+        provenance.code_digest(root=tmp_path)
+    assert provenance.code_digest(root=REPO) != empty
+
+
+def test_a_partial_tree_still_digests(tmp_path):
+    """Strict about nothing, not about everything.
+
+    A tree holding only `examples/` is a legitimate thing to digest, and the
+    freshness tests build exactly that. The rule is that at least one measured
+    file was actually read, not that every CODE_PATHS entry exists.
+    """
+    from hipbridge.verify import provenance
+
+    (tmp_path / "examples").mkdir()
+    (tmp_path / "examples" / "k.cu").write_text("__global__ void k() {}", encoding="utf-8")
+
+    assert provenance.code_digest(root=tmp_path)
+
+
+def test_a_report_that_could_not_digest_is_unknown_not_fresh(tmp_path):
+    """The direction to fail in: unanswerable never reads as verified."""
+    from hipbridge.verify import provenance
+
+    report = (
+        "| hipbridge | 0.1 at commit `abc1234` |\n"
+        f"| measured code | {provenance.DIGEST_UNAVAILABLE} (no source tree found) |\n"
+    )
+    verdict, why = provenance.staleness(report)
+
+    assert verdict == "unknown"
+    assert "could not be read" in why
+
+
+def test_the_header_records_that_it_could_not_check(monkeypatch):
+    """A report still writes from a tree we cannot digest. It just cannot claim one."""
+    from hipbridge.verify import provenance
+
+    def refuse(root=None):
+        raise provenance.DigestUnavailable("no source tree found above nowhere")
+
+    monkeypatch.setattr(provenance, "code_digest", refuse)
+    head = provenance.header("t", "hipcc", "gfx942")
+
+    assert f"| measured code | {provenance.DIGEST_UNAVAILABLE}" in head
+    assert provenance.parse_code_digest(head) is None
+    assert provenance.staleness(head)[0] == "unknown"
