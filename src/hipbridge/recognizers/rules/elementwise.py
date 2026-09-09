@@ -9,7 +9,7 @@ cross-lane communication.
 from __future__ import annotations
 
 from hipbridge.frontend.ir import KernelFacts, Pattern
-from hipbridge.recognize.base import rule
+from hipbridge.recognizers.base import rule
 
 
 @rule("elementwise.flat", priority=90)

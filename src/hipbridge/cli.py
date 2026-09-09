@@ -18,7 +18,7 @@ from pathlib import Path
 from hipbridge import __version__
 from hipbridge.analysis import ARCHS, occupancy, roofline
 from hipbridge.frontend import parse_file
-from hipbridge.recognize import recognize, registered
+from hipbridge.recognizers import recognize, registered
 
 # The precisions --dtype accepts. Spelled here as strings so argparse can offer
 # them without importing torch, and asserted against verify.pipeline.DTYPES by

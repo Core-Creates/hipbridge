@@ -33,7 +33,7 @@ from typing import Any
 import torch
 
 from hipbridge.frontend import parse_file
-from hipbridge.recognize import recognize
+from hipbridge.recognizers import recognize
 
 Progress = Callable[[str], None]
 

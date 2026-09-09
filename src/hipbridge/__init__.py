@@ -10,20 +10,25 @@ submodule of a package runs that package's __init__ first. So an eager
 re-export here meant `import hipbridge.verify.provenance` loaded libclang: a
 dependency the [verify] extra does not declare and has no use for.
 
-Everything else stays eager. `recognize` in particular has to be, because it
-names both this package's `recognize` subpackage and the function inside it, and
-a lazy __getattr__ never runs once the import system has bound the submodule as
-an attribute. Eager assignment is what makes the function win, which is what it
-has always done.
+Everything else stays eager, and cheaply: analysis is pure arithmetic over
+datasheet figures and frontend.ir is stdlib dataclasses.
+
+The recognizer package is `hipbridge.recognizers`, plural, so that `recognize`
+names one thing. It was `hipbridge.recognize`, which collided with the function
+re-exported here under the same name: two objects, one name, one namespace, and
+whichever was assigned last won. Eager assignment made the function win, so the
+collision was invisible until someone made the import lazy - and then it failed
+only in full runs, because a module-level __getattr__ is consulted after
+__dict__, and the import system writes a submodule into its parent's __dict__ on
+first load. `recognize(facts)` raised "'module' object is not callable" in a
+full test run and passed in isolation.
 """
 
 from typing import TYPE_CHECKING
 
-# Neither of these reaches the parser: analysis is pure arithmetic over
-# datasheet figures, and frontend.ir is stdlib dataclasses.
 from hipbridge.analysis import ARCHS, lds_padding, occupancy, roofline
 from hipbridge.frontend import KernelFacts, Pattern, Recognition
-from hipbridge.recognize import recognize, registered
+from hipbridge.recognizers import recognize, registered
 
 __version__ = "0.1.0.dev0"
 
