@@ -20,6 +20,12 @@ from hipbridge.analysis import ARCHS, occupancy, roofline
 from hipbridge.frontend import parse_file
 from hipbridge.recognize import recognize, registered
 
+# The precisions --dtype accepts. Spelled here as strings so argparse can offer
+# them without importing torch, and asserted against verify.pipeline.DTYPES by
+# tests/test_verify_cli.py: the set used to be written out in three places and
+# adding one meant finding all of them.
+DTYPE_CHOICES = ["float32", "float16", "bfloat16"]
+
 
 def _dtypes(args) -> tuple:
     """Precisions to sweep, from repeated --dtype flags.
@@ -28,15 +34,12 @@ def _dtypes(args) -> tuple:
     here rather than deep in the harness so a CI run can ask for the precision
     it cares about without a code change.
     """
-    import torch
+    from hipbridge.verify.pipeline import dtypes_by_name
 
-    known = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
-    out = []
-    for name in args.dtype or []:
-        if name not in known:
-            raise SystemExit(f"unknown dtype {name}; choose from {', '.join(known)}")
-        out.append(known[name])
-    return tuple(out)
+    try:
+        return dtypes_by_name(getattr(args, "dtype", None))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _report_path(args, command: str) -> str:
@@ -144,6 +147,49 @@ def _cmd_analyze(args) -> int:
     return EXIT_OK
 
 
+def _device(args):
+    """The compile-and-run target these flags describe."""
+    from hipbridge.verify.pipeline import Device
+
+    return Device(
+        toolchain=args.toolchain,
+        arch=args.arch,
+        wsl=getattr(args, "wsl", ""),
+        examples=Path(getattr(args, "examples", "examples")),
+    )
+
+
+def _sweep(args):
+    """What to sweep over, beyond the shapes each suite declares."""
+    from hipbridge.verify.pipeline import Sweep
+
+    return Sweep(
+        dtypes=_dtypes(args),
+        limit=getattr(args, "limit", None),
+        layouts=bool(getattr(args, "layouts", False)),
+    )
+
+
+# Outcome is the library's vocabulary; these are this CLI's contract with a
+# shell. Kept as a mapping rather than pushed into the enum, because an exit
+# code is a fact about a process and means nothing to a caller in Python.
+_EXIT_FOR = {
+    "ok": EXIT_OK,
+    "usage": EXIT_USAGE,
+    "refused": EXIT_REFUSED,
+    "nothing": EXIT_NOTHING,
+    "rejected": EXIT_REJECTED,
+    "unprovable": EXIT_UNPROVABLE,
+}
+
+
+def _write_report(args, command: str, title: str, body: str) -> None:
+    from hipbridge.verify import provenance
+
+    written = provenance.write(_report_path(args, command), title, args.toolchain, args.arch, body)
+    print(f"report written to {written}")
+
+
 def _cmd_verify(args) -> int:
     """Run the example suites against a real device.
 
@@ -157,66 +203,20 @@ def _cmd_verify(args) -> int:
         print("SKIP: [verify] extra not installed (pip install 'hipbridge[verify]')")
         return EXIT_UNPROVABLE if args.require else EXIT_OK
 
-    from hipbridge.verify import suites
+    from hipbridge.verify import pipeline
 
-    examples = Path(args.examples)
-    prefix = verify.wsl(args.wsl) if args.wsl else []
-    lines: list[str] = []
-    reports: list[dict] = []
-    failed = False
-    ran = 0
-
-    for suite in suites.BUILTIN:
-        ref = verify.NativeReference(
-            source=suite.source(examples),
-            launch=suite.launch,
-            toolchain=args.toolchain,
-            command_prefix=prefix,
-            extra_flags=(["--offload-arch=" + args.arch] if args.arch else []),
-        )
-        avail = ref.availability()
-        if not avail:
-            msg = f"SKIP  {suite.name}: {avail.reason}"
-            print(msg)
-            lines.append(msg)
-            reports.append({"name": suite.name, "ok": False, "skipped_reason": avail.reason})
-            continue
-
-        candidate, described = suites.candidate_for(suite)
-        print(f"running {suite.name} against {args.toolchain} device")
-        print(f"  candidate: {described}")
-        shape_list = list(suite.shapes())[: args.limit]
-
-        summary = verify.Harness(
-            candidate=candidate,
-            reference=ref,
-            oracle=suite.oracle,
-            extras=tuple(o.build for o in suite.extras),
-            dtypes=_dtypes(args),
-            layouts=verify.NON_CONTIGUOUS if args.layouts else (),
-            name=f"{suite.name} vs original on {args.toolchain}",
-        ).run(shape_list)
-        ran += 1
-        print(summary)
-        lines.append(str(summary))
-        reports.append(summary.as_dict())
-        failed |= not summary.ok
+    run = pipeline.run_suites(_device(args), _sweep(args), progress=print)
 
     if args.report:
-        from hipbridge.verify import provenance
+        print()
+        _write_report(args, "verify", "hipbridge verification", run.report_body())
 
-        body = "\n\n".join("```\n" + x + "\n```" for x in lines)
-        written = provenance.write(
-            _report_path(args, "verify"), "hipbridge verification", args.toolchain, args.arch, body
-        )
-        print(f"\nreport written to {written}")
+    _record(args, **run.as_dict())
 
-    _record(args, toolchain=args.toolchain, arch=args.arch or None, suites=reports, ran=ran)
-
-    if ran == 0:
+    if run.ran == 0:
         print("no suite ran (no device available)")
         return EXIT_UNPROVABLE if args.require else EXIT_OK
-    return EXIT_REJECTED if failed else EXIT_OK
+    return EXIT_OK if run.ok else EXIT_REJECTED
 
 
 def _cmd_bench(args) -> int:
@@ -232,197 +232,24 @@ def _cmd_bench(args) -> int:
         print("SKIP: [verify] extra not installed")
         return EXIT_UNPROVABLE if args.require else EXIT_OK
 
-    import torch
+    from hipbridge.verify import pipeline
 
-    from hipbridge.verify import bench, suites
-
-    examples = Path(args.examples)
-    prefix = verify.wsl(args.wsl) if args.wsl else []
     shapes = [tuple(int(d) for d in s.split("x")) for s in args.shapes.split(",")]
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    failed = False
-    report_sections: list[str] = []
-    measurements: list[dict] = []
-    if device != "cuda":
-        print("WARNING: no GPU visible to torch, so the candidate runs on the host")
-        print("         while the original runs on device. Ratios are suppressed as")
-        print("         NOT COMPARABLE. On Windows this is normally a CPU-only torch")
-        print("         wheel; Triton has no Windows build either.")
-        print()
-
-    for suite in suites.BUILTIN:
-        flags = ["--offload-arch=" + args.arch] if args.arch else []
-
-        # Every baseline gets the same toolchain, the same flags and the same
-        # timing path. The first is the original as written; the rest exist so a
-        # large ratio against a naive kernel cannot pass for the whole story.
-        refs = []
-        for base in suite.all_baselines():
-            r = verify.NativeReference(
-                source=base.source(examples),
-                launch=base.launch,
-                toolchain=args.toolchain,
-                command_prefix=prefix,
-                extra_flags=flags,
-            )
-            avail = r.availability()
-            if not avail:
-                print(f"SKIP  {suite.name} [{base.name}]: {avail.reason}")
-                continue
-            refs.append((base, r))
-        if not refs:
-            continue
-
-        candidate, described = suites.candidate_for(suite)
-        print(
-            f"{suite.name} on {args.toolchain}, device={device}, reps={args.reps}, runs={args.runs}"
-        )
-        print(f"  candidate: {described}")
-        for base, _ in refs:
-            print(f"  {base.name:<9}: {base.source_file} compiled with {args.toolchain}")
-        if suite.portable is not None:
-            print(f"  {suite.portable_name:<9}: library call, timed like the candidate")
-        print()
-
-        for dtype in _dtypes(args) or (torch.float32,):
-            precision = str(dtype).removeprefix("torch.")
-            rows = []
-            for shape in shapes:
-                # Time in the precision being verified. Passing --dtype and then
-                # timing float32 anyway would report numbers for a different program
-                # from the one that just passed.
-                primary = verify.InputSpec(shape=shape, dtype=dtype)
-                # Weight tensors for kernels that take them, built the same way the
-                # harness builds them so the timed call and the proved call agree.
-                ins = suites.make_inputs(suite, primary, device=device)
-                x = ins[0]
-
-                # Verify at this exact shape before timing it. The candidate is
-                # checked against the original; each additional baseline is checked
-                # against the float64 oracle, because a fast baseline that computes
-                # the wrong thing would silently flatter the candidate.
-                summary = verify.Harness(
-                    candidate=candidate,
-                    reference=refs[0][1],
-                    oracle=suite.oracle,
-                    extras=tuple(o.build for o in suite.extras),
-                    # The precision being timed, not the whole sweep: a shape is
-                    # timed only after it verified, and it has to have verified
-                    # in the precision the timing will report.
-                    dtypes=(dtype,),
-                    name=f"{suite.name}@{shape}/{precision}",
-                    distributions=(verify.Distribution.NORMAL,),
-                ).run([shape])
-                ok = summary.ok
-                failed |= not ok
-
-                notes = []
-                try:
-                    measured = []
-                    for base, r in refs:
-                        if base.name != "original":
-                            arb = verify.arbitrate(
-                                r(*ins),
-                                refs[0][1](*ins),
-                                suite.oracle(*(t.double() for t in ins)),
-                            )
-                            if arb.verdict == "worse":
-                                notes.append(f"{base.name} is LESS ACCURATE than the original")
-                                failed = True
-                        measured.append(
-                            bench.Measurement(
-                                base.name,
-                                bench.stat_reference(r, ins, reps=args.reps, runs=args.runs),
-                                "cuda",
-                            )
-                        )
-                    if suite.portable is not None:
-                        # Same timing path as the candidate, so both carry the same
-                        # host-side dispatch cost and the ratio between them is fair.
-                        measured.append(
-                            bench.Measurement(
-                                suite.portable_name,
-                                bench.stat_candidate(
-                                    suite.portable, ins, reps=args.reps, runs=args.runs
-                                ),
-                                device,
-                            )
-                        )
-                    cand = bench.Measurement(
-                        "candidate",
-                        bench.stat_candidate(candidate, ins, reps=args.reps, runs=args.runs),
-                        device,
-                    )
-                except RuntimeError as exc:
-                    print(f"  timing unavailable at {shape}: {exc}")
-                    failed = True
-                    continue
-
-                rows.append(
-                    bench.ShapeRow(
-                        shape=tuple(x.shape),
-                        candidate=cand,
-                        baselines=tuple(measured),
-                        verified=ok,
-                        notes=notes,
-                    )
-                )
-
-            measurements.append(
-                {
-                    "suite": suite.name,
-                    "precision": precision,
-                    "candidate": described,
-                    "device": device,
-                    "reps": args.reps,
-                    "runs": args.runs,
-                    "rows": [r.as_dict() for r in rows],
-                }
-            )
-
-            table = bench.render(rows)
-            print(f"  dtype: {precision}")
-            print(table)
-            print()
-            report_sections.append(
-                "\n".join(
-                    [
-                        f"## {suite.name} ({precision})",
-                        "",
-                        f"candidate: {described}",
-                        f"reps: {args.reps}, runs: {args.runs}, device: `{device}`",
-                        "",
-                        "```",
-                        table,
-                        "```",
-                    ]
-                )
-            )
-
-        print("median of runs, [min-max] beside it. latency-bound marks shapes where")
-        print("the candidate never reaches the throughput it shows at larger sizes.")
-
-    if args.report and report_sections:
-        from hipbridge.verify import provenance
-
-        written = provenance.write(
-            _report_path(args, "bench"),
-            "hipbridge benchmark",
-            args.toolchain,
-            args.arch,
-            "\n\n".join(report_sections),
-        )
-        print(f"\nreport written to {written}")
-
-    _record(
-        args,
-        toolchain=args.toolchain,
-        arch=args.arch or None,
-        device=device,
-        shapes=[list(sh) for sh in shapes],
-        measurements=measurements,
+    run = pipeline.bench_suites(
+        _device(args),
+        _sweep(args),
+        shapes,
+        reps=args.reps,
+        runs=args.runs,
+        progress=print,
     )
-    return EXIT_REJECTED if failed else EXIT_OK
+
+    if args.report and run.sections:
+        print()
+        _write_report(args, "bench", "hipbridge benchmark", run.report_body())
+
+    _record(args, **run.as_dict())
+    return _EXIT_FOR[run.outcome.value]
 
 
 def _cmd_port(args) -> int:
@@ -435,138 +262,95 @@ def _cmd_port(args) -> int:
     nothing to propose, 4 proposed but the proof failed, 5 no device to prove it
     on. A substitution is never recommended on the strength of recognition alone.
     """
-    kernels, problem = _parse(args.file)
-    if problem:
-        return problem
-    if not kernels:
-        print(f"no kernel definitions found in {args.file}", file=sys.stderr)
-        return EXIT_USAGE
-
-    facts = kernels[0]
-    if args.kernel:
-        match = [k for k in kernels if k.name == args.kernel]
-        if not match:
-            names = ", ".join(k.name for k in kernels)
-            print(f"no kernel named {args.kernel} in {args.file} (found: {names})")
-            return EXIT_USAGE
-        facts = match[0]
-
-    result = recognize(facts)
-    _record(args, file=args.file, recognition=result.as_dict())
-    print(result.report())
-    print()
-
     from hipbridge import verify
 
     if not verify.available():
+        # Recognition still runs: it needs no extra, and it is the half of the
+        # answer this machine can give.
+        kernels, problem = _parse(args.file)
+        if problem:
+            return problem
+        if not kernels:
+            print(f"no kernel definitions found in {args.file}", file=sys.stderr)
+            return EXIT_USAGE
+        result = recognize(kernels[0])
+        _record(args, file=args.file, recognition=result.as_dict(), proved=False)
+        print(result.report())
+        print()
         print("SKIP: [verify] extra not installed, so no substitution can be proved")
         return EXIT_UNPROVABLE
 
-    from hipbridge.verify import substitutions, suites
+    from hipbridge.verify import pipeline
 
-    source = Path(args.file).read_text(encoding="utf-8")
-    notes: list[str] = []
-    proposal = substitutions.propose(facts, result.pattern, notes, epsilon=args.eps)
-    if proposal is None:
+    outcome = pipeline.port_file(
+        args.file,
+        _device(args),
+        _sweep(args),
+        kernel=args.kernel,
+        eps=args.eps,
+        block=int(args.block) if args.block else None,
+        progress=print,
+    )
+
+    payload = outcome.as_dict()
+    payload["file"] = args.file
+    _record(args, **payload)
+
+    if outcome.error:
+        print(outcome.error, file=sys.stderr)
+        return _EXIT_FOR[outcome.outcome.value]
+
+    if outcome.outcome is pipeline.Outcome.NOTHING:
         print("no substitution proposed.")
         print()
         # A near miss is worth explaining. Without this, a kernel that matched
         # everything except the order of its weights reports the same "nothing
         # to propose" as a kernel nobody recognised, and sends its author
         # looking for a missing feature instead of reading their signature.
-        for note in notes:
+        for note in outcome.declined:
             print(f"  {note}")
-        if notes:
+        if outcome.declined:
             print()
-        if result.recognized:
-            print(f"  {facts.name} is a {result.pattern.value}, but a pattern is not a")
+        if outcome.recognition.recognized:
+            print(
+                f"  {outcome.facts.name} is a {outcome.recognition.pattern.value}, "
+                "but a pattern is not a"
+            )
             print("  licence to substitute: several different computations share it.")
             print("  Nothing here matched this kernel's maths closely enough to try.")
         else:
             print("  no recognizer claimed this kernel, so there is nothing to propose.")
         print()
         print("  Translate it by hand, or extend hipbridge.verify.substitutions.")
-        _record(args, proposal=None, declined=notes, proved=False)
         return EXIT_NOTHING
 
-    candidate, described = suites.candidate_for(proposal.suite, proposal.epsilon)
-    _record(
-        args,
-        proposal={
-            "suite": proposal.suite.name,
-            "substitute": described,
-            "epsilon": proposal.epsilon,
-            "evidence": list(proposal.evidence),
-            "usage_import": proposal.suite.usage_import,
-            "usage_call": proposal.suite.usage_call,
-        },
-    )
-    print(f"proposing: {described}")
-    # The structural read that got us here, restated beside the evidence rather
-    # than left twenty lines up. It is advisory: a "likely" match is proposed
-    # exactly as readily as a "certain" one, because the proof that follows is
-    # stronger evidence than the recognizer could ever be.
-    print(f"  - recognized as {result.pattern.value} ({result.confidence}), which is advisory")
-    for e in proposal.evidence:
-        print(f"  - {e}")
-    print()
-
-    # The proof compiles the CALLER'S kernel, not the shipped example. Proving a
-    # substitution against our own copy of the original would prove nothing.
-    block = None
-    if args.block:
-        block = (int(args.block), 1, 1)
-    launch = substitutions.reference_launch(proposal.suite, facts, block)
-    ref = verify.NativeReference(
-        source=source,
-        launch=launch,
-        toolchain=args.toolchain,
-        command_prefix=verify.wsl(args.wsl) if args.wsl else [],
-        extra_flags=(["--offload-arch=" + args.arch] if args.arch else []),
-    )
-    avail = ref.availability()
-    if not avail:
-        print(f"CANNOT PROVE: {avail.reason}")
+    if outcome.outcome is pipeline.Outcome.UNPROVABLE:
+        print(f"CANNOT PROVE: {outcome.unprovable}")
         print()
         print("  The substitution is unproven, so it is not recommended. Re-run this")
         print("  on a machine with the toolchain and a device.")
-        _record(args, proved=False, unprovable=avail.reason)
         return EXIT_UNPROVABLE
 
-    print(f"proving against {args.file} compiled with {args.toolchain}")
-    print(f"  launch: grid one block per row, block={launch.block}")
-
-    summary = verify.Harness(
-        candidate=candidate,
-        reference=ref,
-        oracle=suites.oracle_for(proposal.suite, proposal.epsilon),
-        extras=tuple(o.build for o in proposal.suite.extras),
-        layouts=verify.NON_CONTIGUOUS if args.layouts else (),
-        name=f"{facts.name} vs {described}",
-    ).run(list(proposal.suite.shapes())[: args.limit])
-    print(summary)
-    print()
-    _record(args, summary=summary.as_dict(), proved=bool(summary.ok), launch=list(launch.block))
-
-    # The probe now lives in Harness, so verify, bench and synth get it too.
-    # What stays here is the advice only port can give: it is the command that
-    # inferred the launch geometry, so it is the one that can suggest --block.
-    if summary.probe_failure:
-        print(f"  Inferred block={launch.block}; override it with --block.")
-        print("  No substitution is claimed, because being better than a broken")
-        print("  reference is not evidence of anything.")
-        return EXIT_REJECTED
-
-    if not summary.ok:
+    if not outcome.proved:
+        # The probe now lives in Harness, so verify, bench and synth get it too.
+        # What stays here is the advice only port can give: it is the command
+        # that inferred the launch geometry, so it is the one that can suggest
+        # --block.
+        if outcome.summary.probe_failure:
+            print(f"  Inferred block={outcome.launch.block}; override it with --block.")
+            print("  No substitution is claimed, because being better than a broken")
+            print("  reference is not evidence of anything.")
+            return EXIT_REJECTED
         print("SUBSTITUTION REJECTED. The proposal did not survive verification,")
         print("which is the system working: recognition proposes, the oracle decides.")
         return EXIT_REJECTED
 
+    suite = outcome.proposal.suite
     print("SUBSTITUTION PROVED. Use it like this:")
     print()
-    print(f"    {proposal.suite.usage_import}")
+    print(f"    {suite.usage_import}")
     print()
-    print(f"    {proposal.suite.usage_call}   # replaces {facts.name}")
+    print(f"    {suite.usage_call}   # replaces {outcome.facts.name}")
     print()
     print(
         f"Proved on {args.toolchain}"
@@ -574,28 +358,9 @@ def _cmd_port(args) -> int:
     )
     print("judged against a float64 oracle rather than against the original's rounding.")
     if args.report:
-        from hipbridge.verify import provenance
-
-        body = "\n".join(
-            [
-                f"source: `{args.file}`  kernel: `{facts.name}`",
-                f"pattern: `{result.pattern.value}` ({result.confidence})",
-                f"substitute: {described}",
-                f"launch: `block={launch.block}`",
-                "",
-                "```",
-                str(summary),
-                "```",
-            ]
+        _write_report(
+            args, f"port-{outcome.facts.name}", "hipbridge port report", outcome.report_body()
         )
-        written = provenance.write(
-            _report_path(args, f"port-{facts.name}"),
-            "hipbridge port report",
-            args.toolchain,
-            args.arch,
-            body,
-        )
-        print(f"report written to {written}")
     return EXIT_OK
 
 
@@ -611,52 +376,13 @@ def _cmd_synth(args) -> int:
     that passes has matched the caller's compiled kernel across the same sweep
     every shipped kernel had to pass; one that fails is recorded and discarded.
     """
-    kernels, problem = _parse(args.file)
-    if problem:
-        return problem
-    if not kernels:
-        print(f"no kernel definitions found in {args.file}", file=sys.stderr)
-        return EXIT_USAGE
-    facts = kernels[0]
-
     from hipbridge import synth, verify
 
     if not verify.available():
         print("SKIP: [verify] extra not installed, so nothing could be proved")
         return EXIT_UNPROVABLE
 
-    from hipbridge.verify import substitutions
-
-    source = Path(args.file).read_text(encoding="utf-8")
-    result = recognize(facts)
-    proposal = substitutions.propose(facts, result.pattern)
-    if proposal is None:
-        print("no suite covers this kernel, so there is no oracle to judge against.")
-        print("Generation without a proof is not something this tool will do.")
-        return EXIT_NOTHING
-
-    suite = proposal.suite
-    ref = verify.NativeReference(
-        source=source,
-        launch=substitutions.reference_launch(suite, facts),
-        toolchain=args.toolchain,
-        command_prefix=verify.wsl(args.wsl) if args.wsl else [],
-        extra_flags=(["--offload-arch=" + args.arch] if args.arch else []),
-    )
-    avail = ref.availability()
-    if not avail:
-        print(f"CANNOT PROVE: {avail.reason}")
-        print("Generated code is worth nothing unproved, so nothing is generated.")
-        return EXIT_UNPROVABLE
-
-    def verify_one(fn):
-        return verify.Harness(
-            candidate=fn,
-            reference=ref,
-            oracle=suite.oracle,
-            extras=tuple(o.build for o in suite.extras),
-            name="generated",
-        ).run(list(suite.shapes())[: args.limit])
+    from hipbridge.verify import pipeline
 
     generator = (
         synth.ScriptGenerator(command=args.generator.split())
@@ -666,33 +392,41 @@ def _cmd_synth(args) -> int:
         )
     )
 
-    prompt = synth.prompt_for(source, facts.name, args.arch or "gfx942")
-    if args.show_prompt:
-        print(prompt)
-        print()
+    outcome = pipeline.synth_file(
+        args.file,
+        _device(args),
+        _sweep(args),
+        generator,
+        count=args.count,
+        allow_untrusted_code=args.allow_untrusted_code,
+        progress=print,
+        show_prompt=args.show_prompt,
+    )
 
-    print(f"generating up to {args.count} candidate(s) for {facts.name}")
-    print(f"judged against {args.file} compiled with {args.toolchain}, and a float64 oracle")
-    print()
+    if outcome.outcome is pipeline.Outcome.USAGE:
+        print(outcome.error, file=sys.stderr)
+        return EXIT_USAGE
 
-    try:
-        found = synth.search(
-            generator,
-            prompt,
-            verify_one,
-            count=args.count,
-            allow_untrusted_code=args.allow_untrusted_code,
-        )
-    except synth.UntrustedCodeError as exc:
-        print(f"REFUSED: {exc}")
+    if outcome.outcome is pipeline.Outcome.NOTHING:
+        print(f"{outcome.error}.")
+        print("Generation without a proof is not something this tool will do.")
+        return EXIT_NOTHING
+
+    if outcome.outcome is pipeline.Outcome.UNPROVABLE:
+        print(f"CANNOT PROVE: {outcome.error}")
+        print("Generated code is worth nothing unproved, so nothing is generated.")
+        return EXIT_UNPROVABLE
+
+    if outcome.outcome is pipeline.Outcome.REFUSED:
+        print(f"REFUSED: {outcome.error}")
         print()
         print("  Generated kernels execute in this process with its privileges.")
         print("  Pass --allow-untrusted-code once you are on a machine where that")
         print("  is acceptable, which is not one holding credentials you care about.")
         return EXIT_REFUSED
 
-    print(found)
-    winner = found.winner
+    print(outcome.found)
+    winner = outcome.winner
     if winner is None:
         return EXIT_REJECTED
 
@@ -748,7 +482,7 @@ def main(argv: list[str] | None = None) -> int:
         "--dtype",
         action="append",
         default=[],
-        choices=["float32", "float16", "bfloat16"],
+        choices=DTYPE_CHOICES,
         help="precision to sweep; repeatable, defaults to float32",
     )
     ver.add_argument(
@@ -794,7 +528,7 @@ def main(argv: list[str] | None = None) -> int:
         "--dtype",
         action="append",
         default=[],
-        choices=["float32", "float16", "bfloat16"],
+        choices=DTYPE_CHOICES,
         help="precision to sweep; repeatable, defaults to float32",
     )
     ben.add_argument(
