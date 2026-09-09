@@ -42,25 +42,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from hipbridge.frontend.ir import KernelFacts, Pattern
-from hipbridge.frontend.prelude import EXP_NAMES, MAX_NAMES, NORMALISING
-from hipbridge.verify.suites import (
-    LAYER_NORM,
-    LAYER_NORM_AFFINE,
-    RMS_NORM,
-    RMS_NORM_AFFINE,
-    RMS_NORM_ROPE,
-    ROPE,
-    ROW_SOFTMAX,
-    Suite,
-)
-
-# Spellings of the same operation across dialects and precisions, owned by
-# frontend.prelude so that every name tested for here is also declarable there.
-# These sets used to be a verbatim second copy, and 13 of the 17 spellings could
-# never match because the prelude declared none of them.
-_EXP = EXP_NAMES
-_MAX = MAX_NAMES
-_RSQRT = NORMALISING
+from hipbridge.verify.suites import BUILTIN, Suite
 
 
 @dataclass(frozen=True)
@@ -76,96 +58,6 @@ class Proposal:
     @property
     def name(self) -> str:
         return self.suite.name
-
-
-def _calls_any(facts: KernelFacts, names: frozenset[str]) -> bool:
-    return any(c in names for c in facts.calls)
-
-
-def _reduced_quantities(facts: KernelFacts) -> int:
-    """How many separate quantities the kernel reduces over the row.
-
-    LayerNorm needs two, a mean and a variance. RMSNorm needs one. That holds
-    however either is written: naively they show up as scalar accumulations, and
-    in a tuned version as the shared buffers a block reduction needs. Counting
-    them is what separates the two without asking whether a variable happens to
-    be called `mean`, and a kernel using `mu` is judged the same as one that
-    does not.
-    """
-    return max(facts.scalar_accumulations, len(facts.shared))
-
-
-def _looks_like_softmax(facts: KernelFacts) -> list[str] | None:
-    """Exponentiation plus a maximum. No other row-wise reduction has both.
-
-    A row sum has neither, a LayerNorm has neither, and a logsumexp has both and
-    would be proposed here, tried, and rejected by the oracle. That is the
-    intended division of labour.
-    """
-    if not _calls_any(facts, _EXP):
-        return None
-    if not _calls_any(facts, _MAX):
-        return None
-    return [
-        f"calls {', '.join(c for c in facts.calls if c in _EXP)}, so it is not a plain sum",
-        f"calls {', '.join(c for c in facts.calls if c in _MAX)}, the usual stability pass",
-    ]
-
-
-def _looks_like_layer_norm(facts: KernelFacts) -> list[str] | None:
-    """Scales by a reciprocal square root, and reduces two quantities."""
-    if _calls_any(facts, _EXP):
-        return None  # exponentiating makes it a softmax, not a normalisation
-    if not _calls_any(facts, _RSQRT):
-        return None
-    n = _reduced_quantities(facts)
-    if n < 2:
-        return None
-    return [
-        "scales by a reciprocal square root of an accumulated quantity",
-        f"reduces {n} quantities over the row, consistent with a mean and a variance",
-        "centres before scaling, which is what separates it from RMSNorm",
-    ]
-
-
-def _looks_like_rms_norm(facts: KernelFacts) -> list[str] | None:
-    """Scales by a root mean square, reducing one quantity and never centring.
-
-    The confusion that must not happen: substituting RMSNorm for LayerNorm
-    changes the output of every row whose mean is not zero, silently. One
-    reduced quantity against two is the structural difference between them.
-    """
-    if _calls_any(facts, _EXP):
-        return None
-    if not _calls_any(facts, _RSQRT):
-        return None
-    if _reduced_quantities(facts) != 1:
-        return None
-    return [
-        "scales by a reciprocal square root of an accumulated quantity",
-        "reduces exactly one quantity, so it never centres",
-        "no mean pass, which is what separates RMSNorm from LayerNorm",
-    ]
-
-
-def _looks_like_rope(facts: KernelFacts) -> list[str] | None:
-    """A per-position map that accumulates nothing and scales by nothing.
-
-    RoPE cannot be identified by what it accumulates, because it accumulates
-    nothing, and the pattern gate has already established that. What remains is
-    the absence of the operations that would make it something else: no
-    exponential, no reciprocal square root, no reduction. Combined with the
-    signature check it is narrow enough to try, and the oracle settles it.
-    """
-    if _calls_any(facts, _EXP) or _calls_any(facts, _RSQRT):
-        return None
-    if facts.scalar_accumulations or facts.shared_accumulations:
-        return None
-    return [
-        "accumulates nothing across the row, so it is a map and not a reduction",
-        "calls neither an exponential nor a reciprocal square root",
-        "takes per-position tables alongside the tensor it transforms",
-    ]
 
 
 def operand_mismatch(suite: Suite, facts: KernelFacts) -> str | None:
@@ -202,15 +94,6 @@ def operand_mismatch(suite: Suite, facts: KernelFacts) -> str | None:
     return None
 
 
-# Patterns a row-wise reduction can legitimately be written as. Serial is the
-# naive form; tree and shuffle are the competent ones. Anything else is not a
-# row-wise reduction at all and is refused before the evidence is examined.
-_ROW_PATTERNS = (Pattern.REDUCE_SERIAL, Pattern.REDUCE_TREE, Pattern.REDUCE_SHUFFLE)
-
-# Kernels that walk a row without reducing it. RoPE lives here.
-_MAP_PATTERNS = (Pattern.ROW_MAP,)
-
-
 def propose(
     facts: KernelFacts,
     pattern: Pattern,
@@ -238,23 +121,14 @@ def propose(
     # is the reason this is per-suite rather than one global gate: it is a map,
     # not a reduction, so the reduction patterns would exclude it and the
     # reduction suites must not claim a row_map.
-    for suite, patterns, test in (
-        (ROW_SOFTMAX, _ROW_PATTERNS, _looks_like_softmax),
-        (LAYER_NORM, _ROW_PATTERNS, _looks_like_layer_norm),
-        (LAYER_NORM_AFFINE, _ROW_PATTERNS, _looks_like_layer_norm),
-        (RMS_NORM, _ROW_PATTERNS, _looks_like_rms_norm),
-        (RMS_NORM_AFFINE, _ROW_PATTERNS, _looks_like_rms_norm),
-        # Same evidence as RMSNorm, and the signature is what separates them: a
-        # scale plus two position tables is a normalisation fused with a
-        # rotation, and nothing else in this set takes three operands. The
-        # rotation itself leaves no structural trace, so the arity carries the
-        # discrimination and the oracle carries the proof.
-        (RMS_NORM_ROPE, _ROW_PATTERNS, _looks_like_rms_norm),
-        (ROPE, _MAP_PATTERNS, _looks_like_rope),
-    ):
-        if pattern not in patterns:
+    #
+    # Iterated from BUILTIN rather than re-listed here. The old tuple was a
+    # second registry of every suite, and a suite present in one and absent from
+    # the other was unproposable with nothing to say so.
+    for suite in BUILTIN:
+        if suite.evidence is None or pattern not in suite.patterns:
             continue
-        evidence = test(facts)
+        evidence = suite.evidence(facts)
         if not evidence:
             continue
 
