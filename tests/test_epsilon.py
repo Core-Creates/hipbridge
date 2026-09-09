@@ -16,7 +16,7 @@ import pytest
 
 from hipbridge import verify
 from hipbridge.frontend.parser import parse_file, parse_source
-from hipbridge.recognize import recognize
+from hipbridge.recognizers import recognize
 
 needs_verify = pytest.mark.skipif(not verify.available(), reason="[verify] extra not installed")
 

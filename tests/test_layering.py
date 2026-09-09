@@ -163,7 +163,7 @@ ALLOWED_CORE_IMPORTS = {
     # not into core.
     "verify": {
         "hipbridge.frontend",
-        "hipbridge.recognize",
+        "hipbridge.recognizers",
         "hipbridge.synth",
         "hipbridge.kernels",
     },
@@ -340,23 +340,39 @@ def test_the_lazy_map_mirrors_each_submodule_exactly():
         )
 
 
-def test_recognize_names_the_function_not_the_submodule():
-    """A trap the lazy re-export walked straight into.
+def test_no_root_export_collides_with_a_subpackage():
+    """The general rule, replacing the special case it was written for.
 
-    `hipbridge.recognize` is both a subpackage and the function inside it. A
-    module-level __getattr__ is consulted only when normal lookup fails, and the
-    import system binds a submodule as an attribute of its parent the moment
-    anyone imports it. So deferring this name handed callers the module instead
-    of the function, and only for the test files that happened to run after
-    something else had imported the subpackage: `recognize(facts)` raised
-    "'module' object is not callable" in a full run and passed in isolation.
+    `recognize` used to name both a subpackage and the function inside it. Two
+    objects, one name, one namespace, and whichever was assigned last won: eager
+    assignment in hipbridge/__init__.py made the function win, so the collision
+    was invisible right up until someone made that import lazy. Then it failed
+    only in full runs, because a module-level __getattr__ is consulted after
+    __dict__ and the import system writes a submodule into its parent's __dict__
+    on first load. `recognize(facts)` raised "'module' object is not callable"
+    in a full test run and passed on its own.
 
-    Eager assignment in hipbridge/__init__.py is what makes the function win.
+    The package is now `hipbridge.recognizers`. This asserts the property rather
+    than that one name, so the next export to shadow a subpackage is caught when
+    it is added rather than when someone refactors an import three months later.
     """
     import hipbridge
 
-    assert callable(hipbridge.recognize), "hipbridge.recognize must be the function"
+    collisions = sorted(set(hipbridge.__all__) & SUBPACKAGES)
+    assert not collisions, (
+        f"{collisions} names both a subpackage and a re-export of hipbridge. "
+        f"Whichever is assigned last wins, which makes the resolution an "
+        f"accident of import order. Rename one of them."
+    )
+
+
+def test_recognize_is_the_function():
+    """The ergonomic import, pinned. It is what cli.py and pipeline.py use."""
+    import hipbridge
+
+    assert callable(hipbridge.recognize)
     assert hipbridge.recognize.__name__ == "recognize"
+    assert hipbridge.recognize.__module__ == "hipbridge.recognizers.base"
 
 
 def test_the_root_still_exports_everything_it_promises():
