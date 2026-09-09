@@ -192,9 +192,12 @@ def weight_distribution(primary: Distribution) -> Distribution:
 
 __all__ = [
     "DEFAULT_SWEEP",
+    "NON_CONTIGUOUS",
     "WEIGHT_FOR",
     "Distribution",
     "InputSpec",
+    "Layout",
     "generate",
+    "relayout",
     "weight_distribution",
 ]

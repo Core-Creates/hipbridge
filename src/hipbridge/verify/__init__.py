@@ -4,7 +4,7 @@ Build this before the translator, not after. It is the only thing that can tell
 you a substitution is correct, and it is independently useful to anyone writing
 GPU kernels by hand.
 
-Promotion candidate: no import edge back into hipbridge core.
+Depends on hipbridge.frontend (the IR it reads) and nothing else in core.
 
     from hipbridge.verify import Harness, TorchReference, shapes
 
@@ -17,6 +17,15 @@ from __future__ import annotations
 
 _MISSING = "hipbridge.verify requires PyTorch.\n  pip install 'hipbridge[verify]'\n"
 
+# name -> submodule that defines it. Mirrors each submodule's __all__ exactly,
+# which tests/test_layering.py asserts in both directions.
+#
+# It was a hand-copied mirror with nothing keeping it in step, and it had rotted
+# both ways: "BenchResult" and "Comparison" named things that have never existed
+# anywhere in this repo, and since both were in __all__, `from hipbridge.verify
+# import *` raised AttributeError on a machine that HAD torch installed. Missing
+# in the other direction were compare.nonfinite_where_finite, which harness.py
+# imports, and most of bench.
 _LAZY = {
     # compare
     "Arbitration": "compare",
@@ -25,10 +34,18 @@ _LAZY = {
     "check": "compare",
     "is_identity": "compare",
     "is_unwritten": "compare",
+    "nonfinite_where_finite": "compare",
     "ulp_diff": "compare",
     # bench
-    "BenchResult": "bench",
-    "Comparison": "bench",
+    "LATENCY_BOUND_FRACTION": "bench",
+    "LATENCY_BOUND_MIN_SHAPES": "bench",
+    "Measurement": "bench",
+    "ShapeRow": "bench",
+    "Stat": "bench",
+    "mark_latency_bound": "bench",
+    "render": "bench",
+    "stat_candidate": "bench",
+    "stat_reference": "bench",
     "time_candidate": "bench",
     "time_reference": "bench",
     # harness
@@ -38,10 +55,13 @@ _LAZY = {
     # inputs
     "DEFAULT_SWEEP": "inputs",
     "Distribution": "inputs",
+    "InputSpec": "inputs",
     "Layout": "inputs",
     "NON_CONTIGUOUS": "inputs",
-    "InputSpec": "inputs",
+    "WEIGHT_FOR": "inputs",
     "generate": "inputs",
+    "relayout": "inputs",
+    "weight_distribution": "inputs",
     # reference
     "Availability": "reference",
     "LaunchSpec": "reference",
@@ -56,6 +76,9 @@ _LAZY = {
     # submodules
     "shapes": None,
 }
+
+# The submodules _LAZY re-exports from, so a test can compare the two.
+_MIRRORED = ("compare", "bench", "harness", "inputs", "reference")
 
 # Submodules that genuinely have no torch dependency and must stay importable
 # with core alone. Gating these behind require() would be a lie about what they
