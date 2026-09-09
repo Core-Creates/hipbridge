@@ -42,6 +42,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from hipbridge.frontend.ir import KernelFacts, Pattern
+from hipbridge.frontend.prelude import EXP_NAMES, MAX_NAMES, NORMALISING
 from hipbridge.verify.suites import (
     LAYER_NORM,
     LAYER_NORM_AFFINE,
@@ -53,10 +54,13 @@ from hipbridge.verify.suites import (
     Suite,
 )
 
-# Spellings of the same operation across dialects and precisions.
-_EXP = {"exp", "expf", "__expf", "exp2f", "hexp"}
-_MAX = {"max", "fmax", "fmaxf", "fmaxf16", "hmax"}
-_RSQRT = {"rsqrt", "rsqrtf", "sqrt", "sqrtf", "hrsqrt", "__frsqrt_rn"}
+# Spellings of the same operation across dialects and precisions, owned by
+# frontend.prelude so that every name tested for here is also declarable there.
+# These sets used to be a verbatim second copy, and 13 of the 17 spellings could
+# never match because the prelude declared none of them.
+_EXP = EXP_NAMES
+_MAX = MAX_NAMES
+_RSQRT = NORMALISING
 
 
 @dataclass(frozen=True)
@@ -74,7 +78,7 @@ class Proposal:
         return self.suite.name
 
 
-def _calls_any(facts: KernelFacts, names: set[str]) -> bool:
+def _calls_any(facts: KernelFacts, names: frozenset[str]) -> bool:
     return any(c in names for c in facts.calls)
 
 

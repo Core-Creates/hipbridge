@@ -12,7 +12,7 @@ from pathlib import Path
 import clang.cindex as ci
 
 from hipbridge.frontend.ir import KernelFacts, Param, SharedBuffer
-from hipbridge.frontend.prelude import ATOMIC_NAMES, PRELUDE, SHUFFLE_NAMES
+from hipbridge.frontend.prelude import ATOMIC_NAMES, NORMALISING, PRELUDE, SHUFFLE_NAMES
 
 # __global__/__device__ are attribute keywords clang only accepts under -x cuda,
 # which additionally wants the CUDA SDK headers. Parsing as C++ with the
@@ -54,10 +54,6 @@ def _to_param(cursor) -> Param:
     return Param(name=cursor.spelling, type=spelling, is_pointer=is_ptr, is_const=is_const)
 
 
-# Where a normalisation keeps its epsilon: the reciprocal-square-root family.
-_NORMALISING = {"rsqrt", "rsqrtf", "sqrt", "sqrtf", "hrsqrt", "__frsqrt_rn"}
-
-
 def _float_literal(node) -> float | None:
     toks = _tokens(node)
     if len(toks) != 1:
@@ -85,7 +81,7 @@ def _epsilon(nodes) -> float | None:
     """
     found: set[float] = set()
     for call in nodes:
-        if call.kind != ci.CursorKind.CALL_EXPR or call.spelling not in _NORMALISING:
+        if call.kind != ci.CursorKind.CALL_EXPR or call.spelling not in NORMALISING:
             continue
         if "+" not in _tokens(call):
             continue
