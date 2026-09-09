@@ -60,13 +60,12 @@ def require() -> None:
         raise KernelsUnavailable(_MISSING)
 
 
-def registry() -> dict:
-    """Map Pattern -> callable returning a tuned AMD implementation."""
-    require()
-    from hipbridge.frontend.ir import Pattern
-    from hipbridge.kernels import softmax
+# `registry()` used to live here, mapping Pattern -> implementation. It was dead
+# (no call site anywhere in src/, tests/, examples/, scripts/ or the README),
+# wrong (it mapped REDUCE_SERIAL to softmax, which is the wrong answer for five
+# of the seven suites that share that pattern), exported in __all__ so it read
+# as public API, and the only reason this package imported hipbridge.frontend
+# and so contradicted the no-edge-to-core note above. A Suite now names its own
+# implementation; see hipbridge.verify.suites.Suite.triton_impl.
 
-    return {Pattern.REDUCE_SERIAL: softmax.softmax_rowwise}
-
-
-__all__ = ["KernelsUnavailable", "available", "registry", "require"]
+__all__ = ["KernelsUnavailable", "available", "require"]

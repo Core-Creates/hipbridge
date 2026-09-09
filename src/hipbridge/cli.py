@@ -575,11 +575,6 @@ def main(argv: list[str] | None = None) -> int:
         help="write a markdown report; bare flag saves under results/",
     )
     prt.add_argument(
-        "--require",
-        action="store_true",
-        help="fail instead of skipping when nothing can be proved",
-    )
-    prt.add_argument(
         "--no-layouts",
         dest="layouts",
         action="store_false",
@@ -619,7 +614,6 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="execute generated code in this process; it is not sandboxed",
     )
-    syn.add_argument("--require", action="store_true")
     syn.set_defaults(fn=_cmd_synth)
 
     info = sub.add_parser("info", help="show capabilities and which extras are installed")

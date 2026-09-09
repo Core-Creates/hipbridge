@@ -464,3 +464,60 @@ def test_the_manual_workflow_stays_the_one_that_costs_money():
     wf = _workflow("amd-verify.yml")
     triggers = wf.get("on") or wf.get(True)
     assert set(triggers) == {"workflow_dispatch"}
+
+
+def test_every_declared_flag_is_read_somewhere():
+    """`port --require` and `synth --require` were accepted and never consumed.
+
+    Both promised to "fail instead of skipping when nothing can be proved", and
+    both commands already exit 5 in that case, so the flag described behaviour
+    that was unconditional. A no-op flag is worse than a missing one: it reads
+    as a guarantee.
+
+    Deliberately coarse. A dest read anywhere in cli.py counts for every command,
+    so this catches a flag nothing reads rather than a flag the wrong command
+    reads. That is the failure that actually happened.
+    """
+    import ast
+    from pathlib import Path
+
+    source = Path(cli.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    declared: set[str] = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        if node.func.attr != "add_argument":
+            continue
+        dest = next(
+            (kw.value.value for kw in node.keywords if kw.arg == "dest"),
+            None,
+        )
+        if dest is None:
+            flags = [a.value for a in node.args if isinstance(a, ast.Constant)]
+            long = [f for f in flags if isinstance(f, str) and f.startswith("--")]
+            if not long:
+                continue  # a positional; its dest is the name itself
+            dest = long[0][2:].replace("-", "_")
+        declared.add(dest)
+
+    read = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "args"
+    }
+    read |= {
+        node.args[1].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "getattr"
+        and len(node.args) >= 2
+        and isinstance(node.args[1], ast.Constant)
+    }
+
+    unread = declared - read - {"help", "version"}
+    assert not unread, f"flags declared and never read: {sorted(unread)}"

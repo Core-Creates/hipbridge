@@ -25,7 +25,23 @@ import tokenize
 from datetime import datetime, timezone
 from pathlib import Path
 
-from hipbridge import __version__
+
+def _version() -> str:
+    """This package's version, without importing the package.
+
+    `from hipbridge import __version__` ran hipbridge/__init__.py, which imports
+    the frontend, which imports clang.cindex. So importing anything in this
+    module required libclang, a dependency the [verify] extra does not declare
+    and has no use for. Reading the installed metadata answers the same question
+    without loading a line of core.
+    """
+    try:
+        from importlib.metadata import version
+
+        return version("hipbridge")
+    except Exception:  # not installed, or installed under another name
+        return "unknown"
+
 
 # Where tracked results live. Deterministic filenames, no timestamps: re-running
 # a measurement should show up as a diff against the last one, not as a new file
@@ -108,7 +124,7 @@ def header(title: str, toolchain: str, arch: str) -> str:
     """A markdown provenance block for the top of a report."""
     rows = [
         ("generated", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")),
-        ("hipbridge", f"{__version__} at commit `{commit()}`"),
+        ("hipbridge", f"{_version()} at commit `{commit()}`"),
         ("host", f"{platform.node()} ({platform.system()} {platform.machine()})"),
         ("device", device()),
         ("toolchain", f"{toolchain}, {toolchain_version(toolchain)}"),
