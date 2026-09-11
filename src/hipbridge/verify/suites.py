@@ -94,6 +94,41 @@ class Operand:
 
 
 @dataclass(frozen=True)
+class Throughput:
+    """What the benchmark measured about a substitution being worth making.
+
+    Correctness and value are different questions, and `port` used to answer
+    only the first. It printed SUBSTITUTION PROVED for `rope` at any shape, when
+    a competently written HIP kernel beats that substitution at every size and
+    precision this project has measured, and for the norms at 1x1024, where the
+    candidate is several times slower. A proof that a kernel is right, presented
+    as a recommendation to adopt it, is the most expensive kind of true
+    statement this tool can make.
+
+    The numbers are declared here rather than read from `results/`, because a
+    wheel does not ship the results directory and an installed copy must be able
+    to say this too. A test re-derives every field from the committed benchmark,
+    so the declaration cannot drift from the measurement it claims to quote.
+    """
+
+    # Candidate against the tuned HIP baseline at the largest measured shape,
+    # float32. Above 1.0 the substitution is faster there.
+    vs_tuned_hip: float
+    # Elements in the smallest measured shape where the candidate won, or None
+    # where it never did. Not the true crossover, which is somewhere below this
+    # and has not been measured; the honest claim is the smallest size actually
+    # observed to win.
+    faster_at_or_above: int | None
+    # Worst measured slowdown at shapes below that, as a factor.
+    slower_by_up_to: float
+
+    @property
+    def worth_substituting(self) -> bool:
+        """Only on throughput. The oracle decides correctness."""
+        return self.vs_tuned_hip > 1.0
+
+
+@dataclass(frozen=True)
 class Suite:
     name: str
     source_file: str
@@ -139,6 +174,9 @@ class Suite:
     # do not. Only the suites that do require the value to be read off the
     # caller's kernel before anything may be substituted into it.
     uses_epsilon: bool = False
+    # What the benchmark says about adopting this substitution, so a proof does
+    # not read as a recommendation. None means nobody has timed it.
+    throughput: Throughput | None = None
 
     def source(self, examples_dir: Path) -> str:
         return (examples_dir / self.source_file).read_text(encoding="utf-8")
@@ -209,6 +247,7 @@ def tuned_baseline(kernel: str, block: tuple[int, int, int] = (256, 1, 1)) -> Ba
 
 ROW_SOFTMAX = Suite(
     name="row_softmax",
+    throughput=Throughput(vs_tuned_hip=1.6, faster_at_or_above=16777216, slower_by_up_to=5.0),
     source_file="row_softmax.cu",
     kernel="row_softmax",
     launch=LaunchSpec(
@@ -273,6 +312,7 @@ def _rms_norm_oracle(t: torch.Tensor, eps: float = DEFAULT_EPS) -> torch.Tensor:
 
 LAYER_NORM = Suite(
     name="layer_norm",
+    throughput=Throughput(vs_tuned_hip=1.5, faster_at_or_above=16777216, slower_by_up_to=5.2),
     uses_epsilon=True,
     source_file="layer_norm.cu",
     kernel="layer_norm",
@@ -293,6 +333,7 @@ LAYER_NORM = Suite(
 
 RMS_NORM = Suite(
     name="rms_norm",
+    throughput=Throughput(vs_tuned_hip=1.3, faster_at_or_above=16777216, slower_by_up_to=7.0),
     uses_epsilon=True,
     source_file="rms_norm.cu",
     kernel="rms_norm",
@@ -349,6 +390,7 @@ def _per_column(name: str, seed_offset: int, aliases: tuple[str, ...] = ()) -> O
 
 LAYER_NORM_AFFINE = Suite(
     name="layer_norm_affine",
+    throughput=Throughput(vs_tuned_hip=1.4, faster_at_or_above=16777216, slower_by_up_to=7.0),
     uses_epsilon=True,
     source_file="layer_norm_affine.cu",
     kernel="layer_norm_affine",
@@ -457,6 +499,7 @@ def _half_width(
 
 RMS_NORM_AFFINE = Suite(
     name="rms_norm_affine",
+    throughput=Throughput(vs_tuned_hip=1.3, faster_at_or_above=16777216, slower_by_up_to=7.7),
     uses_epsilon=True,
     source_file="rms_norm_affine.cu",
     kernel="rms_norm_affine",
@@ -477,6 +520,7 @@ RMS_NORM_AFFINE = Suite(
 
 ROPE = Suite(
     name="rope",
+    throughput=Throughput(vs_tuned_hip=0.9, faster_at_or_above=None, slower_by_up_to=11.1),
     source_file="rope.cu",
     kernel="rope",
     launch=_norm_launch("rope", (1, 1, 1)),
@@ -529,6 +573,7 @@ def _two_launches(x, gamma, cos_tab, sin_tab, eps: float = DEFAULT_EPS):
 
 RMS_NORM_ROPE = Suite(
     name="rms_norm_rope",
+    throughput=Throughput(vs_tuned_hip=0.8, faster_at_or_above=None, slower_by_up_to=9.9),
     uses_epsilon=True,
     source_file="rms_norm_rope.cu",
     kernel="rms_norm_rope",

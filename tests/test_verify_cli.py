@@ -561,6 +561,61 @@ def test_the_nightly_is_scheduled_small_and_verify_only():
     assert "git commit" not in script, "nightly numbers must not compete with the record"
 
 
+def test_the_gpu_gate_runs_before_a_merge_and_not_from_a_fork():
+    """The pre-merge gate, and the one trigger it is allowed to use.
+
+    Until this existed, nothing touched the GPU before a merge. ci.yml runs on
+    hosted runners where Triton cannot run at all, and amd-verify is dispatch
+    only, so a branch could break a kernel with every check green. rope and
+    rms_norm_rope sat at 63/93 on a branch that looked fine, and the only reason
+    anybody found out was a dispatch somebody chose to run.
+
+    `push` is the load-bearing detail. A fork can open a pull request; a fork
+    cannot push here, so this trigger already requires write access.
+    `pull_request` would hand a stranger's code to a machine we own, which
+    test_no_fork_reachable_workflow_reaches_a_self_hosted_runner forbids
+    outright. This test pins the gate so nobody adds it back the wrong way while
+    trying to make the gate fire on forks too.
+    """
+    wf = _workflow("amd-nightly.yml")
+    triggers = wf.get("on") or wf.get(True)
+
+    assert "push" in triggers, "nothing would gate a branch before it merged"
+    assert not (set(triggers) & FORK_REACHABLE), (
+        f"{sorted(set(triggers) & FORK_REACHABLE)} is reachable from a fork, and this "
+        f"workflow runs on a self-hosted runner"
+    )
+
+    push = triggers["push"] or {}
+    assert "main" in (push.get("branches-ignore") or []), (
+        "main arrives by merge; gating it again spends GPU time on content that "
+        "already passed on the branch"
+    )
+    # The gate must fire on the code that can move a measured number. Those are
+    # the same directories provenance hashes into a report's digest, so the two
+    # cannot drift apart without this failing.
+    from hipbridge.verify.provenance import CODE_PATHS
+
+    watched = " ".join(push.get("paths") or [])
+    for rel in CODE_PATHS:
+        assert rel in watched, (
+            f"{rel} is hashed into a report digest but does not trigger the GPU "
+            f"gate, so a change there could merge unverified"
+        )
+
+
+def test_the_gate_does_not_queue_gpu_jobs_behind_each_other():
+    """One runner, so a superseded push must not still be waiting for it."""
+    wf = _workflow("amd-nightly.yml")
+    concurrency = wf.get("concurrency")
+
+    assert concurrency, "three pushes in a minute would queue three GPU jobs"
+    assert concurrency.get("cancel-in-progress") is True
+    assert "github.ref" in concurrency["group"], (
+        "a group that ignores the ref would let a branch cancel the nightly"
+    )
+
+
 def test_the_manual_workflow_stays_the_one_that_costs_money():
     """Adding the nightly must not have loosened the rule it lives beside."""
     wf = _workflow("amd-verify.yml")

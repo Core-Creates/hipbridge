@@ -32,9 +32,40 @@ on:
     # when the day starts rather than arriving in the middle of it.
     - cron: "0 9 * * *"
   workflow_dispatch:
+  # The pre-merge gate. Until this existed, a branch could break a kernel and
+  # every check stayed green: ci.yml runs on hosted runners where Triton cannot
+  # run at all, and the only thing that touches the GPU before a merge was a
+  # human remembering to dispatch amd-verify. That is how rope and rms_norm_rope
+  # came to sit at 63/93 on a branch that looked fine.
+  #
+  # `push` and not `pull_request`, and the distinction is the whole design. A
+  # fork can open a pull request; a fork cannot push here. Running a fork's code
+  # on a self-hosted runner is arbitrary code execution on a machine we own, and
+  # tests/test_verify_cli.py forbids exactly that pairing across every workflow
+  # in this directory. So the gate triggers on the one event that already
+  # requires write access.
+  push:
+    # main arrives by merge, and its content is the branch content that already
+    # passed this gate. The 09:00 schedule covers it anyway.
+    branches-ignore: [main]
+    # The same three directories hipbridge.verify.provenance hashes into a
+    # report's digest, because they are the code that can move a measured
+    # number, plus this file so a change to the gate is tested by the gate.
+    paths:
+      - "src/hipbridge/kernels/**"
+      - "src/hipbridge/verify/**"
+      - "examples/**"
+      - ".github/workflows/amd-nightly.yml"
 
 permissions:
   contents: read
+
+# One runner, so a branch pushed three times in a minute must not queue three
+# GPU jobs behind each other. The newest push is the only one anybody wants an
+# answer about. Keyed on the ref, so a branch cannot cancel the nightly.
+concurrency:
+  group: amd-smoke-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   smoke:
@@ -99,3 +130,17 @@ jobs:
           name: hipbridge-nightly-${{ github.run_id }}
           path: nightly.json
           if-no-files-found: warn
+
+      # A persistent runner keeps its work tree between jobs. actions/checkout
+      # restores tracked files at the start of the next one, which is why a run
+      # logs "Removing results/port-rms_norm_rope-..." - but it does not remove
+      # untracked build output, __pycache__, or a report written for a kernel
+      # that is not committed yet. An ephemeral runner would solve this by
+      # discarding the machine; this is one fixed MI300X, so the runner is
+      # persistent by necessity and the cleanup is explicit instead.
+      #
+      # Last, and always: the artifact is already uploaded by here, so there is
+      # nothing left that a failure would want.
+      - name: Leave nothing behind
+        if: always()
+        run: git clean -xdff || true
