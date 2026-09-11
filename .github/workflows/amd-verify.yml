@@ -70,12 +70,12 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Only for the hosted dry run. A self-hosted AMD box already has the
       # interpreter that matters, the one with ROCm-built torch and
       # pytorch-triton-rocm, and installing a fresh Python here shadows it.
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         if: ${{ inputs.runner == 'ubuntu-latest' }}
         with:
           python-version: "3.12"
@@ -213,7 +213,7 @@ jobs:
       # anecdote; this project has lost two of those to a droplet already.
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: hipbridge-results-${{ inputs.arch }}-${{ github.run_id }}
           path: results/
