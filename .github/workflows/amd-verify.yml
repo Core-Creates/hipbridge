@@ -247,3 +247,17 @@ jobs:
           echo
           echo "Download the artifact above and commit it if these numbers"
           echo "should become the record."
+
+      # A persistent runner keeps its work tree between jobs. actions/checkout
+      # restores tracked files at the start of the next one, which is why a run
+      # logs "Removing results/port-rms_norm_rope-..." - but it does not remove
+      # untracked build output, __pycache__, or a report written for a kernel
+      # that is not committed yet. An ephemeral runner would solve this by
+      # discarding the machine; this is one fixed MI300X, so the runner is
+      # persistent by necessity and the cleanup is explicit instead.
+      #
+      # Last, and always: the artifact is already uploaded by here, so there is
+      # nothing left that a failure would want.
+      - name: Leave nothing behind
+        if: always()
+        run: git clean -xdff || true
