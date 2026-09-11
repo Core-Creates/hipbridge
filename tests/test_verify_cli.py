@@ -8,6 +8,7 @@ failure. If that inverts, the AMD workflow either burns money or cries wolf.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -127,6 +128,107 @@ def test_push_ci_never_requests_a_gpu_runner():
     for name, job in wf["jobs"].items():
         runs_on = str(job.get("runs-on", ""))
         assert "self-hosted" not in runs_on, f"job {name} would use a paid runner"
+
+
+# Triggers a person with no write access to this repository can cause to fire.
+# `pull_request` is the one that matters most: it checks out the fork's code and
+# runs it, so on a self-hosted runner it is arbitrary code execution on a machine
+# someone owns. `pull_request_target` runs the base repository's code instead,
+# which is worse in a different way because it gets the secrets. The rest cannot
+# execute a stranger's code but can still make a stranger's action consume the
+# runner.
+FORK_REACHABLE = frozenset(
+    {
+        "pull_request",
+        "pull_request_target",
+        "issue_comment",
+        "issues",
+        "discussion",
+        "discussion_comment",
+        "fork",
+        "watch",
+        "public",
+    }
+)
+
+
+def _workflow_files() -> list[Path]:
+    return sorted((REPO / ".github" / "workflows").glob("*.yml"))
+
+
+def _runner_labels(job: dict) -> list[str]:
+    """Every runner a job can land on, with `${{ matrix.x }}` expanded.
+
+    ci.yml's core job is `runs-on: ${{ matrix.os }}` across six legs, which is
+    the ordinary way to write a matrix and must not be read as unknowable. The
+    values are literals in the same file, so resolve them and check each. An
+    expression naming anything other than the matrix is returned unresolved, and
+    the caller refuses it.
+    """
+    runs_on = job.get("runs-on", "")
+    raw = [str(r) for r in runs_on] if isinstance(runs_on, list) else [str(runs_on)]
+    matrix = (job.get("strategy") or {}).get("matrix") or {}
+
+    out: list[str] = []
+    for value in raw:
+        key = re.fullmatch(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}", value.strip())
+        options = matrix.get(key.group(1)) if key else None
+        if isinstance(options, list):
+            out += [str(o) for o in options]
+        else:
+            out.append(value)
+    return out
+
+
+@pytest.mark.parametrize("path", _workflow_files(), ids=lambda p: p.name)
+def test_no_fork_reachable_workflow_reaches_a_self_hosted_runner(path: Path):
+    """The property that makes this repository safe to make public.
+
+    A self-hosted runner executing a fork's code is remote code execution on a
+    machine you own, and GitHub's own guidance is not to pair the two. Today
+    nothing here does: the only fork-reachable trigger is ci.yml's
+    `pull_request`, and every job it starts runs on a hosted runner.
+
+    Asserted over every workflow rather than over ci.yml by name, which is what
+    `test_push_ci_never_requests_a_gpu_runner` does. That test reads the
+    always-on matrix for cost and would not notice a new file: a workflow added
+    next month with `pull_request` and `runs-on: self-hosted` passes every other
+    check in this module.
+
+    A `${{ matrix.os }}` is resolved against the matrix, because the values are
+    right there in the file and ci.yml's six-leg core job is written that way.
+    Any other expression is refused: `runs-on: ${{ inputs.runner }}` is
+    legitimate in amd-verify.yml because dispatch needs write access, but in a
+    fork-reachable workflow a runner nobody can read off the file is not a
+    runner anybody can reason about.
+    """
+    wf = yaml.safe_load(path.read_text(encoding="utf-8"))
+    # PyYAML parses the bare key `on` as the boolean True.
+    triggers = wf.get("on", wf.get(True))
+    names = set(triggers) if isinstance(triggers, dict) else {triggers}
+    reachable = names & FORK_REACHABLE
+    if not reachable:
+        return
+
+    for job_name, job in wf.get("jobs", {}).items():
+        for runs_on in _runner_labels(job):
+            assert "${{" not in runs_on, (
+                f"{path.name}: job {job_name} is reachable from a fork "
+                f"({sorted(reachable)}) and picks its runner by expression "
+                f"{runs_on!r}, which this test cannot resolve. Name it literally."
+            )
+            assert "self-hosted" not in runs_on, (
+                f"{path.name}: job {job_name} is reachable from a fork "
+                f"({sorted(reachable)}) and runs on {runs_on!r}. A fork's code on "
+                f"a self-hosted runner is arbitrary code execution on that machine."
+            )
+
+
+def test_every_workflow_is_actually_checked():
+    """A guard on the guard: the parametrize must not silently collect nothing."""
+    found = _workflow_files()
+    assert found, "no workflows found, so the rule above asserted nothing"
+    assert {p.name for p in found} >= {"ci.yml", "amd-verify.yml", "amd-nightly.yml"}
 
 
 # --- the generated device drivers -------------------------------------------
