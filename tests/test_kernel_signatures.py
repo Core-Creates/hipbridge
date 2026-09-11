@@ -167,11 +167,21 @@ def test_an_empty_row_is_returned_rather_than_reduced():
 
 
 def test_the_tiled_module_tiles_below_the_threshold_it_takes_over_at():
-    """A tile larger than the ceiling would mean the tiled path never loops."""
+    """A tile larger than the ceiling would mean the tiled path never loops.
+
+    TILED_ABOVE now lives in the package root, which imports no Triton, so that
+    hipbridge.verify.suites can cap RoPE's sweep at it without one. Read it from
+    there rather than re-parsing: scraping asserted the literal in the file, and
+    this asserts the value the kernels actually use. TILE is still scraped,
+    because importing wide.py needs Triton and this suite runs where there is
+    none.
+    """
+    from hipbridge.kernels import TILED_ABOVE
+
     source = (KERNELS / "wide.py").read_text(encoding="utf-8")
     ns = {}
     for line in source.splitlines():
-        if line.startswith(("TILE =", "TILED_ABOVE =")):
-            exec(line, ns)  # noqa: S102 - two integer literals from our own source
-    assert ns["TILE"] < ns["TILED_ABOVE"], ns
-    assert ns["TILED_ABOVE"] >= 4096, "taking over below a shape with a measurement history"
+        if line.startswith("TILE ="):
+            exec(line, ns)  # noqa: S102 - an integer literal from our own source
+    assert ns["TILE"] < TILED_ABOVE, ns
+    assert TILED_ABOVE >= 4096, "taking over below a shape with a measurement history"

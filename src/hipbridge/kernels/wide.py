@@ -31,10 +31,10 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
-# Above this many columns, tile. Below it the single-tile kernels are faster and
-# are the ones with a measurement history, so the threshold is deliberately well
-# clear of the shapes anything has been benchmarked at.
-TILED_ABOVE = 8192
+# Defined in the package root, which imports no triton, so that a sweep can be
+# built without one. Re-exported here because rope.py and fused.py read it as
+# wide.TILED_ABOVE, next to the tiling this module implements.
+from hipbridge.kernels import TILED_ABOVE
 
 # Elements per pass. A power of two so the mask arithmetic stays cheap, and
 # small enough that the accumulator plus a tile of data fits comfortably.
