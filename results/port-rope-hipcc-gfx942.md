@@ -2,14 +2,14 @@
 
 | field | value |
 |---|---|
-| generated | 2026-09-08 22:57 UTC |
-| hipbridge | 0.1.0.dev0 at commit `8c1834e` |
+| generated | 2026-09-11 16:07 UTC |
+| hipbridge | 0.1.0.dev0 at commit `8806003` |
 | host | 2 (Linux x86_64) |
 | device | AMD Radeon Graphics |
 | toolchain | hipcc, HIP version: 7.14.60850-0000000 |
 | arch | gfx942 |
 | torch | 2.9.1+rocm6.4 |
-| measured code | `7aa3e84fc2a962b5` |
+| measured code | `c572bb7c221e07b1` |
 
 source: `examples/rope.cu`  kernel: `rope`
 pattern: `row_map` (likely)

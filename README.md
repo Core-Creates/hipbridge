@@ -10,10 +10,11 @@ been checked on both vendors: nvcc on an RTX 4060 via WSL2, and hipcc on an
 MI300X (gfx942).
 
 Performance is measured by CI on a self-hosted MI300X across all seven kernels
-and three precisions. At large shapes the substitutions beat a **competently
-written HIP kernel by 1.3x to 1.9x**, and half precision is about 1.7x faster
-than float32, except RoPE which loses to hand-written HIP in every precision;
-below roughly 16M elements every substitution is a 3x to 5x regression. See
+and three precisions. At large shapes five of the seven beat a
+**competently written HIP kernel by 1.2x to 1.9x**, and half precision is 1.4x
+to 1.9x faster than float32. The two kernels carrying a rotation, `rope` and
+`rms_norm_rope`, lose to hand-written HIP in every precision; below roughly 16M
+elements every substitution is a 3x to 5x regression. See
 [the status table](#status-of-what-has-actually-been-run) for exactly which
 paths those are. Claims in this README are limited to what has actually been
 run, never to what should follow from it.
@@ -86,8 +87,11 @@ is exactly what makes a row's outputs independent.
 The accuracy argument that carries softmax and the norms does not carry RoPE,
 and this README will not pretend otherwise: there is nothing to reduce, so
 there is no serial accumulation to beat. On the MI300X the substitution is
-bitwise identical to the original, `worst ulp=0`, equivalent on all 84 cases.
-The case for substituting it is throughput, not numerics.
+equivalent to the original on all 93 cases at `worst ulp=1`. It read `ulp=0`,
+bitwise identical, until the sweep stopped asking RoPE for a 32768-column row
+it refuses by design; the shapes that replaced it are not bit-exact, and one
+ULP is still the float32 noise floor. The case for substituting it was never
+numerics, and the measured throughput now argues against it outright.
 
 Neither the affine norms nor the plain ones fuse anything, and `rope` assumes an
 even head dimension, since pairing channel 2i with 2i+1 has no meaning
@@ -134,8 +138,8 @@ proposing: hipbridge.kernels.softmax (Triton, AMD-tuned)
 
 proving against examples/row_softmax.cu compiled with hipcc
   launch: grid one block per row, block=(1, 1, 1)
-PASS  row_softmax vs hipbridge.kernels.softmax: 84/84 cases, worst ulp=593
-      [accuracy vs original: better=6, equivalent=78, up to 297x closer to float64]
+PASS  row_softmax vs hipbridge.kernels.softmax: 31/31 cases, worst ulp=4454
+      [accuracy vs original: better=9, equivalent=22, up to 1034x closer to float64]
 
 SUBSTITUTION PROVED. Use it like this:
 
@@ -307,16 +311,24 @@ regrows a `triton` dependency.
 so a case count in a transcript is that run's, not a current claim. The
 committed reports under `results/` are the ones CI keeps in step with the code.
 
-**What 84 cases covers.** Four shapes, seven input distributions, three
-precisions. The four shapes are `(1,1)`, `(2,32768)`, `(64,65)` and `(1000,128)`,
-which is a deliberate spread: a degenerate case, a row too wide for one block so
-the tiled path is exercised, a wavefront of rows one column past a wavefront,
-and a thousand rows so that the row stride has to hold for all of them.
+**What 93 cases covers.** Four shapes x seven input distributions x three
+precisions is 84, plus three non-contiguous layouts (padded, transposed,
+sliced) x three precisions for the remaining nine. The four shapes are `(1,1)`,
+`(2,32768)`, `(64,65)` and `(1000,128)`, which is a deliberate spread: a
+degenerate case, a row too wide for one block so the tiled path is exercised, a
+wavefront of rows one column past a wavefront, and a thousand rows so that the
+row stride has to hold for all of them.
+
+`rope` and `rms_norm_rope` sweep a different four. They refuse a row wider than
+8192 rather than tiling it, because a rotation operates on a head dimension, so
+`(2,32768)` is outside what they are defined for and the sweep no longer asks:
+theirs are `(1000,128)`, `(63,1024)`, `(1,2)` and `(2,2)`. The count is the same
+93 because only the widths differ.
 
 Until the sweep was reordered those four were `(1,1)`, `(1,2)`, `(1,31)` and
 `(1,32)`. Every case ever measured had exactly one row, so `row` was always 0
-and any kernel that ignored its row stride would have scored the same 84/84.
-The count was honest and the width was not, which is why the shapes are now
+and any kernel that ignored its row stride would have scored the same count.
+The number was honest and the width was not, which is why the shapes are now
 named here rather than left to be inferred from a number.
 
 ## The result this project was built to get
@@ -327,11 +339,11 @@ Triton kernel checked against the original `row_softmax.cu` compiled with
 
 ```
 candidate: hipbridge.kernels.softmax (Triton, AMD-tuned)
-PASS  row_softmax vs original on hipcc: 84/84 cases, worst ulp=593
-      [accuracy vs original: better=6, equivalent=78, up to 297x closer to float64]
+PASS  row_softmax vs original on hipcc: 93/93 cases, worst ulp=5719
+      [accuracy vs original: better=9, equivalent=84, up to 3169x closer to float64]
 ```
 
-**593 ULP of divergence, and it passes.** That is the entire argument.
+**5719 ULP of divergence, and it passes.** That is the entire argument.
 
 The Triton kernel reduces pairwise across a 64-wide wavefront; the original
 accumulates serially, which grows rounding error as O(n) rather than O(log n).
@@ -339,19 +351,19 @@ So the two disagree enormously, and where the disagreement is large enough to
 resolve, the Triton one is *closer to float64 truth*.
 
 Judged the obvious way, "does the translation match the original within a ULP
-budget", this run scores **0/84** and the better kernel is rejected. Judged
-against a float64 oracle, it scores 84/84. Matching the original would have
+budget", this run scores **0/93** and the better kernel is rejected. Judged
+against a float64 oracle, it scores 93/93. Matching the original would have
 meant reproducing its rounding error.
 
 Read the verdict breakdown precisely, because it is a narrower claim than "more
 accurate everywhere":
 
-- On **78 of 84** cases both implementations land at the float32 noise floor.
+- On **84 of 93** cases both implementations land at the float32 noise floor.
   Neither is meaningfully closer to truth and the tool calls that equivalent.
-- On **6** cases the original climbs off the floor and the Triton kernel does
-  not, and there it is up to **297x** closer to float64. Those are the inputs
+- On **9** cases the original climbs off the floor and the Triton kernel does
+  not, and there it is up to **3169x** closer to float64. Those are the inputs
   the sweep exists to generate: sparse, mixed-sign, and large-magnitude.
-- **Never worse.** Not once in 84.
+- **Never worse.** Not once in 93.
 
 So the honest statement is not that the substitution is always more accurate.
 It is that the two are indistinguishable on ordinary inputs, and on the inputs
@@ -365,34 +377,41 @@ tried. See `compare.arbitrate` and `tests/test_arbitration.py`.
 ### The same run, across all seven kernels
 
 ```
-PASS  row_softmax        84/84  ulp=593         (max abs 1.199e-07)  better=6,  equivalent=78, up to 297x closer
-PASS  layer_norm         84/84  ulp=1776828265  (max abs 3.910e-05)  better=5,  equivalent=79, up to  79x closer
-PASS  layer_norm_affine  84/84  ulp=332160      (max abs 6.714e-04)  better=5,  equivalent=79, up to  86x closer
-PASS  rms_norm           84/84  ulp=10          (max abs 1.907e-06)  equivalent=84,            up to  15x closer
-PASS  rms_norm_affine    84/84  ulp=10          (max abs 3.662e-04)  equivalent=84,            up to  11x closer
-PASS  rope               84/84  ulp=0           (max abs 0.000e+00)  equivalent=84
+PASS  row_softmax        93/93  ulp=5719        (max abs 1.953e-03)  better=9,  equivalent=84, up to 3169x closer
+PASS  layer_norm         93/93  ulp=1751849056  (max abs 1.562e-02)  better=12, equivalent=81, up to  440x closer
+PASS  layer_norm_affine  93/93  ulp=27780685    (max abs 4.000e+00)  better=11, equivalent=82, up to  226x closer
+PASS  rms_norm           93/93  ulp=60          (max abs 3.125e-02)  better=6,  equivalent=87, up to   51x closer
+PASS  rms_norm_affine    93/93  ulp=62          (max abs 4.000e+00)  better=6,  equivalent=87, up to   32x closer
+PASS  rope               93/93  ulp=1           (max abs 4.883e-04)  equivalent=93
+PASS  rms_norm_rope      93/93  ulp=247803      (max abs 1.000e+00)  better=1,  equivalent=92, up to    6x closer
 ```
 
 Three of those lines need reading carefully, and the absolute error beside each
 ULP count is why it is printed.
 
-**`layer_norm` diverges by 1.78 billion ULP and is fine.** Its outputs are
+**`layer_norm` diverges by 1.75 billion ULP and is fine.** Its outputs are
 centred, so they sit near zero, and ULP distance explodes there: +1e-9 and -1e-9
 are a hair apart in magnitude and astronomically far apart on the integer line.
-The absolute error is 3.9e-05. ULP is the right scale-free metric for softmax,
+The absolute error is 1.6e-02. ULP is the right scale-free metric for softmax,
 whose outputs are positive and O(1), and the wrong one for anything crossing
 zero.
 
-**`rope` is bitwise identical to the original**, `ulp=0`, equivalent on every
-case. There is no reduction in RoPE, so there is no serial accumulation to beat,
-and the accuracy argument simply does not apply. Substituting it is a throughput
-decision.
+**`rope` is equivalent on every case at `ulp=1`.** There is no reduction in
+RoPE, so there is no serial accumulation to beat, and the accuracy argument
+simply does not apply. It read `ulp=0` until the sweep stopped asking it for a
+32768-column row, a width it refuses by design; the shapes that replaced it are
+not bit-exact and one ULP is the float32 noise floor. Substituting it was always
+a throughput decision, and the throughput now argues the other way.
 
-**The two `equivalent=84` rows used to read `better=12`.** `arbitrate` scored a
-tie as a win, because a tie gives a ratio of exactly 1.0 and the test was
-`ratio <= 1.0`. Tightening it to `< 1.0` removed 24 false wins across the sweep
-and left the 16 real ones untouched, which is the useful part: the softmax and
-LayerNorm advantages were not artifacts.
+**`rms_norm_rope` is here for the first time.** The fused kernel was proved end
+to end only once the port loop stopped hardcoding six names for seven suites, so
+this line has no predecessor to compare against.
+
+**Ties are not wins.** `arbitrate` used to score one as a win, because a tie
+gives a ratio of exactly 1.0 and the test was `ratio <= 1.0`. Tightening it to
+`< 1.0` removed 24 false wins across the sweep and left the real ones untouched,
+which is the useful part: the softmax and LayerNorm advantages were not
+artifacts.
 
 First MI300X run, `scripts/smoke-hip.sh`, HIP 7.14, gfx942:
 
@@ -511,14 +530,15 @@ device and toolchain they came from. At 4096x4096, float32:
 
 | Kernel | naive original | competent HIP | torch | candidate | vs original | **vs competent** | vs torch |
 |---|---|---|---|---|---|---|---|
-| `row_softmax` | 2431.9 us | 53.3 us | 40.6 us | **31.7 us** | 76.7x | **1.7x** | 1.3x |
-| `layer_norm` | 1739.7 us | 45.7 us | 44.7 us | **31.0 us** | 56.1x | **1.5x** | 1.4x |
-| `layer_norm_affine` | 1829.9 us | 46.9 us | 45.7 us | **33.2 us** | 55.2x | **1.4x** | 1.4x |
-| `rms_norm` | 1428.3 us | 41.2 us | 43.1 us | **31.2 us** | 45.8x | **1.3x** | 1.4x |
-| `rms_norm_affine` | 1578.2 us | 41.4 us | 43.6 us | **32.0 us** | 49.4x | **1.3x** | 1.4x |
-| `rope` | 1371.6 us | **45.7 us** | 241.3 us | 53.1 us | 25.8x | **0.9x** | 4.5x |
+| `row_softmax` | 2429.8 us | 52.3 us | 40.1 us | **32.6 us** | 74.6x | **1.6x** | 1.2x |
+| `layer_norm` | 1735.9 us | 45.9 us | 44.7 us | **31.3 us** | 55.5x | **1.5x** | 1.4x |
+| `layer_norm_affine` | 1852.8 us | 46.6 us | 45.5 us | **33.6 us** | 55.2x | **1.4x** | 1.4x |
+| `rms_norm` | 1451.7 us | 41.3 us | 43.2 us | **31.5 us** | 46.1x | **1.3x** | 1.4x |
+| `rms_norm_affine` | 1585.9 us | 41.5 us | 43.4 us | **32.1 us** | 49.4x | **1.3x** | 1.3x |
+| `rope` | 1373.6 us | **45.9 us** | 238.7 us | 52.7 us | 26.0x | **0.9x** | 4.5x |
+| `rms_norm_rope` | 2139.2 us | **58.4 us** | 87.3 us | 71.8 us | 29.8x | **0.8x** | 1.2x |
 
-**The 25x to 77x column is the least interesting one and is close to
+**The 26x to 75x column is the least interesting one and is close to
 meaningless.** It is measured against kernels that launch one thread per block
 and leave a 304-CU device idle. Any competent kernel beats them. That is why the
 table carries two baselines that can actually win.
@@ -527,20 +547,26 @@ table carries two baselines that can actually win.
 first version of `row_softmax_tuned.cu` made three passes over the row and torch
 beat it by 2.3x, so "2.9x against a competently written HIP kernel" was really
 2.9x against a mediocre one. Rewriting it as an online softmax, two passes
-instead of three, took it from 94.2 us to 53.3 us, and the claim fell to 1.7x.
+instead of three, took it from 94.2 us to 53.3 us, and the claim fell to 1.7x
+(1.6x on the current record).
 The LayerNorm baselines moved the same way once they used Welford in a single
 pass rather than separate mean and variance passes.
 
-So the honest claim is: **at large shapes the tuned Triton kernels beat a
-competently written HIP kernel by 1.3x to 1.7x and torch by 1.3x to 1.4x, and
-RoPE loses to a good hand-written kernel outright.** That is a smaller number
+So the honest claim is: **at large shapes five of the seven tuned Triton
+kernels beat a competently written HIP kernel by 1.3x to 1.6x and torch by 1.2x
+to 1.4x, and both kernels carrying a rotation lose to a good hand-written kernel
+outright.** That is a smaller number
 than this README used to carry and a much harder one to argue with, and finding
 it out cost nothing except being willing to improve the opponent.
 
-RoPE deserves its own sentence: hand-written HIP wins at 0.9x, and the 4.5x
-against torch says more about torch having no fused RoPE than about the kernel.
-There is no reduction in RoPE, so there is nothing for a tuned implementation to
-recover.
+The rotations deserve their own sentence: hand-written HIP wins at 0.9x for
+`rope` and 0.8x for `rms_norm_rope`, and RoPE's 4.5x against torch says more
+about torch having no fused RoPE than about the kernel. There is no reduction in
+a rotation, so there is nothing for a tuned implementation to recover, and
+fusing RMSNorm onto one does not buy the fused kernel enough reduction to
+change that. `rms_norm_rope` is timed here for the first time; it was never
+benchmarked before the port loop stopped hardcoding six names for seven
+suites.
 
 Below roughly 16M elements every substitution is a **3x to 5x regression**,
 marked `latency-bound` in the tables. The crossover is dispatch cost, measured
@@ -563,33 +589,40 @@ ratio against a competently written HIP kernel:
 
 | Kernel | fp32 | vs HIP | fp16 | vs HIP | bf16 | vs HIP |
 |---|---|---|---|---|---|---|
-| `row_softmax` | 31.3 | 1.7x | **24.0** | 1.9x | **25.5** | 1.8x |
-| `layer_norm` | 30.7 | 1.5x | **17.9** | 1.7x | **18.5** | 1.7x |
-| `layer_norm_affine` | 32.8 | 1.4x | **19.5** | 1.7x | **20.5** | 1.7x |
-| `rms_norm` | 30.8 | 1.3x | **16.8** | 1.4x | **17.7** | 1.4x |
-| `rms_norm_affine` | 31.8 | 1.3x | **18.0** | 1.4x | **18.2** | 1.5x |
-| `rope` | 52.9 | 0.9x | **26.7** | 0.9x | **26.9** | 0.9x |
+| `row_softmax` | 32.6 | 1.6x | **23.9** | 1.9x | **25.5** | 1.8x |
+| `layer_norm` | 31.3 | 1.5x | **20.8** | 1.5x | **19.1** | 1.7x |
+| `layer_norm_affine` | 33.6 | 1.4x | **23.1** | 1.5x | **23.3** | 1.5x |
+| `rms_norm` | 31.5 | 1.3x | **18.8** | 1.2x | **19.8** | 1.2x |
+| `rms_norm_affine` | 32.1 | 1.3x | **21.1** | 1.2x | **21.3** | 1.2x |
+| `rope` | 52.7 | 0.9x | **27.4** | 0.9x | **27.6** | 0.9x |
+| `rms_norm_rope` | 71.8 | 0.8x | **41.0** | 0.7x | **41.2** | 0.7x |
 
-Half precision is roughly **1.7x faster than float32** across the substitutions,
-which is what you would expect from kernels that are memory bound: half the
-bytes, most of the time back. The advantage over a hand-written HIP kernel also
-widens slightly, from 1.3x-1.7x to 1.4x-1.9x, because the tuned baselines gain
-less: they load and store in half but compute in float, so the conversion work
-they add scales with the data while the reduction does not.
+Half precision is **1.4x to 1.9x faster than float32** across the
+substitutions, which is what you would expect from kernels that are memory
+bound: half the bytes, most of the time back.
 
-**RoPE stays at 0.9x in every precision.** It has no reduction, so there is
-nothing for a tuned implementation to recover, and hand-written HIP wins
-whatever the type. That number has not moved across three precisions and two
+The advantage over a hand-written HIP kernel does **not** simply widen, which
+this README claimed on the previous record and the current one does not support.
+It spreads: softmax gains, going 1.6x to 1.9x, while both RMSNorms lose ground,
+going 1.3x to 1.2x. So the range moves from 1.3x-1.6x in float32 to 1.2x-1.9x in
+half, wider at both ends. The tuned baselines load and store in half but compute
+in float, and how much that conversion costs them relative to their reduction is
+evidently not the same for every kernel.
+
+**The rotations lose in every precision.** `rope` sits at 0.9x and
+`rms_norm_rope` at 0.8x-0.7x. Neither has a reduction worth the name, so there
+is nothing for a tuned implementation to recover, and hand-written HIP wins
+whatever the type. RoPE's 0.9x has not moved across three precisions and two
 rewrites, which is about as clear as this project gets about when not to
 substitute.
 
 Two figures worth reading twice. The naive originals get *slower* in half for
-softmax (2425 us to 2736 us) because a single thread converting each element
+softmax (2430 us to 2746 us) because a single thread converting each element
 pays for the conversion without the bandwidth saving, which is why the vs
-original column climbs to 113x and means even less than it did before. And
-`torch` beats the candidate outright at fp16 softmax (24.2 against 24.0, a tie
-within noise), so at that shape and precision the substitution buys nothing over
-the library call.
+original column climbs to 115x and means even less than it did before. And
+`torch` ties the candidate at fp16 softmax (23.8 against 23.9, inside the
+run-to-run spread), so at that shape and precision the substitution buys nothing
+over the library call.
 
 Correctness in half is proved the same way as in float32, against the caller's
 own compiled kernel: the generated driver is templated on the element type, so
