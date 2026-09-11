@@ -357,6 +357,7 @@ def _cmd_port(args) -> int:
         f"{' for ' + args.arch if args.arch else ''} against your own kernel,"
     )
     print("judged against a float64 oracle rather than against the original's rounding.")
+    _print_whether_it_is_worth_it(suite)
     if args.report:
         _write_report(
             args, f"port-{outcome.facts.name}", "hipbridge port report", outcome.report_body()
@@ -449,6 +450,52 @@ def _cmd_info(args) -> int:
     print(f"[kernels] extra: {'available' if kernels.available() else 'not installed'}")
     print(f"[verify]  extra: {'available' if verify.available() else 'not installed'}")
     return EXIT_OK
+
+
+def _elements(n: int) -> str:
+    """16777216 as 16.8M, because nobody reads the first spelling as a size."""
+    for unit, scale in (("B", 10**9), ("M", 10**6), ("K", 10**3)):
+        if n >= scale:
+            return f"{n / scale:.1f}{unit}"
+    return str(n)
+
+
+def _print_whether_it_is_worth_it(suite) -> None:
+    """Correctness is not the same question as value, and port answered one.
+
+    It printed SUBSTITUTION PROVED for `rope`, which a competently written HIP
+    kernel beats at every shape and precision this project has measured, and for
+    the norms at shapes where the substitution is several times slower. Both
+    proofs were right. Presented alone, both read as a recommendation to adopt,
+    and a user who took them would have shipped a slower kernel carrying a
+    correctness certificate.
+
+    The exit code does not change: the substitution is proved, and 0 still means
+    proved. What changes is that the user is told what the benchmark found, next
+    to the proof, rather than having to go and look.
+    """
+    t = getattr(suite, "throughput", None)
+    if t is None:
+        print()
+        print("Worth substituting? Unmeasured. Nothing here has timed this kernel,")
+        print("so this proof says it is correct and nothing about whether it is faster.")
+        return
+
+    print()
+    if t.worth_substituting:
+        print(f"Worth substituting? Measured {t.vs_tuned_hip}x a competently written HIP kernel at")
+        print(
+            f"{_elements(t.faster_at_or_above)} elements and above, and up to "
+            f"{t.slower_by_up_to}x SLOWER below that."
+        )
+        print("Above the crossover it pays. Below it, this proof is not a reason to switch.")
+    else:
+        print("Worth substituting? NOT ON SPEED. A competently written HIP kernel beat this")
+        print(
+            f"substitution at every shape measured: {t.vs_tuned_hip}x at the largest, "
+            f"up to {t.slower_by_up_to}x"
+        )
+        print("slower at small ones. The proof above says it is correct, not that it is better.")
 
 
 def main(argv: list[str] | None = None) -> int:

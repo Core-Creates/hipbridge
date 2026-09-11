@@ -14,7 +14,7 @@ and three precisions. At large shapes five of the seven beat a
 **competently written HIP kernel by 1.2x to 1.9x**, and half precision is 1.4x
 to 1.9x faster than float32. The two kernels carrying a rotation, `rope` and
 `rms_norm_rope`, lose to hand-written HIP in every precision; below roughly 16M
-elements every substitution is a 3x to 5x regression. See
+elements every substitution is a 2.9x to 11.1x regression. See
 [the status table](#status-of-what-has-actually-been-run) for exactly which
 paths those are. Claims in this README are limited to what has actually been
 run, never to what should follow from it.
@@ -568,8 +568,13 @@ change that. `rms_norm_rope` is timed here for the first time; it was never
 benchmarked before the port loop stopped hardcoding six names for seven
 suites.
 
-Below roughly 16M elements every substitution is a **3x to 5x regression**,
-marked `latency-bound` in the tables. The crossover is dispatch cost, measured
+Below roughly 16M elements every substitution is a **2.9x to 11.1x
+regression**, marked `latency-bound` in the tables. That range used to read
+"3x to 5x" here, which understated the worst case by more than double: at
+1x1024 the RoPE substitution is 11.1x slower than hand-written HIP, and the
+figure was quoted from a smaller sweep and never re-derived. `port` now prints
+the per-kernel number beside its proof, so a user reads it without coming
+here. The crossover is dispatch cost, measured
 rather than assumed: on this box an in-place torch op that does no work costs
 **4.9 us** to launch from Python, `torch.softmax` on one row costs **5.5 us**,
 and the Triton candidate costs **17 us**. About 12 us is Triton's own launch
