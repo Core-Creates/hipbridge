@@ -203,3 +203,34 @@ def torch_():
     import torch
 
     return torch
+
+
+def test_the_rotation_sweeps_stay_inside_the_head_dimension_they_support():
+    """The shape domain, pinned, because a sweep widened underneath it once.
+
+    rope and rms_norm_rope refuse a row wider than TILED_ABOVE rather than
+    tiling it: a rotation operates on a head dimension, so 32768 columns is a
+    shape mistake and wide.py exports tiling for softmax and the norms and
+    deliberately not for these two. _FIRST_PASS then moved from (2, 4096) to
+    (2, 32768) to exercise that tiling for the norms, and RoPE's filter screened
+    width for evenness but never for size. On an MI300X both suites scored
+    63/93, with all 30 failures the kernel's own documented refusal reported as
+    a defect.
+
+    Asserted on the sweep rather than on the one shape that broke it, so the
+    next widening of _FIRST_PASS is caught here instead of 14 minutes into a
+    GPU run.
+    """
+    from hipbridge.kernels import TILED_ABOVE
+    from hipbridge.verify.suites import RMS_NORM_ROPE, ROPE
+
+    for suite in (ROPE, RMS_NORM_ROPE):
+        widths = [cols for _, cols in suite.shapes()]
+        assert widths, f"{suite.name} has an empty sweep"
+        too_wide = [w for w in widths if w > TILED_ABOVE]
+        assert not too_wide, (
+            f"{suite.name} sweeps widths {sorted(set(too_wide))}, which its kernel "
+            f"refuses above {TILED_ABOVE}. The sweep would score a documented "
+            f"refusal as a failure."
+        )
+        assert not [w for w in widths if w % 2], f"{suite.name} sweeps an odd head dimension"

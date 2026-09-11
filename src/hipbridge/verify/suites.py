@@ -372,15 +372,28 @@ LAYER_NORM_AFFINE = Suite(
 
 
 def _even_row_shapes() -> Sequence[tuple[int, ...]]:
-    """Row shapes with an even width.
+    """Row shapes with an even width, no wider than a head dimension.
 
     RoPE pairs channel 2i with 2i+1, so an odd head dimension has no pairing.
     Filtering here rather than silently truncating keeps the sweep honest: the
     kernel is not defined for those shapes, so they are not claimed as passing.
+
+    The upper bound is the same argument made about width. rope and
+    rms_norm_rope refuse a row wider than TILED_ABOVE instead of tiling it,
+    because a rotation operates on a head dimension and 32768 columns is a
+    shape mistake rather than a workload; wide.py exports tiling for softmax
+    and the norms and deliberately not for these two. The sweep asked for one
+    anyway once _FIRST_PASS moved to (2, 32768) to exercise that tiling, and
+    scored 30 deliberate refusals per suite as failures. A kernel that declines
+    a shape it documents as out of domain is not a failing kernel, and a sweep
+    that says otherwise teaches everyone to ignore it.
     """
+    from hipbridge.kernels import TILED_ABOVE
     from hipbridge.verify import shapes
 
-    return [s for s in shapes.sample(shapes.row_wise()) if s[1] % 2 == 0 and s[1] >= 2]
+    return [
+        s for s in shapes.sample(shapes.row_wise()) if s[1] % 2 == 0 and 2 <= s[1] <= TILED_ABOVE
+    ]
 
 
 def _torch_rms_norm_affine(

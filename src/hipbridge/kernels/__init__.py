@@ -68,4 +68,15 @@ def require() -> None:
 # and so contradicted the no-edge-to-core note above. A Suite now names its own
 # implementation; see hipbridge.verify.suites.Suite.triton_impl.
 
-__all__ = ["KernelsUnavailable", "available", "require"]
+# Above this many columns, tile. Below it the single-tile kernels are faster and
+# are the ones with a measurement history, so the threshold is deliberately well
+# clear of the shapes anything has been benchmarked at.
+#
+# It lives here rather than in wide.py because it is also the domain boundary
+# that hipbridge.verify.suites has to respect when it builds a sweep, and wide.py
+# imports triton at module level. A sweep must be constructible on a machine with
+# no Triton at all, and re-typing 8192 on the verify side would make the two
+# disagree the first time one moved.
+TILED_ABOVE = 8192
+
+__all__ = ["TILED_ABOVE", "KernelsUnavailable", "available", "require"]
