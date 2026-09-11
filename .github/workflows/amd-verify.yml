@@ -222,8 +222,28 @@ jobs:
       - name: Show what changed against the committed results
         if: always()
         run: |
+          # --intent-to-add first, because `git diff` sees tracked files only and
+          # a report for a kernel nobody has proved before is untracked by
+          # definition. The run that first proved rms_norm_rope end to end
+          # printed seven changed files and said nothing about the eighth it had
+          # just created. A new kernel is the case where this summary most needs
+          # to be complete, and it was the one case it dropped. The index is
+          # scratch on a CI checkout, so staging intent costs nothing.
+          git add --intent-to-add -- results/ || true
+
           echo "Reports differing from what is on this branch:"
           git --no-pager diff --stat -- results/ || true
+
+          # Called out separately as well as counted in the stat above: a new
+          # report is a claim this branch has never made, which is a different
+          # thing to read than a number that moved.
+          new=$(git diff --name-only --diff-filter=A -- results/ || true)
+          if [ -n "$new" ]; then
+            echo
+            echo "New reports, which did not exist on this branch:"
+            echo "$new" | sed "s/^/  /"
+          fi
+
           echo
           echo "Download the artifact above and commit it if these numbers"
           echo "should become the record."
