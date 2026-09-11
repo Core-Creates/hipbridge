@@ -36,6 +36,102 @@ jobs:
       - run: pip install -e ".[all,dev]"
       - run: pytest
 
+  # Every other job installs with `pip install -e`, which puts the source tree
+  # on sys.path. A package missing from setuptools' discovery, or a module that
+  # never made it into the archive, is invisible that way: the import succeeds
+  # because it is reading the checkout, not the artifact. Nothing here had ever
+  # built a wheel, and the README opens with four `pip install hipbridge` lines.
+  #
+  # This job builds what a user would download and installs it where the
+  # checkout cannot be seen.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Build the sdist and the wheel
+        run: |
+          pip install build
+          python -m build
+
+      - name: The wheel carries every package, and nothing it should not
+        run: |
+          python - <<'CHECK'
+          import glob, pathlib, zipfile
+
+          wheels = glob.glob("dist/*.whl")
+          assert len(wheels) == 1, f"expected one wheel, got {wheels}"
+          names = set(zipfile.ZipFile(wheels[0]).namelist())
+
+          # Derived from the tree rather than listed here, so a package added
+          # next month is checked without anyone remembering to add it. That is
+          # the failure this whole job exists for: hipbridge.recognizers was
+          # renamed recently, and a rename that misses the wheel is silent under
+          # an editable install.
+          src = pathlib.Path("src/hipbridge")
+          expected = {
+              f"hipbridge/{p.relative_to(src).as_posix()}"
+              for p in src.rglob("*.py")
+              if "__pycache__" not in p.parts
+          }
+          missing = sorted(expected - names)
+          assert not missing, f"the wheel is missing {len(missing)} module(s): {missing[:5]}"
+
+          stowaways = sorted(n for n in names if n.startswith(("tests/", "results/", ".github/")))
+          assert not stowaways, f"the wheel carries files it should not: {stowaways}"
+
+          print(f"{wheels[0]}: {len(expected)} modules, no stowaways")
+          CHECK
+
+      - name: Install the wheel where the checkout cannot be seen
+        run: |
+          python -m venv /tmp/fresh
+          /tmp/fresh/bin/pip install --quiet dist/*.whl
+
+      - name: Core installs with neither extra, and runs
+        working-directory: /tmp
+        run: |
+          /tmp/fresh/bin/python - <<'CHECK'
+          import importlib.util as u
+          import hipbridge
+
+          # Reading the artifact, not a source tree that happened to be nearby.
+          assert "/tmp/fresh/" in hipbridge.__file__, hipbridge.__file__
+          # The [verify] and [kernels] extras must not arrive with the core wheel.
+          # pyproject says so; until now nothing checked the built package agreed.
+          for heavy in ("torch", "triton"):
+              assert u.find_spec(heavy) is None, f"core pulled in {heavy}"
+
+          from hipbridge import recognize, registered
+          assert callable(recognize) and registered()
+          print(f"hipbridge {hipbridge.__version__} from {hipbridge.__file__}")
+          CHECK
+
+      - name: The console script the README tells people to run
+        working-directory: /tmp
+        run: /tmp/fresh/bin/hipbridge info
+
+      - name: Every documented extra resolves
+        run: |
+          # Resolved, not installed: [verify] is torch and [kernels] is Triton,
+          # which is gigabytes to prove a dependency graph is satisfiable. A
+          # resolution failure is the thing that breaks a user's install.
+          for extra in kernels verify all; do
+            echo "== [$extra]"
+            /tmp/fresh/bin/pip install --quiet --dry-run "$(echo dist/*.whl)[$extra]"
+          done
+
+      - name: Keep the artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hipbridge-dist-${{ github.run_id }}
+          path: dist/
+          if-no-files-found: warn
+
   lint:
     runs-on: ubuntu-latest
     steps:

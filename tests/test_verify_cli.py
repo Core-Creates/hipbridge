@@ -616,6 +616,35 @@ def test_the_gate_does_not_queue_gpu_jobs_behind_each_other():
     )
 
 
+def test_something_builds_the_package_a_user_would_download():
+    """Every other job installs with `pip install -e`, which proves less.
+
+    An editable install puts the source tree on sys.path, so a package missing
+    from setuptools' discovery or a module absent from the archive still
+    imports: it is reading the checkout, not the artifact. Nothing built a wheel
+    until this job existed, while the README opened with four `pip install
+    hipbridge` lines describing a package that had never been assembled, let
+    alone installed.
+
+    Asserted on the properties rather than the step names, so the job can be
+    rewritten without this failing for the wrong reason.
+    """
+    wf = _workflow("ci.yml")
+    assert "package" in wf["jobs"], "nothing builds the distribution"
+
+    job = wf["jobs"]["package"]
+    body = "\n".join(str(step.get("run", "")) for step in job["steps"])
+
+    assert "python -m build" in body, "the wheel and sdist must actually be built"
+    assert "venv" in body, "installing into the same environment proves nothing"
+    assert "--dry-run" in body, (
+        "the extras must be resolved; installing torch and Triton to prove a "
+        "dependency graph is satisfiable costs gigabytes"
+    )
+    for extra in ("kernels", "verify", "all"):
+        assert extra in body, f"[{extra}] is documented in the README but not resolved here"
+
+
 def test_the_manual_workflow_stays_the_one_that_costs_money():
     """Adding the nightly must not have loosened the rule it lives beside."""
     wf = _workflow("amd-verify.yml")
