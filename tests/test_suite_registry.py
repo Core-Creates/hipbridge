@@ -174,49 +174,51 @@ def _measured_from_the_committed_benchmark() -> dict:
     return out
 
 
-@pytest.mark.parametrize("name", [s.name for s in _suites()])
-def test_every_suite_says_whether_substituting_it_is_worth_it(name: str):
+@pytest.mark.parametrize(
+    "suite", _suites() if available() else [], ids=_ids(_suites()) if available() else []
+)
+def test_every_suite_says_whether_substituting_it_is_worth_it(suite):
     """A proof that does not say this reads as a recommendation.
 
     port printed SUBSTITUTION PROVED for rope, which hand-written HIP beats at
     every shape and precision measured. The statement was true and the omission
     was the problem.
     """
-    suite = next(s for s in _suites() if s.name == name)
-
     assert suite.throughput is not None, (
-        f"{name} is proposable but nothing declares whether substituting it is "
+        f"{suite.name} is proposable but nothing declares whether substituting it is "
         f"an improvement, so port would recommend it by omission"
     )
 
 
-@pytest.mark.parametrize("name", [s.name for s in _suites()])
-def test_the_declared_throughput_matches_the_committed_benchmark(name: str):
+@pytest.mark.parametrize(
+    "suite", _suites() if available() else [], ids=_ids(_suites()) if available() else []
+)
+def test_the_declared_throughput_matches_the_committed_benchmark(suite):
     """The declaration is a quote. Quotes go stale silently."""
     measured = _measured_from_the_committed_benchmark()
-    if name not in measured:
-        pytest.skip(f"{name} is not in the committed benchmark")
+    if suite.name not in measured:
+        pytest.skip(f"{suite.name} is not in the committed benchmark")
 
-    rows = sorted(measured[name])
-    declared = next(s for s in _suites() if s.name == name).throughput
+    rows = sorted(measured[suite.name])
+    declared = suite.throughput
 
     largest_ratio = rows[-1][1]
     assert abs(declared.vs_tuned_hip - largest_ratio) < 0.1, (
-        f"{name} declares {declared.vs_tuned_hip}x against the tuned HIP baseline; "
+        f"{suite.name} declares {declared.vs_tuned_hip}x against the tuned HIP baseline; "
         f"the committed benchmark measures {largest_ratio:.2f}x at the largest shape"
     )
 
     wins = [elements for elements, ratio, _ in rows if ratio > 1.0]
     expected = min(wins) if wins else None
     assert declared.faster_at_or_above == expected, (
-        f"{name} declares it wins at or above {declared.faster_at_or_above} elements; "
+        f"{suite.name} declares it wins at or above {declared.faster_at_or_above} elements; "
         f"the benchmark says {expected}"
     )
 
     below = [slower for elements, _, slower in rows if expected is None or elements < expected]
     if below:
         assert abs(declared.slower_by_up_to - max(below)) < 0.2, (
-            f"{name} declares up to {declared.slower_by_up_to}x slower below the "
+            f"{suite.name} declares up to {declared.slower_by_up_to}x slower below the "
             f"crossover; the benchmark says {max(below):.1f}x"
         )
 
