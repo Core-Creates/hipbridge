@@ -123,6 +123,42 @@ jobs:
               print(f\"{s['name']:>18}: {state}\")
           "
 
+      # The comparator added with the benchmark could not run unattended: it
+      # lives in amd-verify, which is workflow_dispatch only, so a regression was
+      # caught exactly when somebody chose to look. That is the failure it was
+      # written to prevent, one step removed.
+      #
+      # One shape, one precision, deliberately. 4096x4096 is the only regime
+      # where the substitutions are supposed to win, and its noise bands are the
+      # tightest measured: two runs of identical code agree to within a few
+      # percent there, while at 1x1024 they disagree by a quarter. Watching the
+      # shape that swings is how a check earns the reputation that gets it
+      # switched off.
+      - name: Time what it verified
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
+        run: |
+          ${{ steps.py.outputs.python }} -m hipbridge.cli bench \
+            --toolchain hipcc \
+            --arch gfx942 \
+            --shapes 4096x4096 \
+            --dtype float32 \
+            --reps 50 \
+            --runs 3 \
+            --require \
+            --report
+
+      # Fails the nightly when a kernel is measurably slower than the committed
+      # record. Noise-aware: a row has to move past the threshold AND clear the
+      # [min-max] band the report already carries, or it prints as noted and the
+      # run stays green.
+      - name: Compare against the committed benchmark
+        run: |
+          git show HEAD:results/bench-hipcc-gfx942.md > /tmp/committed-bench.md 2>/dev/null || {
+            echo "no committed benchmark on this ref; nothing to compare"; exit 0; }
+          ${{ steps.py.outputs.python }} scripts/compare-bench.py \
+            /tmp/committed-bench.md results/bench-hipcc-gfx942.md
+
       - name: Keep the failing run's detail
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
