@@ -173,6 +173,22 @@ jobs:
             ${{ steps.flags.outputs.dtype }} \
             --report
 
+      # The nightly verifies and does not time, so a kernel could lose a third
+      # of its throughput and every check would stay green until somebody read a
+      # table. The committed benchmark is right here; nothing compared against
+      # it until now.
+      #
+      # Noise-aware on purpose: a row has to move past the threshold AND clear
+      # the [min-max] band the report already records, because two runs of
+      # identical code disagree by a quarter at dispatch-bound shapes. A check
+      # that fires on that gets switched off within a fortnight.
+      - name: Compare against the committed benchmark
+        if: ${{ inputs.bench }}
+        run: |
+          git show HEAD:results/bench-hipcc-gfx942.md > /tmp/committed-bench.md 2>/dev/null || {
+            echo "no committed benchmark on this ref; nothing to compare"; exit 0; }
+          ${{ steps.py.outputs.python }} scripts/compare-bench.py             /tmp/committed-bench.md results/bench-hipcc-gfx942.md
+
       # Every substitutable kernel, proved end to end. Without this the artifact
       # mixes fresh reports with whatever port files happened to be committed,
       # which is precisely the drift the freshness check exists to catch.
