@@ -35,6 +35,18 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # The OIDC assertion carries the environment as a claim, so this has to
+    # match what the trusted publisher on the index was registered with. It was
+    # absent here while TestPyPI's publisher named one, and the mint failed with
+    # "no corresponding publisher" - a mismatch that reads as a missing
+    # publisher rather than a disagreeing one.
+    #
+    # Named for the target rather than fixed, because one job publishes to both:
+    # `testpypi` on a rehearsal dispatch, `pypi` on a tag. Each index's publisher
+    # must be registered with the matching name. An environment is also where a
+    # required reviewer would go, which is the right place for the one action
+    # here that cannot be undone.
+    environment: ${{ inputs.repository || 'pypi' }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
