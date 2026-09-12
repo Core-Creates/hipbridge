@@ -14,7 +14,7 @@ and three precisions. At large shapes five of the seven beat a
 **competently written HIP kernel by 1.2x to 1.9x**, and half precision is 1.4x
 to 1.9x faster than float32. The two kernels carrying a rotation, `rope` and
 `rms_norm_rope`, lose to hand-written HIP in every precision; below roughly 16M
-elements every substitution is a 2.9x to 11.1x regression. See
+elements every substitution is a 3x to 11x regression. See
 [the status table](#status-of-what-has-actually-been-run) for exactly which
 paths those are. Claims in this README are limited to what has actually been
 run, never to what should follow from it.
@@ -568,13 +568,19 @@ change that. `rms_norm_rope` is timed here for the first time; it was never
 benchmarked before the port loop stopped hardcoding six names for seven
 suites.
 
-Below roughly 16M elements every substitution is a **2.9x to 11.1x
-regression**, marked `latency-bound` in the tables. That range used to read
-"3x to 5x" here, which understated the worst case by more than double: at
-1x1024 the RoPE substitution is 11.1x slower than hand-written HIP, and the
-figure was quoted from a smaller sweep and never re-derived. `port` now prints
-the per-kernel number beside its proof, so a user reads it without coming
-here. The crossover is dispatch cost, measured
+Below roughly 16M elements every substitution is a **3x to 11x regression**,
+marked `latency-bound` in the tables. That range used to read "3x to 5x" here,
+which understated the worst case by more than double: at 1x1024 the RoPE
+substitution is about 11x slower than hand-written HIP, and the figure was
+quoted from a smaller sweep and never re-derived.
+
+Whole numbers, because that is what this measurement reproduces. Two runs of
+identical code put row_softmax at 5.0x and 4.5x and layer_norm_affine at 7.0x
+and 5.7x: these shapes are dispatch-dominated, 4us against 20us, so a
+microsecond of jitter moves the ratio by a quarter. The verify figures alongside
+them do not move at all - the same two runs were bit-identical - which is the
+difference between measuring arithmetic and measuring a clock. `port` prints the
+per-kernel number beside its proof, so a user reads it without coming here. The crossover is dispatch cost, measured
 rather than assumed: on this box an in-place torch op that does no work costs
 **4.9 us** to launch from Python, `torch.softmax` on one row costs **5.5 us**,
 and the Triton candidate costs **17 us**. About 12 us is Triton's own launch
