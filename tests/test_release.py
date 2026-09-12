@@ -81,6 +81,31 @@ def test_publishing_stores_no_credential():
     assert "mint-token" in text, "the short-lived token has to be minted, not stored"
 
 
+def test_the_environment_matches_the_index_being_published_to():
+    """The OIDC assertion carries the environment as a claim.
+
+    A trusted publisher registered with an environment will not match a token
+    that carries none, and the index reports that as "no corresponding
+    publisher" - which reads as a missing publisher rather than a disagreeing
+    one, and sends you to the wrong page. The job had no environment while
+    TestPyPI's publisher named one, and that is how the second rehearsal failed.
+
+    Named for the target, because one job publishes to both indexes and each
+    registers its own publisher.
+    """
+    job = _workflow("release.yml")["jobs"]["publish"]
+    environment = job.get("environment")
+
+    assert environment, (
+        "the publisher on each index is registered with an environment, so a job "
+        "without one mints a token whose claims cannot match"
+    )
+    assert "inputs.repository" in str(environment), (
+        f"environment is {environment!r}, which cannot be right for both indexes: "
+        f"a rehearsal publishes to testpypi and a tag to pypi"
+    )
+
+
 def test_a_tag_cannot_publish_a_different_version():
     """v0.2.0 built from a tree that says 0.1.0 publishes one under the other."""
     text = (REPO / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
