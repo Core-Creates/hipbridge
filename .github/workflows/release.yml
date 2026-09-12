@@ -73,14 +73,27 @@ jobs:
           fi
           echo "publishing to $host"
 
+          # The audience is not the hostname. It is "pypi" for PyPI and
+          # "testpypi" for TestPyPI, and each index publishes the string it
+          # expects at /_/oidc/audience, so ask rather than hardcode a second
+          # thing that can be wrong. The first rehearsal sent the hostname and
+          # was told "malformed or invalid token", which reads like a
+          # configuration problem and was not one.
+          audience=$(curl -sS "https://$host/_/oidc/audience" |
+                     python -c "import json,sys; print(json.load(sys.stdin)['audience'])")
+          echo "audience: $audience"
+
           # Ask GitHub for an assertion that this workflow, in this repository,
           # is what it says it is.
           oidc=$(curl -sS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-                   "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=$host" |
+                   "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=$audience" |
                  python -c "import json,sys; print(json.load(sys.stdin)['value'])")
 
           # Exchange it for a token that can upload once and then expires.
+          # Content-Type matters: curl -d sends form encoding by default and this
+          # endpoint wants JSON, which was the other half of the rejection.
           minted=$(curl -sS -X POST "https://$host/_/oidc/mint-token" \
+                     -H "Content-Type: application/json" \
                      -d "{\"token\":\"$oidc\"}" |
                    python -c "import json,sys; d=json.load(sys.stdin); print(d.get('token') or sys.exit(f'mint failed: {d}'))")
 
