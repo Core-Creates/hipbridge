@@ -30,7 +30,7 @@ from hipbridge.analysis import ARCHS, lds_padding, occupancy, roofline
 from hipbridge.frontend import KernelFacts, Pattern, Recognition
 from hipbridge.recognizers import recognize, registered
 
-__version__ = "0.1.0.dev0"
+__version__ = "0.1.0"
 
 # Defined in hipbridge.frontend.parser, which costs a libclang import.
 _LAZY = ("parse_file", "parse_source")

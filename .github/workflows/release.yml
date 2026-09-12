@@ -1,0 +1,96 @@
+name: Release
+
+# Publishing is the one action here that cannot be undone. A version number on
+# PyPI is permanent: it can be yanked, never replaced, so a wrong artifact is a
+# wrong artifact for good. Hence a tag or a deliberate dispatch, never a push.
+#
+# No third-party action and no stored API token, which is not a stylistic
+# choice. This repository's Actions policy is `selected` with
+# github_owned_allowed and an empty pattern list, so pypa/gh-action-pypi-publish
+# would be refused at startup. Trusted publishing gets the same result with
+# less standing authority than a token: GitHub mints a short-lived OIDC
+# assertion, PyPI exchanges it for a token good for one upload, and nothing
+# durable is stored anywhere.
+#
+# Before the first run, configure a trusted publisher on PyPI:
+#   owner Core-Creates, repository hipbridge, workflow release.yml
+# https://docs.pypi.org/trusted-publishers/
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: Where to publish. Rehearse on testpypi first.
+        type: choice
+        options: [testpypi, pypi]
+        default: testpypi
+
+permissions:
+  contents: read
+  id-token: write # the OIDC assertion, and nothing else
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        run: |
+          pip install --quiet build twine
+          python -m build
+
+      - name: The tag must be the version it claims to be
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          # A tag that disagrees with pyproject publishes one version under
+          # another's name, and the mistake is only visible after it is
+          # permanent.
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(python -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          echo "tag=$tag  pyproject=$version"
+          test "$tag" = "$version"
+
+      - name: The artifact must be well formed before it is permanent
+        run: twine check dist/*
+
+      - name: Publish
+        env:
+          TARGET: ${{ inputs.repository || 'pypi' }}
+        run: |
+          set -euo pipefail
+          if [ "$TARGET" = "pypi" ]; then
+            host="pypi.org"; repo="https://upload.pypi.org/legacy/"
+          else
+            host="test.pypi.org"; repo="https://test.pypi.org/legacy/"
+          fi
+          echo "publishing to $host"
+
+          # Ask GitHub for an assertion that this workflow, in this repository,
+          # is what it says it is.
+          oidc=$(curl -sS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+                   "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=$host" |
+                 python -c "import json,sys; print(json.load(sys.stdin)['value'])")
+
+          # Exchange it for a token that can upload once and then expires.
+          minted=$(curl -sS -X POST "https://$host/_/oidc/mint-token" \
+                     -d "{\"token\":\"$oidc\"}" |
+                   python -c "import json,sys; d=json.load(sys.stdin); print(d.get('token') or sys.exit(f'mint failed: {d}'))")
+
+          TWINE_USERNAME=__token__ TWINE_PASSWORD="$minted" \
+            twine upload --repository-url "$repo" --non-interactive dist/*
+
+      - name: Keep what was published
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hipbridge-release-${{ github.run_id }}
+          path: dist/
+          if-no-files-found: warn
