@@ -554,9 +554,27 @@ def test_the_nightly_is_scheduled_small_and_verify_only():
 
     script = "\n".join(str(step.get("run", "")) for step in job["steps"])
     assert "cli verify" in script
-    assert "cli bench" not in script, "benchmarking belongs in the run someone asked for"
     assert "cli port" not in script, "proving every kernel end to end is not a smoke test"
     assert "--limit 2" in script
+
+    # This used to read `"cli bench" not in script`, on the grounds that
+    # "benchmarking belongs in the run someone asked for". That was written when
+    # nothing compared the numbers, so a nightly benchmark would have produced a
+    # table nobody read. There is a comparator now, and it lived in amd-verify,
+    # which is workflow_dispatch only - so a regression was caught exactly when
+    # somebody chose to look, which is the failure it exists to prevent.
+    #
+    # Scoped rather than full: one shape and one precision, so the smoke alarm
+    # stays a smoke alarm.
+    assert "cli bench" in script, (
+        "the only unattended GPU job must time what it verified, or a kernel can "
+        "lose a third of its throughput in silence"
+    )
+    assert "compare-bench.py" in script, "timing without comparing is a table nobody reads"
+    assert "--shapes 4096x4096" in script, (
+        "the nightly must watch one shape, and the one where the substitutions are supposed to win"
+    )
+    assert script.count("--dtype") >= 2, "one precision per step, verify and bench alike"
     assert "--require" in script, "a nightly that passes when the box is off says nothing"
     assert "git commit" not in script, "nightly numbers must not compete with the record"
 
