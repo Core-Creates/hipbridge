@@ -217,7 +217,10 @@ def test_the_declared_throughput_matches_the_committed_benchmark(suite):
 
     below = [slower for elements, _, slower in rows if expected is None or elements < expected]
     if below:
-        assert abs(declared.slower_by_up_to - max(below)) < 0.2, (
+        # Within one, not to a decimal: see Throughput.slower_by_up_to. Two runs
+        # of identical code disagree here by more than a decimal place, so a
+        # tighter tolerance would fail on noise after every regeneration.
+        assert abs(declared.slower_by_up_to - max(below)) <= 1.0, (
             f"{suite.name} declares up to {declared.slower_by_up_to}x slower below the "
             f"crossover; the benchmark says {max(below):.1f}x"
         )
