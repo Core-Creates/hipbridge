@@ -38,6 +38,8 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from hipbridge.analysis import wavefront_for
+
 # What a generated module must define. Fixed rather than configurable so a
 # generator has one target to hit and the loader has one thing to look for.
 ENTRY_POINT = "candidate"
@@ -262,12 +264,29 @@ def prompt_for(source: str, kernel: str, arch: str = "gfx942") -> str:
     Says what the kernel must be called and what it receives, because a
     generator that returns something differently shaped fails at the loader for
     a reason that has nothing to do with the maths.
+
+    The wavefront width comes from the arch rather than being written in. The
+    prompt used to tell every generator "64 wide, AMD CDNA", including one asked
+    to target an RDNA card, which is 32 wide. Where the width is not known the
+    prompt says so, and asks for sizes that are whole multiples of either.
     """
+    width = wavefront_for(arch)
+    target = arch or "an AMD GPU whose offload arch was not given"
+    if width is None:
+        sizing = [
+            f"CUDA kernel, targeting {target}. Its wavefront width is not known, so use",
+            "power-of-two block sizes of at least 64, which divide by either width AMD",
+            "compiles to (32 or 64).",
+        ]
+    else:
+        sizing = [
+            f"CUDA kernel, targeting {target}. Wavefronts are {width} wide, so block sizes",
+            f"should be multiples of {width}.",
+        ]
     return "\n".join(
         [
-            "Write a Triton kernel for AMD CDNA that computes the same function as this",
-            f"CUDA kernel, targeting {arch}. Wavefronts are 64 wide, so block sizes should",
-            "be multiples of 64.",
+            "Write a Triton kernel for AMD that computes the same function as this",
+            *sizing,
             "",
             f"Define a module-level function named `{ENTRY_POINT}` taking the same tensors",
             "the CUDA kernel takes, in the same order, minus the output and the scalar",

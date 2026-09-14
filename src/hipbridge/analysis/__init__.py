@@ -7,6 +7,7 @@ find out what your hardware actually does.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 
@@ -29,6 +30,33 @@ ARCHS: dict[str, ArchSpec] = {
     "cdna1": ArchSpec("MI100", "gfx908", 64, 4, 256, 65536, 1.2, 184.6),
     "rdna3": ArchSpec("RX 7900 XTX", "gfx1100", 32, 2, 512, 131072, 0.96, 122.8),
 }
+
+# RDNA-era offload archs: gfx10xx, gfx11xx, gfx12xx. HIP compiles all of them
+# 32 wide, whether or not a datasheet row above names the card.
+_RDNA_ARCH = re.compile(r"gfx1[0-9a-f]{3}")
+
+
+def wavefront_for(arch: str) -> int | None:
+    """Wavefront width HIP compiles an offload arch to, or None when unknown.
+
+    One owner, because three places answered this separately and all three
+    guessed. They went by leading digit, gfx9 is 64 and gfx1 is 32, and fell back
+    to 64 for anything else, including an empty arch. So a Vega-era Radeon
+    (gfx900, gfx906) was filed with CDNA on the strength of a 9, and an RDNA run
+    that did not pass --arch was handed 64. Neither fails loudly: a wrong width
+    papers over a header skew with the wrong value and the build succeeds.
+
+    Only what is known is answered: a datasheet row in ARCHS, or the RDNA family.
+    Everything else is None, and callers say so rather than pick a number. The
+    compiler's own __AMDGCN_WAVEFRONT_SIZE outranks this table wherever it can be
+    read.
+    """
+    for spec in ARCHS.values():
+        if spec.gfx == arch:
+            return spec.wavefront
+    if _RDNA_ARCH.fullmatch(arch):
+        return 32
+    return None
 
 
 def occupancy(vgprs_per_thread: int, arch: str = "cdna3") -> dict:
@@ -77,4 +105,4 @@ def lds_padding(row_elems: int, elem_bytes: int = 4, banks: int = 32) -> int:
     return 0 if row_elems % elems_per_bank_cycle else 1
 
 
-__all__ = ["ARCHS", "ArchSpec", "lds_padding", "occupancy", "roofline"]
+__all__ = ["ARCHS", "ArchSpec", "lds_padding", "occupancy", "roofline", "wavefront_for"]

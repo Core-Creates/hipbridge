@@ -85,7 +85,9 @@ int main() {
     printf("max abs error     : %.3e  (vs float64 CPU)\n", worst_val);
     if (worst_val > 1e-5 || worst_sum > 1e-4) { printf("FAIL: numerically wrong\n"); return 5; }
 
-    printf("\nPASS: hipcc built it, MI300X ran it, the numbers are right.\n");
+    // The device is whatever this box has; the arch is echoed above. This said
+    // "MI300X ran it" on every card, which is a false line in a transcript.
+    printf("\nPASS: hipcc built it, the device ran it, the numbers are right.\n");
     return 0;
 }
 HIP
@@ -187,17 +189,30 @@ else
     exit 6
 fi
 
-# Wavefront width for the target. CDNA (gfx9xx) is 64 wide; RDNA (gfx10xx and
-# later) is 32. Used only if the header/compiler mismatch below needs papering.
+# Wavefront width for the target, used only if the header/compiler mismatch
+# below needs papering. Mirrors hipbridge.analysis.wavefront_for: the CDNA archs
+# with a datasheet row are 64, every RDNA arch (gfx10xx and later) is 32, and
+# anything else is unknown. This used to go by first digit and default to 64,
+# which put Vega-era Radeon (gfx900, gfx906) and an undetected arch at 64, and a
+# wrong value here builds cleanly.
 case "$ARCH" in
-    gfx9*)  WAVE=64 ;;
-    gfx1*)  WAVE=32 ;;
-    *)      WAVE=64 ;;
+    gfx908|gfx90a|gfx942)                 WAVE=64 ;;
+    gfx1[0-9a-f][0-9a-f][0-9a-f])         WAVE=32 ;;
+    *)                                    WAVE="" ;;
 esac
 
 echo "compiling: hipcc $FLAGS"
 if hipcc $FLAGS "$WORK/smoke.hip.cpp" -o "$WORK/smoke" 2>"$WORK/err.txt"; then
     :
+elif grep -q '__AMDGCN_WAVEFRONT_SIZE' "$WORK/err.txt" && [ -z "$WAVE" ]; then
+    echo
+    echo "  header/compiler version mismatch: __AMDGCN_WAVEFRONT_SIZE undefined"
+    echo "  not retrying: the wavefront width for '${ARCH:-an undetected arch}' is not"
+    echo "  known here, and guessing it would build cleanly with the wrong value."
+    echo "  Install headers matching the compiler:"
+    echo "      bash scripts/install-hip-headers.sh"
+    echo "  or pass the arch if it was not detected:  bash scripts/smoke-hip.sh gfxNNNN"
+    exit 7
 elif grep -q '__AMDGCN_WAVEFRONT_SIZE' "$WORK/err.txt"; then
     # The apt headers (/usr/include/hip) and the compiler (/opt/rocm/core-*) come
     # from different ROCm versions. The headers reference __AMDGCN_WAVEFRONT_SIZE,

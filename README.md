@@ -108,7 +108,8 @@ confidence: certain
   - [reduce.tree] 1 shared buffer(s): float[256] (1024 B)
   - [reduce.tree] 2 __syncthreads() calls
   - [reduce.tree] loop stride is halved (log-depth tree)
-  - [reduce.tree] AMD note: wavefront is 64 wide, tree needs 6 steps not 5
+  - [reduce.tree] 1 compound assignment(s) into shared memory
+  - [reduce.tree] AMD note: tree depth follows the wavefront: 6 steps on CDNA (64 wide), 5 on RDNA (32 wide)
 ```
 
 When nothing claims the kernel, it says so instead of guessing:

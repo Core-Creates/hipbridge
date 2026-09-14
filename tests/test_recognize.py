@@ -27,6 +27,19 @@ def test_tree_reduction_is_not_elementwise(examples):
     assert r.facts.shared[0].size_bytes == 1024
 
 
+def test_the_tree_note_does_not_assume_a_wavefront(examples):
+    """Recognition runs before a device is named, so the note has to give both.
+
+    It said "wavefront is 64 wide, tree needs 6 steps not 5", which is CDNA's
+    answer and backwards for every Radeon, where RDNA is 32 wide and 5 is right.
+    """
+    report = _one(examples / "tree_reduce.cu").report()
+
+    assert "wavefront is 64 wide" not in report
+    assert "CDNA (64 wide)" in report
+    assert "RDNA (32 wide)" in report
+
+
 def test_row_softmax_is_a_serial_reduction(examples):
     r = _one(examples / "row_softmax.cu")
     assert r.pattern is Pattern.REDUCE_SERIAL

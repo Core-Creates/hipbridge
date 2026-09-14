@@ -139,6 +139,25 @@ def test_the_prompt_names_the_contract():
     assert "float64 oracle" in prompt, "the generator should know how it will be judged"
 
 
+def test_the_prompt_states_the_width_of_the_arch_it_names():
+    """It told every generator 64 wide, including one asked to target RDNA."""
+    prompt = synth.prompt_for("__global__ void k() {}", "row_softmax", "gfx1100")
+
+    assert "gfx1100" in prompt
+    assert "Wavefronts are 32 wide" in prompt
+    assert "64 wide" not in prompt
+    assert "CDNA" not in prompt
+
+
+@pytest.mark.parametrize("arch", ["", "gfx906"])
+def test_the_prompt_does_not_invent_a_width_it_does_not_know(arch):
+    prompt = synth.prompt_for("__global__ void k() {}", "row_softmax", arch)
+
+    assert "not known" in prompt
+    assert "Wavefronts are" not in prompt
+    assert "gfx942" not in prompt, "an unnamed arch is not the MI300X"
+
+
 def test_identical_proposals_are_recognisable():
     """Sampling the same model repeatedly returns duplicates; they should be
     visible as duplicates rather than counted as independent attempts."""
