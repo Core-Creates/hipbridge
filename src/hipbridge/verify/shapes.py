@@ -1,10 +1,16 @@
 """Shape enumeration for differential testing.
 
-Wavefront-aware by construction. AMD CDNA wavefronts are 64 wide, so shapes are
-chosen to land on and around multiples of 64, not 32. The off-by-one and
-off-by-63 cases are where mask errors live: a kernel that computes
-`mask = offsets < n_rows` while indexing an (n_rows, n_cols) buffer passes every
-square shape and fails these.
+Wavefront-aware by construction, for both widths AMD compiles to. CDNA
+wavefronts are 64 wide and RDNA ones are 32, so shapes land on and around
+multiples of each. The off-by-one and off-by-63 cases are where mask errors
+live: a kernel that computes `mask = offsets < n_rows` while indexing an
+(n_rows, n_cols) buffer passes every square shape and fails these.
+
+Only 64 used to be straddled. 63, 64 and 65 do cross a multiple of 32 as well,
+but the first RDNA boundary did not: no row count was 31, 32 or 33, and no
+width was 33, so a mask error tied to one 32-wide wavefront had nothing here to
+find it. The only device this project has been proven on is 64 wide, which is
+exactly how that went unnoticed.
 
 The order is load-bearing, not incidental. Every consumer truncates this with
 `--limit`, so what a cheap run tests is decided here rather than by the caller.
@@ -14,17 +20,21 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
+# CDNA's width, which is what is_wavefront_aligned asks about. RDNA's is 32;
+# hipbridge.analysis.wavefront_for owns the answer per arch.
 WAVEFRONT = 64
 
-# Row counts: one, small, exactly a wavefront, and either side of it.
-_ROWS = (1, 2, 63, 64, 65, 127, 128, 1000)
+# Row counts: one, small, exactly a wavefront, and either side of it, for the
+# 32-wide RDNA wavefront and the 64-wide CDNA one.
+_ROWS = (1, 2, 31, 32, 33, 63, 64, 65, 127, 128, 1000)
 
-# Column widths: degenerate, sub-wavefront, boundary, prime, wide, and wider
-# than one block can hold. The last two exist because the kernels size a block
-# as next_power_of_2(n_cols) and stopped there: a vocabulary softmax is 32k to
-# 128k columns, so the most common wide-row kernel in inference sat outside
-# both what the kernels supported and what the sweep would ever ask for.
-_COLS = (1, 2, 31, 32, 63, 64, 65, 127, 128, 257, 1024, 4096, 8192, 32768)
+# Column widths: degenerate, either side of both wavefront widths, prime, wide,
+# and wider than one block can hold. The last two exist because the kernels
+# size a block as next_power_of_2(n_cols) and stopped there: a vocabulary
+# softmax is 32k to 128k columns, so the most common wide-row kernel in
+# inference sat outside both what the kernels supported and what the sweep
+# would ever ask for.
+_COLS = (1, 2, 31, 32, 33, 63, 64, 65, 127, 128, 257, 1024, 4096, 8192, 32768)
 
 _CAP = 8_000_000  # keep the sweep runnable on CPU
 
@@ -38,12 +48,19 @@ _CAP = 8_000_000  # keep the sweep runnable on CPU
 # always 0, a candidate that ignored its row stride entirely still scored
 # 84/84, and so would one whose grid was sized wrong.
 #
-# So the first pass is chosen rather than fallen into. Eight shapes covering
-# all eight row counts, ordered so the fourth has already brought four row
-# counts and a 4096-wide row. Wide columns are paired with small row counts on
-# purpose: (2, 4096) buys the wide-row path for 8192 elements where
+# So the first pass is chosen rather than fallen into. It covers every row
+# count, and it fits inside the CLI's default --limit of 12, so a default run
+# reaches all of it. The fourth shape has already brought four row counts and a
+# row past the tiling threshold. Wide columns are paired with small row counts
+# on purpose: (2, 4096) buys the wide-row path for 8192 elements where
 # (1000, 4096) would cost four million, and a first pass nobody can afford to
 # run is the same bug in a different place.
+#
+# The RDNA shapes come after the first eight, not before. The metered MI300X
+# record is taken at --limit 4 and the nightly at --limit 2, and putting them
+# in front would silently change what those runs measure. They do move RoPE's
+# fourth shape: RoPE takes even widths only, so (33, 32) is its third, ahead
+# of (1, 2), and (2, 2) drops out of its first four.
 _FIRST_PASS = (
     (1, 1),  # degenerate: one element, no reduction to speak of
     (2, 32768),  # past the tiling threshold, at the cheapest row count
@@ -53,6 +70,9 @@ _FIRST_PASS = (
     (65, 257),  # one over on rows, past 256 on columns
     (128, 31),  # aligned rows, sub-wavefront width
     (63, 1024),  # one under on rows, wide
+    (32, 33),  # an RDNA wavefront of rows, one column past one
+    (33, 32),  # one row past an RDNA wavefront, columns on one; RoPE can take it
+    (31, 31),  # one under an RDNA wavefront on both axes
 )
 
 

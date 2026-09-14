@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Stops assuming every AMD GPU is 64 wide
+
+Proven on one device, an MI300X, which is 64 wide. Radeon cards (RDNA)
+compile 32 wide, and several places either assumed 64 or guessed it.
+
+- `analysis.wavefront_for` is the one answer per arch: a datasheet row, or 32
+  for any RDNA arch (`gfx1xxx`). Anything else is unknown, never 64 by default.
+- The sweep straddles 31, 32 and 33 on rows and columns as well as 63, 64 and
+  65, inside the default `--limit`. The first four shapes, which the MI300X
+  record is taken over, are unchanged. RoPE's fourth-shape set now includes
+  `(33,32)` in place of `(2,2)`.
+- A header/compiler skew is papered with the target's own width, or not at all:
+  with no `--arch` it used to define 64, which builds cleanly on RDNA.
+- `inspect` notes, the `synth` prompt and `scripts/smoke-hip.sh` no longer
+  present 64 (or "MI300X") as the answer for every card.
+  `scripts/bootstrap-amd.sh` stops instead of defaulting to gfx942.
+
+Nothing has yet been run on RDNA.
+
 ## 0.1.0
 
 First release. Pre-alpha, and the classifier says so: this is published to be
