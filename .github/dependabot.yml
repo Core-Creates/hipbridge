@@ -1,0 +1,29 @@
+# The action pins are commits, which is what sha_pinning_required demands and
+# what makes a tag nobody can move under us. The cost of that is they never
+# update: without this file the repository sits on checkout v7.0.1 until somebody
+# remembers it is there, and "somebody remembers" is the failure mode this
+# project keeps finding in other places.
+#
+# Grouped and monthly on purpose. Three first-party actions across three
+# workflows would otherwise open several pull requests a week for version bumps
+# nobody needs to read separately, and a stream of ignorable pull requests is how
+# a repository learns to ignore them.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+    labels: []
+    open-pull-requests-limit: 2
+
+# No pip entry. Every dependency in pyproject.toml is a floor rather than a pin
+# (`torch>=2.4`, `triton>=3.0`), so there is nothing for Dependabot to raise: pip
+# already resolves to the newest compatible release at install time. Adding the
+# ecosystem would produce either no pull requests or noise about a lower bound
+# that is deliberately loose.

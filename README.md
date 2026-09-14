@@ -192,6 +192,45 @@ as the buffer; `--block` overrides), and the original is checked against the
 oracle before any comparison with it is believed. A reference that cannot
 reproduce its own maths is not a baseline, and the run stops with exit 4.
 
+## Growing coverage without hand-writing the kernel
+
+`synth` asks a generator for candidate kernels and lets the oracle decide which
+survive. It is documented last because it is the least proven part of this
+project, and first in interest because of what it implies.
+
+```bash
+hipbridge synth my_kernel.cu   --generator "llm -m claude-opus-4"   --count 5 --toolchain hipcc --arch gfx942   --allow-untrusted-code
+```
+
+The generator is any command that reads a prompt on stdin and prints a Triton
+kernel on stdout, so the model is a detail rather than a dependency. Use
+`--file-candidate` to propose files you already have and skip generation
+entirely, and `--show-prompt` to see what would be asked.
+
+Each candidate is run against **your** `.cu` on device, judged by the float64
+oracle, across the same sweep every shipped kernel had to pass, including the
+identity, unwritten-output and nondeterminism detectors. The first that survives
+is kept and written with `--out`. The rest are discarded without ceremony and
+without anybody reading them.
+
+What comes out is not "code a model wrote". It is code that matched a compiled
+reference on hardware, which is a different claim and the only one worth making.
+Coverage here grows one hand-written Triton kernel at a time, and that is the
+constraint on the project being useful; a generator can write those far faster
+than a person can. The reason to try it *here* rather than anywhere else is that
+the expensive part of generated code is deciding whether to trust it, and this
+repository is a machine for deciding exactly that.
+
+Nothing in `synth` tries to make the model better, and nothing softens the gate
+to let more through. The gate is the entire value.
+
+**It executes code it was handed, and nothing sandboxes it.** A generated kernel
+can do anything this process can: read your keys, post them somewhere, delete
+files. `--allow-untrusted-code` is required and exists to make that a decision
+rather than a surprise; without it `synth` refuses and exits 2. Run it in a
+container or on a disposable box. A rented GPU machine holding a broadly scoped
+token is precisely the machine not to run it on.
+
 ## Verifying an implementation
 
 ```python
