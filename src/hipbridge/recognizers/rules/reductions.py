@@ -2,9 +2,14 @@
 
 Three distinct shapes that all reduce, and that lower to very different AMD code:
 
-  tree     shared-memory log-depth tree, needs wavefront-64 retuning (6 steps not 5)
-  shuffle  warp intrinsics, needs mask removal and 64-lane semantics
+  tree     shared-memory log-depth tree, retuned to the target's wavefront
+  shuffle  warp intrinsics, needs mask removal and wavefront-wide lane semantics
   serial   per-thread sequential accumulation, usually one row per block
+
+Recognition runs before anyone has named a device, so the notes below cannot
+know the width and must not imply one. They used to say "64 wide", which is
+CDNA's answer and wrong for every Radeon: RDNA compiles 32 wide, where a tree
+reduction over one wavefront takes 5 steps, not 6.
 """
 
 from __future__ import annotations
@@ -39,7 +44,8 @@ def tree_reduction(f: KernelFacts):
                 if f.shared_accumulations
                 else "the halving loop combines values held in shared memory"
             ),
-            "AMD note: wavefront is 64 wide, tree needs 6 steps not 5",
+            "AMD note: tree depth follows the wavefront: 6 steps on CDNA (64 wide), "
+            "5 on RDNA (32 wide)",
         ],
     )
 
@@ -54,7 +60,8 @@ def shuffle_reduction(f: KernelFacts):
         [
             "warp shuffle intrinsics: " + ", ".join(f.shuffle_intrinsics),
             "AMD note: drop the mask argument, __shfl_down_sync -> __shfl_down",
-            "AMD note: 64-lane wavefront changes the reduction depth and ballot width",
+            "AMD note: the wavefront width (64 on CDNA, 32 on RDNA) sets the reduction "
+            "depth and ballot width",
         ],
     )
 

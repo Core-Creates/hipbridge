@@ -93,11 +93,22 @@ done
 
 # Device bitcode for the specific target. Usually already present under
 # /opt/rocm/amdgcn, but the arch metapackage supplies it when it is not.
-ARCH_DETECT="${ARCH:-$(rocminfo 2>/dev/null | grep -o 'gfx[0-9a-f]*' | head -1 || echo gfx942)}"
-for pkg in $(apt-cache search --names-only "amdrocm-core-dev.*-${ARCH_DETECT}$" 2>/dev/null | awk '{print $1}' | sort -r | head -1); do
-    echo "installing device libs for $ARCH_DETECT: $pkg"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" >/dev/null 2>&1 || true
-done
+#
+# No fallback arch. This used to end in `|| echo gfx942`, which never fired,
+# because `head` succeeds on empty input: the search then ran for a package name
+# ending in "-", matched nothing, and skipped the device libraries without a
+# word. Had the fallback fired it would have installed MI300X libraries on a
+# Radeon. Without an arch, say so and skip.
+ARCH_DETECT="${ARCH:-$(rocminfo 2>/dev/null | grep -o 'gfx[0-9a-f]*' | head -1 || true)}"
+if [ -z "$ARCH_DETECT" ]; then
+    echo "no offload arch detected and ARCH not set; skipping device libraries"
+    echo "  (set ARCH=gfxNNNN, as listed by rocminfo, to install them)"
+else
+    for pkg in $(apt-cache search --names-only "amdrocm-core-dev.*-${ARCH_DETECT}$" 2>/dev/null | awk '{print $1}' | sort -r | head -1); do
+        echo "installing device libs for $ARCH_DETECT: $pkg"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" >/dev/null 2>&1 || true
+    done
+fi
 
 say "Does anything now match the compiler"
 MATCH=""

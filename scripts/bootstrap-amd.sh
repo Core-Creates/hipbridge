@@ -25,8 +25,13 @@ if command -v rocminfo >/dev/null 2>&1; then
 else
     DETECTED=""
 fi
-ARCH="${ARCH:-${DETECTED:-gfx942}}"
-echo "arch: $ARCH${DETECTED:+ (detected)}"
+# No fallback to gfx942. On anything but an MI300X that compiles every kernel
+# for the wrong device, and the verification it then runs is about a card that
+# is not in the box. An arch nobody named or detected is a stop, not a default.
+ARCH="${ARCH:-$DETECTED}"
+[ -n "$ARCH" ] || die "could not detect the offload arch (rocminfo lists it as gfxNNNN).
+  Set it and re-run:  ARCH=gfxNNNN bash scripts/bootstrap-amd.sh"
+if [ "$ARCH" = "$DETECTED" ]; then echo "arch: $ARCH (detected)"; else echo "arch: $ARCH"; fi
 command -v rocm-smi >/dev/null 2>&1 && rocm-smi --showproductname 2>/dev/null | head -6 || true
 
 say "Python environment"
