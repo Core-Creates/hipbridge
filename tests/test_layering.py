@@ -160,8 +160,10 @@ ALLOWED_CORE_IMPORTS = {
     # frontend supplies KernelFacts, the language this package reads; recognize
     # and synth are the other halves of the port and synth pipelines. kernels is
     # the substitute a Suite resolves, which is an edge between two extras and
-    # not into core.
+    # not into core. analysis owns the wavefront width per arch, which the
+    # native reference needs when a header skew has to be papered over.
     "verify": {
+        "hipbridge.analysis",
         "hipbridge.frontend",
         "hipbridge.recognizers",
         "hipbridge.synth",

@@ -26,6 +26,9 @@ from pathlib import Path
 
 import torch
 
+# Re-exported: this module was its home, and hipbridge.verify still offers it.
+from hipbridge.analysis import wavefront_for
+
 
 @dataclass(frozen=True)
 class Availability:
@@ -361,15 +364,6 @@ def hip_include_flags(root: str | None = None) -> list[str]:
     return []
 
 
-def wavefront_for(arch: str) -> int:
-    """Wavefront width for a gfx target. CDNA is 64 wide, RDNA is 32."""
-    if arch.startswith("gfx9"):
-        return 64
-    if arch.startswith("gfx1"):
-        return 32
-    return 64
-
-
 def wsl(distro: str = "Ubuntu") -> list[str]:
     """Command prefix that runs the toolchain inside a WSL2 distribution.
 
@@ -497,15 +491,29 @@ class NativeReference(Reference):
         # The macro is normally predefined by the compiler. Supplying the value
         # for the target arch is correct and lets the build proceed; matching
         # header and compiler versions is the real fix.
+        #
+        # Only a known width is supplied. With no --offload-arch this assumed
+        # gfx942 and defined 64, which on an RDNA card (32 wide) builds cleanly
+        # with the wrong value, so every number after it inherits the mistake.
+        skew = ""
         if r.returncode != 0 and "__AMDGCN_WAVEFRONT_SIZE" in (r.stdout + r.stderr):
             arch = next(
                 (f.split("=", 1)[1] for f in flags if f.startswith("--offload-arch=")),
-                "gfx942",
+                "",
             )
-            retry = [*cmd, f"-D__AMDGCN_WAVEFRONT_SIZE={wavefront_for(arch)}"]
-            r = self._run(retry, capture_output=True, text=True)
-            if r.returncode == 0:
-                cmd = retry
+            width = wavefront_for(arch)
+            if width is None:
+                skew = (
+                    "\nThe HIP headers do not match the compiler, and the wavefront width "
+                    f"for {arch or 'an unnamed arch'} is not known, so it was not guessed. "
+                    "Pass --arch, or install headers matching the compiler "
+                    "(scripts/install-hip-headers.sh)."
+                )
+            else:
+                retry = [*cmd, f"-D__AMDGCN_WAVEFRONT_SIZE={width}"]
+                r = self._run(retry, capture_output=True, text=True)
+                if r.returncode == 0:
+                    cmd = retry
 
         if r.returncode != 0:
             # nvcc reports fatal driver errors (a missing host compiler, for one)
@@ -515,7 +523,7 @@ class NativeReference(Reference):
             raise RuntimeError(
                 f"{self.toolchain} failed (exit {r.returncode}):\n"
                 f"{detail[-2000:] or '(no output)'}\n"
-                f"command: {' '.join(cmd)}"
+                f"command: {' '.join(cmd)}{skew}"
             )
         self._built = exe
         return exe

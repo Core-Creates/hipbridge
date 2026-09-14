@@ -270,6 +270,68 @@ def test_generated_driver_is_well_formed(toolchain):
         assert "cudaMemcpyDeviceToHost" in src
 
 
+def _skewed_hipcc(monkeypatch, flags):
+    """A NativeReference whose compiler fails the way skewed HIP headers do.
+
+    Returns the reference and the list of commands it tried to run, so the
+    header-skew retry is testable without hipcc, a device or mismatched headers.
+    """
+    import subprocess
+
+    from hipbridge.verify import suites
+    from hipbridge.verify.reference import Availability
+
+    s = suites.ROW_SOFTMAX
+    ref = verify.NativeReference(
+        source=s.source(REPO / "examples"),
+        launch=s.launch,
+        toolchain="hipcc",
+        extra_flags=["-I/opt/rocm/include", *flags],
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kw):
+        calls.append(list(argv))
+        if any(a.startswith("-D__AMDGCN_WAVEFRONT_SIZE=") for a in argv):
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        err = "amd_warp_functions.h: use of undeclared identifier '__AMDGCN_WAVEFRONT_SIZE'"
+        return subprocess.CompletedProcess(argv, 1, "", err)
+
+    monkeypatch.setattr(ref, "availability", lambda: Availability(True))
+    monkeypatch.setattr(ref, "_run", fake_run)
+    return ref, calls
+
+
+@needs_verify
+@pytest.mark.parametrize(("arch", "width"), [("gfx942", 64), ("gfx1100", 32), ("gfx1201", 32)])
+def test_a_header_skew_is_papered_with_the_targets_own_width(monkeypatch, arch, width):
+    ref, calls = _skewed_hipcc(monkeypatch, [f"--offload-arch={arch}"])
+
+    ref.build(n_inputs=1, n_scalars=2)
+
+    assert len(calls) == 2, "one failed compile, one retry"
+    assert f"-D__AMDGCN_WAVEFRONT_SIZE={width}" in calls[1]
+
+
+@needs_verify
+@pytest.mark.parametrize("flags", [[], ["--offload-arch=gfx906"]])
+def test_a_header_skew_with_an_unknown_width_is_not_guessed(monkeypatch, flags):
+    """No arch used to mean gfx942, so an RDNA run without --arch built at 64.
+
+    It compiled, it ran, and every number after it was produced with the wrong
+    wavefront. Unknown now stops the build and says what to do instead.
+    """
+    ref, calls = _skewed_hipcc(monkeypatch, flags)
+
+    with pytest.raises(RuntimeError) as err:
+        ref.build(n_inputs=1, n_scalars=2)
+
+    assert len(calls) == 1, "no retry with a guessed width"
+    assert "not known" in str(err.value)
+    assert "--arch" in str(err.value)
+    assert "install-hip-headers.sh" in str(err.value)
+
+
 # --- benchmarking -----------------------------------------------------------
 
 
