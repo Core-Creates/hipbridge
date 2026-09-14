@@ -247,8 +247,9 @@ print(harness.run(shapes.row_wise()))
 ```
 
 The sweep crosses shapes against input distributions chosen to break things
-rather than confirm them. Shapes straddle the 64-wide AMD wavefront (63, 64, 65)
-because that is where mask errors live. Distributions include large-magnitude
+rather than confirm them. Shapes straddle both widths AMD compiles to, the
+64-wide CDNA wavefront (63, 64, 65) and the 32-wide RDNA one (31, 32, 33), on
+rows and on columns, because that is where mask errors live. Distributions include large-magnitude
 inputs specifically because a softmax missing its max-subtraction pass is
 **bitwise correct on N(0,1)** and destroyed on realistic logits.
 
@@ -346,6 +347,13 @@ regrows a `triton` dependency.
 | AMD, kernels taking learned weights | **verified**, `layer_norm_affine` and `rms_norm_affine` |
 | AMD, timed on MI300X (gfx942) | **measured**, all seven suites, three precisions |
 | AMD, timed with weights | **measured**, in the same run |
+| AMD, any Radeon (RDNA, 32-wide wavefront) | **never run** |
+| AMD, MI250X (gfx90a) or MI100 (gfx908) | **never run** |
+
+The MI300X is 64 wide, and it is the only AMD device anything here has run
+on. Radeon cards compile 32 wide, so nothing above says anything about them
+until one is run. An RX 7900 XTX (gfx1100) or a Radeon AI PRO R9700 would be
+the most useful next result.
 
 **The terminal output quoted in this file is from the run that produced it**,
 so a case count in a transcript is that run's, not a current claim. The
@@ -362,8 +370,10 @@ row stride has to hold for all of them.
 `rope` and `rms_norm_rope` sweep a different four. They refuse a row wider than
 8192 rather than tiling it, because a rotation operates on a head dimension, so
 `(2,32768)` is outside what they are defined for and the sweep no longer asks:
-theirs are `(1000,128)`, `(63,1024)`, `(1,2)` and `(2,2)`. The count is the same
-93 because only the widths differ.
+theirs are `(1000,128)`, `(63,1024)`, `(33,32)` and `(1,2)`. The count is the same
+93 because only the widths differ. `(33,32)`, one row past a 32-wide RDNA
+wavefront, replaced `(2,2)` when the sweep grew its RDNA boundary shapes; a
+committed report older than that change was measured over `(2,2)`.
 
 Until the sweep was reordered those four were `(1,1)`, `(1,2)`, `(1,31)` and
 `(1,32)`. Every case ever measured had exactly one row, so `row` was always 0

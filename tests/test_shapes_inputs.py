@@ -38,6 +38,36 @@ def test_row_shapes_straddle_the_wavefront():
     assert (1, 1) in pairs, "degenerate single-element case missing"
 
 
+@pytest.mark.parametrize("width", [32, 64])
+def test_both_wavefront_widths_are_straddled_on_both_axes(width):
+    """RDNA is 32 wide, and the sweep only ever straddled 64.
+
+    No row count was 31, 32 or 33 and no width was 33, so the first 32-wide
+    boundary went untested. Asserted for both widths on both axes, so dropping
+    either family's neighbours is caught here.
+    """
+    neighbours = (width - 1, width, width + 1)
+    assert set(neighbours) <= set(sh._ROWS), f"row counts miss {neighbours}"
+    assert set(neighbours) <= set(sh._COLS), f"column widths miss {neighbours}"
+
+
+def test_a_default_run_reaches_the_rdna_boundary():
+    """The CLI's default --limit is 12, so the RDNA shapes must sit inside it."""
+    default = sh.sample(sh.row_wise(), limit=12)
+    assert any(r == 32 and c == 33 for r, c in default), default
+    assert any(r == 33 and c == 32 for r, c in default), default
+    assert any(r == 31 and c == 31 for r, c in default), default
+
+
+def test_the_metered_prefixes_did_not_move():
+    """The MI300X record is taken at --limit 4 and the nightly at --limit 2.
+
+    Adding shapes must not quietly change what those runs measure, or their
+    committed numbers stop describing the sweep that produces them.
+    """
+    assert sh.sample(sh.row_wise(), limit=4) == [(1, 1), (2, 32768), (64, 65), (1000, 128)]
+
+
 def test_elementwise_includes_zero_and_non_multiples():
     sizes = [n for (n,) in sh.elementwise()]
     assert 0 in sizes
@@ -114,8 +144,11 @@ def test_a_truncated_sweep_still_spans_row_counts():
     assert max(c for _, c in first4) >= 1024, first4
     assert max(r * c for r, c in first4) <= 200_000, first4
 
-    first8 = sh.sample(sh.row_wise(), limit=8)
-    assert {r for r, _ in first8} == set(sh._ROWS), first8
+    # The whole first pass covers every row count, and it has to fit inside the
+    # CLI's default --limit of 12 for a default run to reach all of it.
+    assert len(sh._FIRST_PASS) <= 12, "a default run no longer reaches the whole first pass"
+    first = sh.sample(sh.row_wise(), limit=len(sh._FIRST_PASS))
+    assert {r for r, _ in first} == set(sh._ROWS), first
 
 
 def test_reordering_did_not_drop_any_shape():
