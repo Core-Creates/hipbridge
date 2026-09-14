@@ -675,7 +675,9 @@ def synth_file(
             name="generated",
         ).run(sweep.shapes_of(suite))
 
-    prompt = synth.prompt_for(source, facts.name, device.arch or "gfx942")
+    # The arch as given. Substituting gfx942 when none was told an RDNA
+    # generator it was writing for a 64-wide MI300X.
+    prompt = synth.prompt_for(source, facts.name, device.arch)
     if show_prompt:
         progress(prompt)
         progress("")
