@@ -190,12 +190,56 @@ def _write_report(args, command: str, title: str, body: str) -> None:
     print(f"report written to {written}")
 
 
+def _missing_examples(args, command: str) -> str:
+    """Why the built-in suites cannot run here, or "" when they can.
+
+    The suites prove a substitution against the *original* kernel, which means
+    compiling that kernel, which means having its source. Those .cu files live in
+    the repository under examples/ and are deliberately not packaged: they are
+    fixtures for the built-in suites, not library code, and shipping them would
+    put a second copy of every kernel inside the wheel.
+
+    Without this check an installed copy raised FileNotFoundError from inside the
+    sweep - a bare traceback naming examples/row_softmax.cu, from a tool whose
+    whole argument is that it fails closed with a report. The first person to
+    `pip install hipbridge[verify]` and run `hipbridge verify` would have met a
+    stack trace.
+    """
+    where = Path(getattr(args, "examples", "examples"))
+    if not where.is_dir():
+        found = f"no such directory: {where}"
+    elif not any(where.glob("*.cu")):
+        found = f"no .cu files in {where}"
+    else:
+        return ""
+
+    return f"""{found}
+
+The built-in suites prove a substitution against the original kernel, so they
+need that kernel's source to compile. Those files live in the hipbridge
+repository under examples/ and are not shipped in the wheel.
+
+  git clone https://github.com/Core-Creates/hipbridge
+  hipbridge {command} --examples hipbridge/examples ...
+
+or point --examples at a checkout you already have.
+
+To prove your OWN kernel instead, which needs no examples at all:
+
+  hipbridge port your_kernel.cu --toolchain {getattr(args, "toolchain", "hipcc")}"""
+
+
 def _cmd_verify(args) -> int:
     """Run the example suites against a real device.
 
     Exits 0 and reports a skip when no device is present, so this is safe to
     wire into CI that usually has no GPU. Pass --require to make absence fatal.
     """
+    missing = _missing_examples(args, "verify")
+    if missing:
+        print(missing, file=sys.stderr)
+        return EXIT_USAGE
+
     # Lazy, guarded: core must run without the [verify] extra installed.
     from hipbridge import verify
 
@@ -226,6 +270,11 @@ def _cmd_bench(args) -> int:
     wrong kernel is not a result, and a benchmark that does not say whether the
     numbers were correct is the kind this project exists to distrust.
     """
+    missing = _missing_examples(args, "bench")
+    if missing:
+        print(missing, file=sys.stderr)
+        return EXIT_USAGE
+
     from hipbridge import verify
 
     if not verify.available():
