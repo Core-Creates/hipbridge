@@ -288,21 +288,33 @@ def _device_present(toolchain: str) -> bool:
     torch's runtime, so gating on torch's build flavour is simply the wrong
     question.
     """
-    probe = "nvidia-smi" if toolchain == "nvcc" else "rocm-smi"
-    if shutil.which(probe):
+    # nvcc has one enumeration tool; ROCm has three across versions. rocm-smi is
+    # the historical one, but recent ROCm deprecates it for amd-smi, and the
+    # component-split core-<ver> images ship neither on the default PATH while
+    # still carrying rocminfo. The question is only "does the vendor runtime see
+    # a device", so any of them answering yes is a yes. Checking rocm-smi alone
+    # skipped every suite on an AMD Developer Cloud MI300X image that had a
+    # perfectly working GPU (torch ran on it), which is the opposite of helpful.
+    if toolchain == "nvcc":
+        probes = (["nvidia-smi", "-L"],)
+    else:
+        probes = (["rocm-smi"], ["amd-smi", "list"], ["rocminfo"])
+    for argv in probes:
+        if not shutil.which(argv[0]):
+            continue
         try:
-            r = subprocess.run(
-                [probe, "-L"] if probe == "nvidia-smi" else [probe],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                return True
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
         except (OSError, subprocess.SubprocessError):
-            pass
-    # Fall back to torch only as a secondary signal, never as the gate.
-    return bool(toolchain == "nvcc" and torch.cuda.is_available())
+            continue
+        if r.returncode == 0 and r.stdout.strip():
+            return True
+    # Fall back to torch, but only a vendor build that genuinely sees the device,
+    # never the CPU-only wheel. A ROCm torch reports version.hip and answers
+    # is_available through the same API a CUDA build does; the CPU wheel reports
+    # neither, so it still gates to False as the docstring promises.
+    if toolchain == "nvcc":
+        return bool(torch.cuda.is_available())
+    return bool(getattr(torch.version, "hip", None) and torch.cuda.is_available())
 
 
 def _host_compiler_missing(toolchain: str) -> str:

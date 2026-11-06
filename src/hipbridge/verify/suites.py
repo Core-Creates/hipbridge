@@ -18,6 +18,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import partial
+from math import prod
 from pathlib import Path
 from typing import Any
 
@@ -604,6 +605,90 @@ RMS_NORM_ROPE = Suite(
     baselines=(tuned_baseline("rms_norm_rope"),),
 )
 
+# --- Computer-vision family (first kernel: RGB -> grayscale) ------------------
+#
+# Unlike the transformer suites above, grayscale is flat elementwise: one output
+# per element, no row structure. So it uses a flat launch (one thread per
+# element, 256-thread blocks) and the 1D elementwise shape sweep, not row_wise.
+# It also takes THREE equally-shaped input planes; R is the primary and G/B ride
+# along as full-shape extras, the same mechanism LayerNorm's gamma/beta use.
+
+
+def _flat_launch(kernel: str) -> LaunchSpec:
+    """One thread per element, 256-thread blocks. Shapes are flattened.
+
+    prod(s[0]) is the element count of the primary plane; the grid is that many
+    elements in 256-wide blocks. scalar_args passes it as the kernel's `int n`.
+    cdiv is spelled by hand rather than imported from triton: verify/ must not
+    import triton (pyproject documents why), so the one ceil-divide it needs is
+    arithmetic, not a dependency.
+    """
+    return LaunchSpec(
+        kernel=kernel,
+        grid=lambda s: ((prod(s[0]) + 255) // 256, 1, 1),
+        block=(256, 1, 1),
+        scalar_args=lambda s: [prod(s[0])],
+        out_shape=lambda s: s[0],
+    )
+
+
+def _full_plane(name: str, seed_offset: int, aliases: tuple[str, ...] = ()) -> Operand:
+    """An extra input plane the same shape as the primary.
+
+    Grayscale's G and B planes. Unlike gamma/beta, which are one row wide, these
+    follow the primary's full shape so a sweep over sizes sweeps them with it,
+    and are seeded apart so R, G and B are three different tensors rather than
+    one tensor three times.
+    """
+
+    def make(spec: InputSpec) -> InputSpec:
+        return InputSpec(
+            shape=spec.shape,
+            dtype=spec.dtype,
+            distribution=spec.distribution,
+            seed=spec.seed + seed_offset,
+            layout=spec.layout,
+        )
+
+    return Operand(name=name, spec=make, aliases=aliases)
+
+
+def _elementwise_shapes() -> Sequence[tuple[int, ...]]:
+    from hipbridge.verify import shapes
+
+    # Drop the zero-element case: an empty sweep case proves nothing and some
+    # launch maths divides by the count.
+    return [s for s in shapes.sample(shapes.elementwise()) if s[0] > 0]
+
+
+RGB_TO_GRAY = Suite(
+    name="rgb_to_gray",
+    source_file="rgb_to_gray.cu",
+    kernel="rgb_to_gray",
+    launch=_flat_launch("rgb_to_gray"),
+    oracle=lambda r, g, b: (0.299 * r.double() + 0.587 * g.double() + 0.114 * b.double()),
+    portable=lambda r, g, b: 0.299 * r + 0.587 * g + 0.114 * b,
+    portable_name="torch",
+    triton_impl="hipbridge.kernels.cv:rgb_to_gray",
+    triton_label="hipbridge.kernels.cv.rgb_to_gray (Triton, AMD-tuned)",
+    fallback=lambda r, g, b: 0.299 * r + 0.587 * g + 0.114 * b,
+    fallback_label="torch rgb_to_gray (Triton unavailable)",
+    usage_call="out = rgb_to_gray(r, g, b)",
+    shapes=_elementwise_shapes,
+    extras=(
+        _full_plane("g", 5009, ("green",)),
+        _full_plane("b", 6011, ("blue",)),
+    ),
+    baselines=(
+        Baseline(
+            name="tuned HIP",
+            source_file="rgb_to_gray_tuned.cu",
+            launch=_flat_launch("rgb_to_gray_tuned"),
+        ),
+    ),
+)
+
+
 BUILTIN: tuple[Suite, ...] = (
     ROW_SOFTMAX,
     LAYER_NORM,
@@ -612,6 +697,7 @@ BUILTIN: tuple[Suite, ...] = (
     RMS_NORM_AFFINE,
     ROPE,
     RMS_NORM_ROPE,
+    RGB_TO_GRAY,
 )
 
 
