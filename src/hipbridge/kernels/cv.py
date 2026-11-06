@@ -18,9 +18,15 @@ import triton.language as tl
 
 # Rec.601 luma weights. Full precision on purpose: these are constants, so there
 # is no reason to round them to the input dtype before the multiply.
-_R_WEIGHT = 0.299
-_G_WEIGHT = 0.587
-_B_WEIGHT = 0.114
+#
+# Declared tl.constexpr, not plain floats: Triton 3.x refuses to read a plain
+# module global from inside an @triton.jit kernel ("can only access global
+# variables that are instantiated as constexpr"). As bare floats these compiled
+# nowhere, which is why the kernel shipped UNVERIFIED; the verify harness is what
+# surfaced it.
+_R_WEIGHT = tl.constexpr(0.299)
+_G_WEIGHT = tl.constexpr(0.587)
+_B_WEIGHT = tl.constexpr(0.114)
 
 
 @triton.jit
